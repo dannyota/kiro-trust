@@ -1,0 +1,42 @@
+[package]
+name = "kiro-trust"
+description = "Security-first local trust proxy for using Claude Code with Kiro and AWS IAM Identity Center credentials."
+publish = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+default-run = "kiro-trust"
+
+[features]
+# Developer-only payload capture (spec 8.3). Never in release builds.
+capture = []
+
+[dependencies]
+kiro-trust-protocol.workspace = true
+kiro-trust-net.workspace = true
+kiro-trust-auth.workspace = true
+kiro-trust-kiro.workspace = true
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "fs"] }
+tokio-stream = "0.1.19"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+serde.workspace = true
+serde_json.workspace = true
+secrecy.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "std"] }
+http.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+uuid.workspace = true
+getrandom = "0.4.3"
+base64 = "0.23.1"
+directories = "6.0.0"
+subtle = "2.6"
+time = { version = "0.3.55", features = ["formatting"] }
+
+[dev-dependencies]
+tempfile.workspace = true

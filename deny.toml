@@ -1,0 +1,43 @@
+# cargo-deny checks what the dependency tree carries; `cargo test` checks our
+# code. The tree reaches about 200 crates through reqwest, rustls, tokio, and
+# axum. Advisories can affect an unchanged tree, so CI runs this weekly too.
+
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+
+[licenses]
+# The binary is Apache-2.0. Permissive licenses used by this tree; anything
+# else needs an explicit decision here with a reason.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Zlib",
+    "BSL-1.0",
+    "0BSD",
+    # webpki-roots ships Mozilla's root store under MPL-2.0. File-level
+    # copyleft; we modify nothing, so linking it into an Apache-2.0 binary is
+    # allowed.
+    "MPL-2.0",
+    # aws-lc-sys carries the OpenSSL license alongside ISC and Apache-2.0.
+    "OpenSSL",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+skip = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,29 @@
+[package]
+name = "kiro-trust-net"
+description = "The single outbound network policy for kiro-trust: fixed destinations, region validation, rustls with compiled-in roots, no redirects, no proxy."
+publish = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Loopback plain-HTTP endpoints for tests only. The binary never enables this;
+# scripts/check-features.sh proves it.
+test-endpoints = []
+
+[dependencies]
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
+rustls = { version = "0.23.44", default-features = false, features = ["std", "aws_lc_rs", "tls12"] }
+webpki-roots = "1.0.9"
+http.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+wiremock.workspace = true

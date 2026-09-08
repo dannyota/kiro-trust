@@ -1,0 +1,26 @@
+[package]
+name = "kiro-trust-auth"
+description = "Read-only Kiro CLI credential access and AWS IAM Identity Center token refresh for kiro-trust."
+publish = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kiro-trust-net.workspace = true
+rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+directories = "6.0.0"
+time = { version = "0.3.55", features = ["parsing", "formatting"] }
+tokio = { workspace = true, features = ["sync"] }
+http.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
