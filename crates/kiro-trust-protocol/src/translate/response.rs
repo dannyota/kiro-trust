@@ -497,7 +497,7 @@ impl ResponseTranslator {
                 cache_write_input_tokens,
                 ..
             } => {
-                let input = uncached_input_tokens + cache_read_input_tokens;
+                let input = uncached_input_tokens.saturating_add(*cache_read_input_tokens);
                 if input > 0 || *output_tokens > 0 {
                     self.has_metadata = true;
                     self.input_tokens = input;
@@ -551,13 +551,16 @@ impl ResponseTranslator {
         }
         self.finished = true;
         self.ensure_started(&mut out);
-        // Flush a partial tag buffer.
+        // Flush a partial tag buffer. Once a local stop has latched, nothing
+        // more is emitted (spec 5.4): the thinking branch is already safe
+        // because `apply_max_tokens` returns an empty string once latched,
+        // but the text branch needs an explicit guard.
         let remaining = std::mem::take(&mut self.tag_buf);
         if !remaining.is_empty() {
             if self.tag_inside {
                 let t = self.take_thinking(&remaining);
                 self.emit_thinking(t, &mut out);
-            } else {
+            } else if self.local_stop.is_none() {
                 let t = self.take_text(&remaining);
                 self.emit_text(t, &mut out);
             }
@@ -911,6 +914,30 @@ mod tests {
         assert_eq!(usage.output_tokens, 2);
     }
 
+    // Regression: `finish()` must not flush a buffered `<thinking>`-tag
+    // prefix as text once a local stop has latched (spec 5.4 "nothing after
+    // a stop"). Covers a max_tokens latch and a stop_sequence latch, each
+    // with a partial open-tag left in the buffer.
+    #[test]
+    fn nothing_is_flushed_after_a_latched_stop() {
+        let mut o = opts();
+        o.max_tokens = 2;
+        let mut t = ResponseTranslator::new(o);
+        let all = t.push(&text("abcdefgh<thin"));
+        assert_eq!(deltas_text(&all), "abcdefgh");
+        assert!(matches!(
+            all[all.len() - 2],
+            StreamEvent::MessageDelta { .. }
+        ));
+        assert!(matches!(all[all.len() - 1], StreamEvent::MessageStop));
+
+        let mut o = opts();
+        o.stop_sequences = vec!["END".into()];
+        let mut t = ResponseTranslator::new(o);
+        let all = t.push(&text("xEND<thin"));
+        assert_eq!(deltas_text(&all), "x");
+    }
+
     // kirocc TestAccumulator_MeteringFallback, _EmptyMetadataDoesNotOverrideMetering
     #[test]
     fn metering_fills_usage_when_metadata_is_empty() {
@@ -963,6 +990,22 @@ mod tests {
                 cache_creation_input_tokens: 0
             }
         );
+    }
+
+    // Regression: `uncached_input_tokens + cache_read_input_tokens` must not
+    // panic (debug) or wrap (release) when upstream sends adversarial u64
+    // values; the sum must saturate at u64::MAX.
+    #[test]
+    fn metadata_token_counts_saturate() {
+        let mut t = ResponseTranslator::new(opts());
+        t.push(&Event::Metadata {
+            uncached_input_tokens: u64::MAX,
+            output_tokens: 0,
+            total_tokens: 0,
+            cache_read_input_tokens: 1,
+            cache_write_input_tokens: 0,
+        });
+        assert_eq!(t.usage().input_tokens, u64::MAX);
     }
 
     #[test]
