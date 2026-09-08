@@ -15,6 +15,7 @@ pub struct Request {
     pub system: Option<SystemPrompt>,
     #[serde(default)]
     pub tools: Vec<Tool>,
+    #[serde(default)]
     pub max_tokens: u32,
     #[serde(default)]
     pub stop_sequences: Vec<String>,

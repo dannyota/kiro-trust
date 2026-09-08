@@ -3,6 +3,8 @@
 
 pub mod anthropic;
 pub mod catalog;
+pub mod estimate;
 pub mod eventstream;
 pub mod kiro;
+pub mod sse;
 pub mod translate;
