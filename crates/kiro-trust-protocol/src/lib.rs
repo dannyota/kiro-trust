@@ -3,4 +3,5 @@
 
 pub mod anthropic;
 pub mod catalog;
+pub mod eventstream;
 pub mod kiro;
