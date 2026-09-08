@@ -21,6 +21,10 @@ pub enum NetError {
     HeaderTimeout(Duration),
     #[error("body read failed: {0}")]
     Body(String),
+    #[error(
+        "request path would change the authority for {host}; paths must be absolute and carry no userinfo"
+    )]
+    BadPath { host: String },
 }
 
 pub struct Client {
@@ -56,6 +60,36 @@ impl Client {
         }
     }
 
+    /// Builds the request URL and proves it still names exactly the
+    /// destination host: a hostile `path` must never be able to move the
+    /// bearer token to a different authority (spec 3.2, 6.2).
+    fn checked_url(&self, dest: &Destination, path: &str) -> Result<reqwest::Url, NetError> {
+        let host = dest.host();
+        let bad = || NetError::BadPath { host: host.clone() };
+        // Reject up front so the failure is explicit rather than dependent
+        // on parser behavior: an absolute path only, no userinfo
+        // separator, no query or fragment, no backslash (some HTTP stacks
+        // normalize it to a slash), and no leading "//" (a network-path
+        // reference some URL resolvers treat as authority-carrying).
+        if !path.starts_with('/') || path.starts_with("//") || path.contains(['@', '?', '#', '\\'])
+        {
+            return Err(bad());
+        }
+        let url = reqwest::Url::parse(&self.url(dest, path)).map_err(|_| bad())?;
+        let (expected_host, expected_port) = match self.policy.loopback_port() {
+            Some(port) => ("127.0.0.1".to_string(), port),
+            None => (host.clone(), 443),
+        };
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.host_str() != Some(expected_host.as_str())
+            || url.port_or_known_default() != Some(expected_port)
+        {
+            return Err(bad());
+        }
+        Ok(url)
+    }
+
     pub async fn post(
         &self,
         dest: &Destination,
@@ -64,12 +98,8 @@ impl Client {
         body: Vec<u8>,
     ) -> Result<Response, NetError> {
         let host = dest.host();
-        let send = self
-            .inner
-            .post(self.url(dest, path))
-            .headers(headers)
-            .body(body)
-            .send();
+        let url = self.checked_url(dest, path)?;
+        let send = self.inner.post(url).headers(headers).body(body).send();
         let resp = match tokio::time::timeout(self.policy.header_timeout, send).await {
             Err(_) => return Err(NetError::HeaderTimeout(self.policy.header_timeout)),
             Ok(Err(e)) => {

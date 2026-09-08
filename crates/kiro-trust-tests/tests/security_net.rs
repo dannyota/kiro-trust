@@ -119,6 +119,40 @@ async fn error_bodies_are_capped() {
     assert_eq!(body.len(), 1024);
 }
 
+// spec 3.2: a hostile path must never move the request (and its bearer
+// token) to a different authority.
+#[tokio::test]
+async fn path_cannot_change_the_authority() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let client = Client::new(Policy::loopback_plain_http(server.address().port())).unwrap();
+    for bad_path in ["@evil.com/", "//evil.com/", "x", "/token?x=1"] {
+        let err = client
+            .post(&runtime(), bad_path, HeaderMap::new(), b"{}".to_vec())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NetError::BadPath { .. }), "{bad_path}");
+    }
+
+    let ok_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&ok_server)
+        .await;
+    let ok_client = Client::new(Policy::loopback_plain_http(ok_server.address().port())).unwrap();
+    let resp = ok_client
+        .post(&runtime(), "/token", HeaderMap::new(), b"{}".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(resp.status, 200);
+}
+
 #[test]
 fn production_policy_is_https_only_with_no_override() {
     let p = Policy::production();

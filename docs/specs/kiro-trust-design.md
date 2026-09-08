@@ -138,7 +138,10 @@ impl Client {
 }
 ```
 
-`Destination` is the only way to name a host. There is no `Url` in the public
+`Destination` is the only way to name a host. The request path is validated
+too: it must start with `/` and carry no userinfo, query, fragment, or
+backslash, and the built URL is parsed and checked to name exactly the
+destination host before it is sent. There is no `Url` in the public
 API. `Policy::production()` is the only constructor the binary uses. A
 `test-endpoints` cargo feature adds `Policy::loopback_plain_http(port)` for
 this crate's own tests; the binary never enables it and CI proves that.
