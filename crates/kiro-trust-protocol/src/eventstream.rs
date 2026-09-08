@@ -12,6 +12,9 @@ use serde_json::Value;
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 /// Spec 5.5: tool input accumulation per call.
 pub const MAX_TOOL_INPUT_BYTES: usize = 16 * 1024 * 1024;
+/// AWS event stream header-block limit (spec 7.5); bounds the number of
+/// `(String, HeaderValue)` tuples a single frame can force us to allocate.
+pub const MAX_HEADERS_BYTES: usize = 128 * 1024;
 const PRELUDE_LEN: usize = 12;
 const MIN_FRAME_LEN: u32 = 16;
 
@@ -124,6 +127,11 @@ impl FrameDecoder {
         }
         let body_len = total as usize - PRELUDE_LEN;
         if headers_len as usize > body_len - 4 {
+            return Err(FrameError::HeadersOverrun {
+                headers: headers_len,
+            });
+        }
+        if headers_len as usize > MAX_HEADERS_BYTES {
             return Err(FrameError::HeadersOverrun {
                 headers: headers_len,
             });
@@ -450,20 +458,37 @@ impl EventParser {
             self.tool.name = name;
         }
         match v.get("input") {
-            Some(Value::String(s)) => self.tool.input.push_str(s),
-            Some(other) if !other.is_null() => self.tool.input = other.to_string(),
+            Some(Value::String(s)) => {
+                if self.tool.input.len().saturating_add(s.len()) > MAX_TOOL_INPUT_BYTES {
+                    return self.reject_tool_input();
+                }
+                self.tool.input.push_str(s);
+            }
+            Some(other) if !other.is_null() => {
+                let serialized = other.to_string();
+                if serialized.len() > MAX_TOOL_INPUT_BYTES {
+                    return self.reject_tool_input();
+                }
+                self.tool.input = serialized;
+            }
             _ => {}
-        }
-        if self.tool.input.len() > MAX_TOOL_INPUT_BYTES {
-            return Err(EventError::ToolInputTooLarge {
-                tool_use_id: self.tool.id.clone(),
-                max: MAX_TOOL_INPUT_BYTES,
-            });
         }
         if v.get("stop").and_then(Value::as_bool) == Some(true) {
             out.push(self.tool.take());
         }
         Ok(out)
+    }
+
+    /// Cap exceeded: drop the in-flight call so neither `stop` nor end of
+    /// stream can hand out an over-cap `ToolUse` (kirocc caps and drops on
+    /// overflow rather than truncating silently).
+    fn reject_tool_input(&mut self) -> Result<Vec<Event>, EventError> {
+        let tool_use_id = self.tool.id.clone();
+        self.tool = ToolUseAccumulator::default();
+        Err(EventError::ToolInputTooLarge {
+            tool_use_id,
+            max: MAX_TOOL_INPUT_BYTES,
+        })
     }
 
     /// Flush an in-flight tool call at end of stream (kirocc `flush`).
@@ -580,6 +605,35 @@ mod tests {
         assert_eq!(frames[0].headers.len(), 10);
         assert_eq!(frames[0].headers[5].1, HeaderValue::Int(70000));
         assert_eq!(frames[0].headers[9].1, HeaderValue::Uuid([9u8; 16]));
+    }
+
+    #[test]
+    fn header_block_over_128kib_is_rejected_but_4kib_decodes() {
+        // 128 KiB + 1 byte of headers, each header exactly 3 bytes
+        // (name-len 1 + name "a" 1 + type byte 1; `HeaderValue::Bool(true)`
+        // carries no value bytes).
+        let mut oversized = Vec::new();
+        for _ in 0..43_691 {
+            push_header(&mut oversized, "a", &HeaderValue::Bool(true));
+        }
+        assert_eq!(oversized.len(), MAX_HEADERS_BYTES + 1);
+        let bytes = encode_frame(&oversized, b"{}");
+        let mut d = FrameDecoder::new();
+        d.push(&bytes);
+        assert!(matches!(
+            d.next_frame(),
+            Err(FrameError::HeadersOverrun { .. })
+        ));
+
+        // A 4 KiB header block is well under the cap and still decodes.
+        let mut small = Vec::new();
+        for _ in 0..1_365 {
+            push_header(&mut small, "a", &HeaderValue::Bool(true));
+        }
+        assert!(small.len() < 4096);
+        let bytes = encode_frame(&small, b"{}");
+        let frames = decode_all(&bytes);
+        assert_eq!(frames[0].headers.len(), 1_365);
     }
 
     fn events(frames: &[Vec<u8>]) -> Vec<Event> {
@@ -750,5 +804,46 @@ mod tests {
             p.parse(&f),
             Err(EventError::ToolInputTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn tool_input_cap_resets_accumulator_and_recovers() {
+        let mut p = EventParser::new();
+        let mut d = FrameDecoder::new();
+        let chunk = "x".repeat(1024 * 1024);
+        let payload = format!(r#"{{"toolUseId":"t1","name":"Read","input":"{chunk}"}}"#);
+        let frame = encode_event_frame("toolUseEvent", payload.as_bytes());
+        for _ in 0..16 {
+            d.push(&frame);
+            let f = d.next_frame().unwrap().unwrap();
+            p.parse(&f).unwrap();
+        }
+        d.push(&frame);
+        let f = d.next_frame().unwrap().unwrap();
+        assert!(matches!(
+            p.parse(&f),
+            Err(EventError::ToolInputTooLarge { .. })
+        ));
+        assert!(
+            p.finish().is_none(),
+            "the over-cap call must not survive to end of stream"
+        );
+
+        // A later, unrelated, complete tool-use event still parses normally.
+        let ok_frame = encode_event_frame(
+            "toolUseEvent",
+            br#"{"toolUseId":"t2","name":"Bash","input":"{}","stop":true}"#,
+        );
+        d.push(&ok_frame);
+        let f = d.next_frame().unwrap().unwrap();
+        let got = p.parse(&f).unwrap();
+        assert_eq!(
+            got[0],
+            Event::ToolUse {
+                tool_use_id: "t2".into(),
+                name: "Bash".into(),
+                input: "{}".into()
+            }
+        );
     }
 }

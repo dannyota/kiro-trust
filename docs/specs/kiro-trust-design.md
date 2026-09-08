@@ -602,6 +602,7 @@ name length u8, name, type u8, value; type 7 is a string with u16 BE length.
 Headers used: `:message-type` (`event` or `exception`), `:event-type`,
 `:content-type`, `:exception-type`. `total_length` below 16 or above 4 MiB is
 a decode error; a truncated prelude with zero bytes read is a clean end.
+A header block over 128 KiB is a decode error.
 
 Events and payload fields:
 
