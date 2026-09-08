@@ -346,9 +346,8 @@ Fixed values: `chatTriggerType: MANUAL`, `agentTaskType: vibe`.
 The decoder yields `Event` values (section 7.5). The response state machine
 tracks the current block (`thinking`, `text`, `tool_use`, or none) and emits:
 
-- `message_start` with `id: msg_<24 hex>`, the Anthropic model id the client
-  sent, empty content, and `usage.input_tokens` from the estimate until
-  `metadataEvent` arrives.
+- `message_start` with `id: msg_<24 hex>`, the Anthropic model id, empty
+  content, and zero usage; real usage arrives in `message_delta`.
 - `assistantResponseEvent.content` appends to a text block verbatim. Frames
   are incremental; there is no overlap removal (kirocc #116).
   `<thinking>` tags inside text open and close a thinking block (transcribe
@@ -356,9 +355,12 @@ tracks the current block (`thinking`, `text`, `tool_use`, or none) and emits:
 - `reasoningContentEvent.text` appends to a thinking block; `signature`
   becomes a `signature_delta`; `redactedContent` becomes a
   `redacted_thinking` block.
+- A `signature` on a reasoning event becomes a `signature_delta` on the
+  open thinking block.
 - `toolUseEvent` frames accumulate `input` fragments per `toolUseId` until
   `stop`; the block emits `content_block_start` with the mapped-back name and
-  `input_json_delta` chunks (transcribe from `kiroproto/tooluse.go`).
+  `input_json_delta` chunks (transcribe from `kiroproto/tooluse.go`); the
+  tool block is closed immediately after its single `input_json_delta`.
 - `metadataEvent.tokenUsage` sets `input_tokens = uncachedInputTokens +
   cacheReadInputTokens`, `output_tokens`, `cache_read_input_tokens`,
   `cache_creation_input_tokens = cacheWriteInputTokens`. `meteringEvent`
