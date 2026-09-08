@@ -1,0 +1,6 @@
+[
+  {"event_type": "assistantResponseEvent", "payload": {"content": "alpha E"}},
+  {"event_type": "assistantResponseEvent", "payload": {"content": "ND beta"}},
+  {"event_type": "assistantResponseEvent", "payload": {"content": " never sent"}},
+  {"event_type": "metadataEvent", "payload": {"tokenUsage": {"uncachedInputTokens": 20, "outputTokens": 6, "totalTokens": 26, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}}}
+]

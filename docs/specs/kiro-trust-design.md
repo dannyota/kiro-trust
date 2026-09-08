@@ -694,12 +694,21 @@ The offline suite must pass on `ubuntu-latest`, `macos-latest`, and
 - `request.json`: the Anthropic request as the client sent it
 - `expected-payload.json`: the Kiro payload kiro-trust must produce
 - `upstream.eventstream`: raw bytes from the runtime, when the case has a
-  response
+  response; a transcribed case may instead give `upstream.events.json`, a
+  readable list of `{"event_type": .., "payload": ..}` or
+  `{"exception_type": .., "payload": ..}` objects, one per frame, that the
+  harness re-encodes to the same bytes
 - `expected-sse.txt` or `expected-message.json`: the Anthropic output
 
 Fixture tests compare the produced payload with `expected-payload.json` as
 JSON values (key order independent, `conversationId` masked) and the produced
 SSE with `expected-sse.txt` byte for byte after masking `msg_` ids.
+
+`expected-payload.json`, `expected-sse.txt`, and `expected-message.json` are
+generated, never hand-written: run the fixture test with `UPDATE_FIXTURES=1`
+to (re)write them from the current `request.json` and upstream frames, then
+review the diff by hand before committing. A generated file that contradicts
+this spec is a product bug to fix, not an expectation to edit.
 
 Priority cases, in order: plain text; streaming text; frame boundaries inside
 multi-byte characters and repeated bytes; tool call; tool result; extended

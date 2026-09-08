@@ -1,0 +1,7 @@
+[
+  {"event_type": "assistantResponseEvent", "payload": {"content": "I will grep next."}},
+  {"event_type": "toolUseEvent", "payload": {"toolUseId": "toolu_02", "name": "mcp__very_long_server_name__and_an_even_longer_too_1d66f927323af", "input": "{\"pat"}},
+  {"event_type": "toolUseEvent", "payload": {"toolUseId": "toolu_02", "input": "tern\":\"main\"}"}},
+  {"event_type": "toolUseEvent", "payload": {"toolUseId": "toolu_02", "stop": true}},
+  {"event_type": "metadataEvent", "payload": {"tokenUsage": {"uncachedInputTokens": 120, "outputTokens": 20, "totalTokens": 140, "cacheReadInputTokens": 400, "cacheWriteInputTokens": 50}}}
+]

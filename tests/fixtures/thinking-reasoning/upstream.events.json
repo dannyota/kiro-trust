@@ -1,0 +1,6 @@
+[
+  {"event_type": "reasoningContentEvent", "payload": {"text": "The user wants "}},
+  {"event_type": "reasoningContentEvent", "payload": {"text": "the number.", "signature": "sig_fixture"}},
+  {"event_type": "assistantResponseEvent", "payload": {"content": "42"}},
+  {"event_type": "metadataEvent", "payload": {"tokenUsage": {"uncachedInputTokens": 40, "outputTokens": 12, "totalTokens": 52, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}}}
+]

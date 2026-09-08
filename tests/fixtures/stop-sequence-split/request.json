@@ -1,0 +1,1 @@
+{"model": "claude-sonnet-4-6", "max_tokens": 64, "stream": true, "stop_sequences": ["END"], "messages": [{"role": "user", "content": "kiro-trust fixture probe: say alpha END beta."}]}
