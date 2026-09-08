@@ -1,0 +1,62 @@
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Weekly, Sunday 03:00 UTC: advisories change without a commit.
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch; rust-toolchain.toml pins the version
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: ./scripts/check-packages.sh
+      - run: ./scripts/check-fixtures.sh
+      - run: ./scripts/check-features.sh
+      - name: Audit gate
+        run: |
+          cargo build --release --locked -p kiro-trust
+          if [ -f tests/fixtures/db/idc.sqlite3 ]; then
+            ./target/release/kiro-trust audit --json --kiro-db tests/fixtures/db/idc.sqlite3 > /tmp/audit.json
+            diff <(python3 -m json.tool tests/fixtures/db/idc-audit.json) <(python3 -m json.tool /tmp/audit.json)
+          else
+            echo "audit fixture not present yet"
+          fi
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check advisories bans licenses sources
