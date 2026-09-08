@@ -278,16 +278,14 @@ rows with attribution in `NOTICE`.
 | `claude-opus-5` | `claude-opus-5` | same | 1M | low, medium, high, xhigh, max |
 | `claude-opus-4-8` | `claude-opus-4.8` | same | 1M | low, medium, high, xhigh, max |
 | `claude-opus-4-7` | `claude-opus-4.7` | same | 1M | low, medium, high, xhigh, max |
-| `claude-opus-4-6` | `claude-opus-4.6` | same | 1M | low, medium, high, xhigh, max |
+| `claude-opus-4-6` | `claude-opus-4.6` | same | 1M | low, medium, high, max |
 | `claude-sonnet-5` | `claude-sonnet-5` | same | 1M | low, medium, high, xhigh, max |
-| `claude-sonnet-4-6` | `claude-sonnet-4.6` | `claude-sonnet-4.6-1m` | 200k / 1M | low, medium, high, xhigh, max |
-| `claude-sonnet-4.5` | `claude-sonnet-4.5` | `claude-sonnet-4.5-1m` | 200k / 1M | low, medium, high |
-| `claude-opus-4.5` | `claude-opus-4.5` | — | 200k | low, medium, high |
-| `claude-haiku-4.5` | `claude-haiku-4.5` | — | 200k | low, medium, high |
+| `claude-sonnet-4-6` | `claude-sonnet-4.6` | `claude-sonnet-4.6-1m` | 200k / 1M | low, medium, high, max |
+| `claude-sonnet-4.5` | `claude-sonnet-4.5` | `claude-sonnet-4.5-1m` | 200k / 1M | none (effort omitted) |
+| `claude-opus-4.5` | `claude-opus-4.5` | — | 200k | none (effort omitted) |
+| `claude-haiku-4.5` | `claude-haiku-4.5` | — | 200k | none (effort omitted) |
 
-The effort enum per model is transcribed from kirocc `internal/models/effort.go`
-during Phase 1; the values above are the expected shape and the transcription
-corrects them if they differ.
+Transcribed from kirocc v0.11.1 `internal/models/effort.go` on 2026-09-08.
 
 Resolution: strip a trailing `-YYYYMMDD` date, canonicalize a trailing `[1m]`
 or `[1M]` to `[1m]`, accept a dashed or dotted minor version
