@@ -315,7 +315,10 @@ conversation id (UUID v4 per request), and the effort level. Output: `Payload`.
    is ignored. Remaining tools become `toolSpecification` entries after
    schema sanitization (transcribe from `schema_sanitize.go`) and name mapping
    (transcribe from `tool_name_map.go`). A tool with `cache_control` gets a
-   `cachePoint` entry after it (transcribe from `cache_points.go`).
+   `cachePoint` entry after it (transcribe from `cache_points.go`). The keys
+   of `properties` are parameter names and are never treated as schema
+   keywords; only their values are sanitized. Each combinator branch is
+   sanitized once.
 3. Messages: consecutive same-role messages merge; the last message is the
    current message, everything before is history. A trailing assistant
    message pushes everything to history and synthesizes a `Continue` user

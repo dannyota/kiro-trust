@@ -54,6 +54,21 @@ pub fn sanitize_schema(schema: &Map<String, Value>) -> Map<String, Value> {
                 }
                 result.insert(key.clone(), value.clone());
             }
+            // `properties` keys are parameter names, not schema keywords: a
+            // property literally named `format`, `default`, `const`, etc.
+            // must survive untouched. Only each property's own value is a
+            // schema and gets sanitized.
+            "properties" => {
+                if let Value::Object(props) = value {
+                    let sanitized: Map<String, Value> = props
+                        .iter()
+                        .map(|(k, v)| (k.clone(), sanitize_value(v)))
+                        .collect();
+                    result.insert(key.clone(), Value::Object(sanitized));
+                } else {
+                    result.insert(key.clone(), value.clone());
+                }
+            }
             "anyOf" | "oneOf" | "allOf" => {}
             _ => {
                 result.insert(key.clone(), sanitize_value(value));
@@ -70,16 +85,27 @@ pub fn sanitize_schema(schema: &Map<String, Value>) -> Map<String, Value> {
                 if branches.is_empty() {
                     continue;
                 }
-                if let Some(merged) = flatten_enum_branches(branches) {
+                // Sanitize each object branch exactly once (`None` for a
+                // non-object branch) so nested anyOf/oneOf costs O(depth)
+                // instead of doubling per level between the enum-flatten
+                // attempt and the fallback below.
+                let sanitized: Vec<Option<Map<String, Value>>> = branches
+                    .iter()
+                    .map(|b| match b {
+                        Value::Object(m) => Some(sanitize_schema(m)),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(merged) = flatten_enum_branches(&sanitized) {
                     result.extend(merged);
                 } else {
-                    let non_null = drop_null_branches(branches);
+                    let non_null = drop_null_branches(&sanitized);
                     if non_null.len() == 1 {
-                        if let Value::Object(m) = non_null[0] {
-                            result.extend(sanitize_schema(m));
+                        if let Some(m) = non_null[0] {
+                            result.extend(m.clone());
                         }
-                    } else if let Some(Value::Object(first)) = branches.first() {
-                        result.extend(sanitize_schema(first));
+                    } else if let Some(first) = sanitized.first().and_then(|s| s.as_ref()) {
+                        result.extend(first.clone());
                     }
                 }
             }
@@ -113,20 +139,23 @@ fn sanitize_value(v: &Value) -> Value {
     }
 }
 
-fn drop_null_branches(branches: &[Value]) -> Vec<&Value> {
+/// Branches already sanitized once by the caller; `None` marks a branch that
+/// was not an object. A branch is dropped only when it sanitized to
+/// `{"type": "null"}`.
+fn drop_null_branches(branches: &[Option<Map<String, Value>>]) -> Vec<&Option<Map<String, Value>>> {
     branches
         .iter()
-        .filter(|b| !matches!(b, Value::Object(m) if m.get("type") == Some(&Value::String("null".into()))))
+        .filter(|s| !matches!(s, Some(m) if m.get("type") == Some(&Value::String("null".into()))))
         .collect()
 }
 
-fn flatten_enum_branches(branches: &[Value]) -> Option<Map<String, Value>> {
+/// Branches already sanitized once by the caller (see `drop_null_branches`).
+fn flatten_enum_branches(branches: &[Option<Map<String, Value>>]) -> Option<Map<String, Value>> {
     let mut all = Vec::new();
     let mut typ: Option<String> = None;
     let mut consistent = true;
     for b in branches {
-        let Value::Object(m) = b else { return None };
-        let s = sanitize_schema(m);
+        let s = b.as_ref()?;
         let Some(Value::Array(e)) = s.get("enum") else {
             return None;
         };
@@ -248,6 +277,61 @@ mod tests {
         assert_eq!(
             Value::Object(sanitize_schema(&overrides)),
             json!({"type": "string", "enum": ["x"]})
+        );
+    }
+
+    // Regression: flatten_enum_branches previously re-sanitized each branch
+    // that the fallback path also sanitized, doubling cost per nesting
+    // level. A non-enum leaf forces the fallback on every level, so depth 40
+    // used to be computationally infeasible; it must now complete in linear
+    // time.
+    #[test]
+    fn nested_any_of_sanitizes_in_linear_time() {
+        let mut schema = json!({"type": "string"});
+        for _ in 0..40 {
+            schema = json!({"anyOf": [schema]});
+        }
+        let s = obj(schema);
+        let start = std::time::Instant::now();
+        let got = sanitize_schema(&s);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 500,
+            "sanitize_schema took {elapsed:?} for depth 40, expected linear time"
+        );
+        assert_eq!(Value::Object(got), json!({"type": "string"}));
+    }
+
+    // Regression: `properties` keys are parameter names, not schema
+    // keywords, and must never be filtered or rewritten by the keyword list
+    // or the const/required special cases. Only each property's value is a
+    // schema.
+    #[test]
+    fn properties_named_after_keywords_survive() {
+        let s = obj(json!({
+            "type": "object",
+            "properties": {
+                "format": {"type": "string", "minLength": 1},
+                "default": {"type": "string"},
+                "const": {"type": "string"},
+                "pattern": {"type": "string"},
+                "required": {"type": "string"},
+                "ok": {"type": "string"}
+            }
+        }));
+        assert_eq!(
+            Value::Object(sanitize_schema(&s)),
+            json!({
+                "type": "object",
+                "properties": {
+                    "format": {"type": "string"},
+                    "default": {"type": "string"},
+                    "const": {"type": "string"},
+                    "pattern": {"type": "string"},
+                    "required": {"type": "string"},
+                    "ok": {"type": "string"}
+                }
+            })
         );
     }
 
