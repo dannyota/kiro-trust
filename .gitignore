@@ -1,0 +1,40 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Secrets and credentials; never commit them.
+*.key
+*.pem
+*.p12
+*.sqlite3
+!tests/fixtures/db/idc.sqlite3
+credentials.json
+.env
+.env.*
+
+# Raw captures may contain live credentials and real prompts until scrubbed.
+captures/
+tests/fixtures/**/*.unscrubbed.*
+
+# Fuzz artifacts and corpus growth
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/target/
+
+# Tooling
+.mcp.json
+.playwright-profile/
+.playwright-mcp/
+.worktrees/
+
+# Local working notes
+PLAN.md
+scratch/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Track the agent guidance file despite the global ignore default.
+!CLAUDE.md

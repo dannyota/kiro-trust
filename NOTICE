@@ -1,0 +1,18 @@
+kiro-trust
+Copyright 2026 Danny
+
+Licensed under the Apache License, Version 2.0.
+
+This project uses d-kuro/kirocc (https://github.com/d-kuro/kirocc),
+Apache License 2.0, Copyright d-kuro, as a behavioral reference. The
+following pieces are transcribed from kirocc v0.11.1 and carry that
+license and attribution:
+
+- the static Claude model table (internal/models/models.go)
+- the AWS EventStream test frame builder (internal/testutil/testutil.go)
+- JSON Schema sanitization rules (internal/reqconv/schema_sanitize.go)
+- tool name mapping rules (internal/reqconv/tool_name_map.go)
+- regression cases transcribed from kirocc tests, each named in the
+  fixture's meta.json
+
+Everything else is an independent implementation.
