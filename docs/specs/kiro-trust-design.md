@@ -329,7 +329,9 @@ conversation id (UUID v4 per request), and the effort level. Output: `Payload`.
    results reordered to the preceding assistant turn's `tool_use` order with
    `status` success or error and content blocks, and images
    (transcribe from `tool_results.go`, `images.go`).
-6. Thinking blocks in history replay per `thinking_blocks.go`.
+6. Thinking and `redacted_thinking` blocks in history are dropped; only text
+   and `tool_use` blocks reach `assistantResponseMessage`. (kirocc replays
+   redacted blobs for GPT models only, out of scope.)
 7. `profileArn` is set from the credential.
 8. Thinking: when `thinking.type` is `enabled` or `adaptive`, or
    `output_config.effort` is set, `additionalModelRequestFields.output_config.effort`
