@@ -179,8 +179,9 @@ confirm it is scoped to `master` and not a wildcard.
 Before every dispatch, verify each crate's Trusted Publishing entry on
 crates.io: repository owner `dannyota`, repository `kiro-trust`, workflow
 `publish-crates.yml`, environment `crates-io`. Check all five entries and the
-environment's required-reviewer rule. A successful token exchange does not
-prove the token authorizes all five crates.
+environment's required-reviewer rule and deployment branch policy. A
+successful token exchange does not prove the token authorizes all five
+crates.
 
 The normal workflow runs `scripts/check-crates-io-publish-ready.sh` in both
 jobs before token exchange or upload. The guard requires all five names to

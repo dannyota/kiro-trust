@@ -1016,10 +1016,17 @@ archives, built and attested in `build-local-artifacts`. The two installers,
 archive and derive installers and checksums from it, so widening a second
 job to `attestations: write`/`id-token: write` would buy little. The SBOM is
 a `.cdx.xml` per package on the release: `cargo-cyclonedx`'s own default,
-and what `dist`'s generated `release.yml` looks for by name;
-`release-preflight.yml` runs `cargo cyclonedx -v`, the exact invocation
-`release.yml` performs, to prove the tool works before the first tag rather
-than a separately-guessed invocation.
+and what `dist`'s generated `release.yml` looks for by name.
+`release-preflight.yml` greps the `cargo-cyclonedx` version `release.yml`
+pins (currently 0.5.5) out of that file rather than restating it, installs
+that exact version, then runs `cargo cyclonedx -v`: the same binary and the
+same invocation `release.yml` performs, so a future `dist` regeneration that
+bumps the pin cannot silently desync the rehearsal from the real run.
+`cargo-auditable` is left unpinned on both sides on purpose: `release.yml`'s
+generated matrix expression resolves to a `releases/latest` installer, so
+`release-preflight.yml` installing it with `--locked` and no version already
+matches; pinning only the preflight side would create the divergence this
+paragraph used to have for `cargo-cyclonedx`.
 
 No Homebrew tap and no quarantine removal.
 

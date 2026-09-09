@@ -14,7 +14,34 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo install cargo-auditable cargo-cyclonedx --locked
+      - name: Derive the pinned cargo-cyclonedx version from release.yml
+        id: cyclonedx-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Extracted rather than restated, so this rehearsal cannot silently
+          # desynchronize from what release.yml installs, including after a
+          # `dist` regeneration bumps the pin (task-23-fix-2.md Important 2).
+          # Fails loudly if the installer line's shape changes, rather than
+          # falling back to an unpinned install.
+          pattern='cargo-cyclonedx-[0-9]+\.[0-9]+\.[0-9]+/cargo-cyclonedx-installer\.sh'
+          count="$(grep -cE "$pattern" .github/workflows/release.yml)"
+          if [ "$count" -ne 1 ]; then
+            echo "expected exactly one pinned cargo-cyclonedx version in .github/workflows/release.yml matching '$pattern'; found $count" >&2
+            exit 1
+          fi
+          match="$(grep -oE "$pattern" .github/workflows/release.yml)"
+          version="${match#cargo-cyclonedx-}"
+          version="${version%/cargo-cyclonedx-installer.sh}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "pinned cargo-cyclonedx version: $version"
+      # cargo-auditable is intentionally left unpinned: release.yml's
+      # `matrix.install_cargo_auditable.run` (dist-generated, release.yml:157-158)
+      # expands to a `releases/latest` installer, so cargo-auditable already
+      # floats on both sides. Pinning it here only would create the
+      # divergence this file exists to prevent.
+      - run: cargo install cargo-auditable --locked
+      - run: cargo install cargo-cyclonedx --locked --version "${{ steps.cyclonedx-version.outputs.version }}"
       - run: cargo publish --workspace --dry-run --locked --registry crates-io
       - run: cargo auditable build --release --locked -p kiro-trust
       - run: cargo cyclonedx -v
