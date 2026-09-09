@@ -211,9 +211,24 @@ async fn unknown_routes_and_methods_use_the_error_envelope() {
 }
 
 #[tokio::test]
-async fn an_empty_bearer_token_is_rejected() {
+async fn an_empty_token_never_authenticates_even_against_an_empty_local_token() {
     let dir = tempfile::tempdir().unwrap();
-    let (app, _) = app(dir.path(), vec![]);
+    let net = Arc::new(Client::new(Policy::loopback_plain_http(1)).unwrap());
+    let tokens = Arc::new(TokenSource::new(test_db(dir.path()), net, None));
+    let upstream = Arc::new(Scripted {
+        responses: Mutex::new(vec![]),
+        payloads: Mutex::new(vec![]),
+    });
+    let state = Arc::new(AppState {
+        tokens,
+        upstream,
+        local_token: SecretString::from(String::new()),
+        limiter: Arc::new(tokio::sync::Semaphore::new(32)),
+        conversation_salt: [7u8; 16],
+    });
+    let app = build_router(state);
+
+    // Bearer with empty value (trailing space).
     let r = app
         .clone()
         .oneshot(
@@ -222,6 +237,27 @@ async fn an_empty_bearer_token_is_rejected() {
                 .body(Body::empty())
                 .unwrap(),
         )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+    // x-api-key with empty value.
+    let r = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/models")
+                .header("x-api-key", "")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+    // No auth header at all.
+    let r = app
+        .clone()
+        .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
