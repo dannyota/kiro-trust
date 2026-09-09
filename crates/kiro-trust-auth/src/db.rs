@@ -85,6 +85,24 @@ impl KiroDb {
         Ok(KiroDb { conn })
     }
 
+    /// Measures whether this connection is genuinely enforced read-only,
+    /// rather than assuming the flags passed to `open_read_only` took
+    /// effect (task-20-fix-1.md Important 2). Reads back `PRAGMA
+    /// query_only` on the live connection instead of returning a fixed
+    /// `true`: a regression that stopped setting the pragma would leave
+    /// `kiro-trust audit` asserting a guarantee nothing enforces, which is
+    /// the exact defect this method exists to catch.
+    ///
+    /// There is still only one constructor: nothing here can make the
+    /// connection writable, and `open_writable_is_impossible` below already
+    /// proves the authorizer denies a write independently of this pragma.
+    pub fn is_read_only(&self) -> bool {
+        self.conn
+            .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+            .map(|v| v != 0)
+            .unwrap_or(false)
+    }
+
     fn auth_kv(&self, keys: &[&str]) -> Result<Option<String>, AuthError> {
         for key in keys {
             let value: Option<String> = self
@@ -397,6 +415,17 @@ pub(crate) mod tests {
             KiroDb::open_read_only(std::path::Path::new("/nonexistent/data.sqlite3")),
             Err(AuthError::Open(_))
         ));
+    }
+
+    // task-20-fix-1.md Important 2: `is_read_only` measures the pragma on a
+    // live connection rather than returning a fixed `true`; this is the
+    // real invocation `kiro-trust audit` now depends on.
+    #[test]
+    fn open_read_only_is_measured_true_via_pragma_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_db(dir.path(), &[("kirocli:odic:token", TOKEN_SNAKE)], &[]);
+        let db = KiroDb::open_read_only(&path).unwrap();
+        assert!(db.is_read_only());
     }
 
     // spec 8.4 open_writable_is_impossible, only_auth_tables_are_readable

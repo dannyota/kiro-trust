@@ -557,6 +557,10 @@ Automatic updates      disabled
 Build features         none
 ```
 
+On Windows, `Local authentication` reads
+`required (token file, user profile ACL)`, matching 6.3: Windows sets no
+explicit file mode, so audit does not claim one.
+
 The profile ARN and account id are never printed. `--json` emits the same
 data as one object. When `Build features` lists `capture` or
 `test-endpoints`, audit exits 1.
@@ -848,8 +852,12 @@ successful retry. Live tests print token counts and durations only.
 6. `./scripts/check-fixtures.sh`
 7. `./scripts/check-features.sh` (8.4, last two lines)
 8. audit gate: `cargo build --release --locked -p kiro-trust` then
-   `target/release/kiro-trust audit --json --kiro-db tests/fixtures/db/idc.sqlite3`
-   compared with `tests/fixtures/db/idc-audit.json`
+   `target/release/kiro-trust audit --json --kiro-db tests/fixtures/db/idc.sqlite3 --token-file /tmp/kiro-trust-audit/token`.
+   `--token-file` points at a scratch path so the gate never touches a real
+   runtime token file. The `commit` field is stripped from the output before
+   comparing, because it changes on every build and so can never match a
+   committed fixture; what remains is compared with
+   `tests/fixtures/db/idc-audit.json`.
 
 `tests/fixtures/db/idc.sqlite3` is a synthetic database built by
 `cargo xtask make-db` with placeholder values; it is not a scrubbed copy.

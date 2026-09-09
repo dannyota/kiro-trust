@@ -13,6 +13,28 @@ use kiro_trust_net::{Destination, RuntimeRegion};
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 
+/// Replaces every occurrence of the real home directory in `s` with `~`
+/// (task-20-fix-1.md Important 1). Audit output is what a user pastes into
+/// a bug report to show their configuration is safe, and a bare path leaks
+/// the OS username the way a log line must not (CLAUDE.md; spec 6.4).
+/// `String::replace` rather than a prefix strip because the second call
+/// site embeds the path mid-sentence, inside rusqlite's own error text, not
+/// only at the start of the field.
+fn abbreviate_home(s: &str) -> String {
+    let home = directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_string_lossy().into_owned())
+        .unwrap_or_default();
+    abbreviate_home_with(s, &home)
+}
+
+fn abbreviate_home_with(s: &str, home: &str) -> String {
+    if home.is_empty() {
+        s.to_string()
+    } else {
+        s.replace(home, "~")
+    }
+}
+
 #[derive(Serialize, Default)]
 pub struct CredentialSource {
     pub path: String,
@@ -67,20 +89,45 @@ pub fn report(args: &AuditArgs) -> Result<AuditReport, String> {
     let db_path = resolve_db_path(args.kiro_db.clone()).map_err(|e| e.to_string())?;
     // Resolved but, per spec 6.6, never printed: `local_authentication` is a
     // fixed description of the guarantee, not a report of where this
-    // particular run would write a token (audit never writes one). Keeping
-    // the call validates that a token directory can be determined at all,
-    // the same config-error class `serve` fails on at startup.
+    // particular run would write a token (audit never writes one). When
+    // `--token-file` is not given, this validates that a token directory
+    // can be determined at all, the same config-error class `serve` fails
+    // on at startup. When `--token-file` *is* given, `resolve_token_file`
+    // cannot fail (it returns the given path unconditionally), so this
+    // validates nothing in that case; the flag is kept for parity with
+    // `serve`, which accepts the same flag, and so the CI audit gate can
+    // point it at a scratch path rather than the caller's real runtime
+    // directory (task-20-fix-1.md minor 5).
     let _token_file = resolve_token_file(args.token_file.clone()).map_err(|e| e.to_string())?;
-    let creds = KiroDb::open_read_only(&db_path).and_then(|db| db.read_identity_center());
+
+    // Validated regardless of whether the credential loaded below (
+    // task-20-fix-1.md minor 7): an invalid --runtime-region must always be
+    // reported, not silently discarded when the database can't be opened.
+    let region_arg = args.runtime_region.as_deref().map(RuntimeRegion::parse);
+    if let Some(Err(e)) = &region_arg {
+        problems.push(e.to_string());
+    }
+
+    let db_open = KiroDb::open_read_only(&db_path);
+    // Measured, not asserted (task-20-fix-1.md Important 2): `is_read_only`
+    // reads back the live connection's `query_only` pragma rather than this
+    // module trusting that `open_read_only`'s flags took effect.
+    let mode = match &db_open {
+        Ok(db) if db.is_read_only() => "read-only, authorizer enforced".to_string(),
+        Ok(_) => {
+            problems.push(
+                "database connection is not read-only: PRAGMA query_only reports false".to_string(),
+            );
+            "NOT read-only (query_only pragma unset)".to_string()
+        }
+        Err(_) => "unavailable (could not open the database)".to_string(),
+    };
+    let creds = db_open.and_then(|db| db.read_identity_center());
     let (auth, runtime, outbound) = match &creds {
         Ok(c) => {
-            let (region, source) = match args.runtime_region.as_deref().map(RuntimeRegion::parse) {
-                Some(Ok(r)) => (r, "from --runtime-region".to_string()),
-                Some(Err(e)) => {
-                    problems.push(e.to_string());
-                    (c.runtime_region.clone(), "from profile".to_string())
-                }
-                None => (c.runtime_region.clone(), "from profile".to_string()),
+            let (region, source) = match &region_arg {
+                Some(Ok(r)) => (r.clone(), "from --runtime-region".to_string()),
+                Some(Err(_)) | None => (c.runtime_region.clone(), "from profile".to_string()),
             };
             let expires = time::OffsetDateTime::from(c.expires_at)
                 .format(&Rfc3339)
@@ -105,7 +152,11 @@ pub fn report(args: &AuditArgs) -> Result<AuditReport, String> {
             )
         }
         Err(e) => {
-            problems.push(format!("credential: {e}"));
+            // AuthError::Open wraps rusqlite's message, which embeds the
+            // full database path; abbreviate the whole formatted string,
+            // not a pre-extracted path fragment, since the path is not
+            // leading in this text (task-20-fix-1.md Important 1).
+            problems.push(abbreviate_home(&format!("credential: {e}")));
             (
                 Authentication {
                     kind: "unavailable".into(),
@@ -145,17 +196,33 @@ pub fn report(args: &AuditArgs) -> Result<AuditReport, String> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         commit: env!("KIRO_TRUST_COMMIT").to_string(),
         credential_source: CredentialSource {
-            path: db_path.display().to_string(),
-            mode: "read-only, authorizer enforced".into(),
+            path: abbreviate_home(&db_path.display().to_string()),
+            mode,
         },
         authentication: auth,
         runtime,
         allowed_outbound: outbound,
-        tls_roots: "webpki-roots (compiled in)".into(),
-        http_proxy: "disabled (environment ignored)".into(),
-        redirects: "rejected".into(),
+        tls_roots: kiro_trust_net::TLS_ROOTS.to_string(),
+        http_proxy: kiro_trust_net::HTTP_PROXY.to_string(),
+        redirects: kiro_trust_net::REDIRECTS.to_string(),
         local_listener: listener,
-        local_authentication: "required (token file 0600)".into(),
+        // spec 6.3: file mode 0600 is set only `#[cfg(unix)]`
+        // (crates/kiro-trust/src/token.rs); on Windows nothing sets a mode,
+        // the file inherits the user profile ACL, and asserting the Unix
+        // text there would be a false guarantee (task-20-fix-1.md
+        // Critical 2).
+        local_authentication: if cfg!(unix) {
+            "required (token file 0600)".to_string()
+        } else {
+            "required (token file, user profile ACL)".to_string()
+        },
+        // telemetry, request_body_logging, dynamic_model_discovery, and
+        // automatic_updates stay fixed literals (task-20-fix-1.md
+        // Important 2, scoped): each asserts the *absence* of code, and a
+        // constant sitting next to nothing cannot prove that any better
+        // than a string literal does. Mechanizing tls_roots, http_proxy,
+        // and redirects works because those assert the *presence* of a
+        // specific, one-place builder call this module can read back.
         telemetry: "none".into(),
         content_sharing: if args.share_content {
             "enabled (--share-content)".into()
@@ -250,25 +317,19 @@ mod tests {
     use std::path::Path;
 
     /// Placeholder database with the real schema (spec 8.7), for tests only.
-    /// Byte-identical to the batch in `xtask/src/main.rs`'s `make-db`
-    /// command, duplicated rather than shared because `xtask` must not
-    /// depend on this crate (task-20-rulings.md ruling 2) and this crate
-    /// must not carry `rusqlite` as a normal dependency (CLAUDE.md:
-    /// `KiroDb::open_read_only` is the only opener). Never a real
-    /// credential; the SSO region and ARN are the fixture's own
-    /// (task-20-rulings.md ruling 1, ruling 4).
+    /// The SQL is `include_str!`-shared with `xtask/src/main.rs`'s
+    /// `make-db` command, not duplicated, so the audit gate's fixture and
+    /// this crate's own tests can never drift out of byte-identical sync
+    /// (task-20-fix-1.md Important 4). This crate still carries no
+    /// `rusqlite` in `[dependencies]` (CLAUDE.md: `KiroDb::open_read_only`
+    /// is the only opener); `rusqlite` here is a `[dev-dependencies]` entry
+    /// used only inside this `#[cfg(test)]` module.
+    const SYNTHETIC_IDC_SQL: &str = include_str!("../../kiro-trust-auth/synthetic-idc.sql");
+
     fn make_synthetic_db(path: &Path) -> Result<(), String> {
         let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value TEXT);
-             CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value BLOB);
-             DELETE FROM auth_kv; DELETE FROM state;
-             INSERT INTO auth_kv VALUES ('kirocli:odic:token', '{\"access_token\":\"placeholder-access\",\"refresh_token\":\"ph-ref\",\"expires_at\":\"2099-01-01T00:00:00Z\",\"region\":\"us-east-1\"}');
-             INSERT INTO auth_kv VALUES ('kirocli:odic:device-registration', '{\"clientId\":\"placeholder-client\",\"clientSecret\":\"ph-sec\"}');
-             INSERT INTO state VALUES ('auth.idc.region', '\"us-east-1\"');
-             INSERT INTO state VALUES ('api.codewhisperer.profile', '{\"arn\":\"arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE\",\"profile_name\":\"KiroProfile-us-east-1\"}');",
-        )
-        .map_err(|e| e.to_string())
+        conn.execute_batch(SYNTHETIC_IDC_SQL)
+            .map_err(|e| e.to_string())
     }
 
     fn synthetic_db(dir: &std::path::Path) -> std::path::PathBuf {
@@ -356,8 +417,12 @@ mod tests {
         assert!(!json.contains("000000000000"));
     }
 
+    // task-20-fix-1.md minor 1: split from the old `problems_make_audit_fail`,
+    // which set both a non-loopback `--listen` and `--share-content` and
+    // asserted exit 1, so it never proved which condition caused the
+    // failure. This half isolates the non-loopback listener.
     #[test]
-    fn problems_make_audit_fail() {
+    fn a_non_loopback_listener_fails_the_audit() {
         let dir = tempfile::tempdir().unwrap();
         let db = synthetic_db(dir.path());
         let args = AuditArgs {
@@ -366,7 +431,7 @@ mod tests {
             kiro_db: Some(db),
             runtime_region: None,
             token_file: None,
-            share_content: true,
+            share_content: false,
         };
         let r = report(&args).unwrap();
         assert!(
@@ -374,8 +439,184 @@ mod tests {
             "{:?}",
             r.problems
         );
-        assert_eq!(r.content_sharing, "enabled (--share-content)");
         assert_eq!(exit_code(&r), 1);
+    }
+
+    // task-20-fix-1.md minor 1: the other half. `--share-content` is
+    // spec-conformant (it produces no `problems` entry, so the exit code
+    // stays 0), and this test pins exactly that: the warning text is
+    // present but the command still succeeds.
+    #[test]
+    fn share_content_warns_but_does_not_fail_the_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = synthetic_db(dir.path());
+        let args = AuditArgs {
+            json: false,
+            listen: "127.0.0.1:3456".into(),
+            kiro_db: Some(db),
+            runtime_region: None,
+            token_file: None,
+            share_content: true,
+        };
+        let r = report(&args).unwrap();
+        assert_eq!(r.content_sharing, "enabled (--share-content)");
+        assert!(render_text(&r).contains("enabled (--share-content)"));
+        // --share-content alone never produces a `problems` entry (spec
+        // conformant, task-20-fix-1.md minor 1). `cargo test -p kiro-trust`
+        // alone compiles no development feature into this crate or
+        // kiro-trust-net; `cargo test --workspace` can unify
+        // `test-endpoints` in regardless of this test
+        // (report_has_every_line_and_no_secrets above explains why), which
+        // is a real, unrelated problem this test must not paper over, so
+        // the exit-0 assertion only applies when that signal is absent.
+        if !kiro_trust_net::TEST_ENDPOINTS_COMPILED && !cfg!(feature = "capture") {
+            assert_eq!(exit_code(&r), 0, "{:?}", r.problems);
+        }
+    }
+
+    // task-20-fix-1.md minor 7: an invalid --runtime-region must be
+    // reported even when the credential itself fails to load, not silently
+    // discarded because the validation used to sit inside the `Ok(c)` arm.
+    #[test]
+    fn an_invalid_runtime_region_is_reported_even_when_the_credential_fails_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nonexistent.sqlite3");
+        let args = AuditArgs {
+            json: false,
+            listen: "127.0.0.1:3456".into(),
+            kiro_db: Some(missing),
+            runtime_region: Some("not-a-region".into()),
+            token_file: None,
+            share_content: false,
+        };
+        let r = report(&args).unwrap();
+        assert!(
+            r.problems.iter().any(|p| p.contains("not-a-region")),
+            "{:?}",
+            r.problems
+        );
+        assert!(
+            r.problems.iter().any(|p| p.contains("credential")),
+            "{:?}",
+            r.problems
+        );
+    }
+
+    // task-20-fix-1.md Critical 2: this must not be `#[cfg(unix)]`-gated,
+    // the exact pattern that let the audit's Windows text go unasserted in
+    // CI in the first place (`writes_0600_reads_back_and_removes` in
+    // `token.rs`). Branching inside one test that always runs proves the
+    // text on whichever platform actually executes it.
+    #[test]
+    fn local_authentication_text_matches_the_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = synthetic_db(dir.path());
+        let args = AuditArgs {
+            json: false,
+            listen: "127.0.0.1:3456".into(),
+            kiro_db: Some(db),
+            runtime_region: None,
+            token_file: None,
+            share_content: false,
+        };
+        let r = report(&args).unwrap();
+        if cfg!(unix) {
+            assert_eq!(r.local_authentication, "required (token file 0600)");
+        } else {
+            assert_eq!(
+                r.local_authentication,
+                "required (token file, user profile ACL)"
+            );
+        }
+        assert!(render_text(&r).contains(&format!(
+            "Local authentication   {}",
+            r.local_authentication
+        )));
+    }
+
+    // task-20-fix-1.md Important 1: derived from the real $HOME at test
+    // time, like the Task 19 log-leak test, rather than a hardcoded path,
+    // per CLAUDE.md's rule against a real home path in a test. The file is
+    // never created, only referenced, so `KiroDb::open_read_only` fails and
+    // `AuthError::Open` embeds this path in its message, exercising both
+    // call sites (task-20-fix-1.md Important 1) at once: `credential_source
+    // .path`, and the `problems` entry the error produces.
+    #[test]
+    fn a_db_path_under_home_is_tilde_abbreviated_in_text_and_json() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/nonexistent-home".to_string());
+        let missing = std::path::PathBuf::from(&home).join(format!(
+            "kiro-trust-audit-test-missing-{}.sqlite3",
+            std::process::id()
+        ));
+        let args = AuditArgs {
+            json: false,
+            listen: "127.0.0.1:3456".into(),
+            kiro_db: Some(missing),
+            runtime_region: None,
+            token_file: None,
+            share_content: false,
+        };
+        let r = report(&args).unwrap();
+        assert!(
+            r.credential_source.path.starts_with('~'),
+            "{}",
+            r.credential_source.path
+        );
+        assert!(!r.credential_source.path.contains(&home));
+        assert!(
+            r.problems
+                .iter()
+                .any(|p| p.contains('~') && !p.contains(&home)),
+            "{:?}",
+            r.problems
+        );
+        let text = render_text(&r);
+        assert!(!text.contains(&home), "home path leaked in text:\n{text}");
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains(&home), "home path leaked in json:\n{json}");
+    }
+
+    #[test]
+    fn a_path_outside_home_is_unchanged_by_abbreviate_home() {
+        assert_eq!(
+            abbreviate_home_with("tests/fixtures/db/idc.sqlite3", "/home/someone"),
+            "tests/fixtures/db/idc.sqlite3"
+        );
+        assert_eq!(
+            abbreviate_home_with(
+                "credential: cannot open the Kiro CLI database read-only: unable to open \
+                 database file: /home/someone/nonexistent.sqlite3",
+                "/home/someone"
+            ),
+            "credential: cannot open the Kiro CLI database read-only: unable to open \
+             database file: ~/nonexistent.sqlite3"
+        );
+    }
+
+    // task-20-fix-1.md Important 2: `KiroDb::open_read_only` is the only
+    // constructor and it always yields a genuinely read-only connection
+    // (`open_read_only_is_measured_true_via_pragma_readback` in
+    // kiro-trust-auth proves that with a real call), so a failing case
+    // cannot be constructed without a second, writable constructor, which
+    // CLAUDE.md forbids. Assert on a hand-built report instead, pinning the
+    // exit-code and rendering contract `report()` wires up when the
+    // measured check fails.
+    #[test]
+    fn a_non_read_only_connection_fails_the_audit() {
+        let r = AuditReport {
+            credential_source: CredentialSource {
+                mode: "NOT read-only (query_only pragma unset)".into(),
+                ..Default::default()
+            },
+            problems: vec![
+                "database connection is not read-only: PRAGMA query_only reports false".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(exit_code(&r), 1);
+        let text = render_text(&r);
+        assert!(text.contains("mode                 NOT read-only (query_only pragma unset)"));
+        assert!(text.contains("database connection is not read-only"));
     }
 
     // task-20-rulings.md ruling 5: `test-endpoints` lives in kiro-trust-net

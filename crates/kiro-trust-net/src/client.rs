@@ -27,6 +27,18 @@ pub enum NetError {
     BadPath { host: String },
 }
 
+/// Root store `kiro-trust audit` reports (spec 6.6): kept next to the
+/// `with_root_certificates` call in `Client::new` below so changing the
+/// compiled-in root store without updating this text is visibly wrong to a
+/// reader (task-20-fix-1.md Important 2).
+pub const TLS_ROOTS: &str = "webpki-roots (compiled in)";
+/// Proxy behavior `kiro-trust audit` reports: kept next to the
+/// `.no_proxy()` call below (task-20-fix-1.md Important 2).
+pub const HTTP_PROXY: &str = "disabled (environment ignored)";
+/// Redirect behavior `kiro-trust audit` reports: kept next to the
+/// `.redirect(...)` call below (task-20-fix-1.md Important 2).
+pub const REDIRECTS: &str = "rejected";
+
 pub struct Client {
     inner: reqwest::Client,
     policy: Policy,
@@ -34,15 +46,15 @@ pub struct Client {
 
 impl Client {
     pub fn new(policy: Policy) -> Result<Self, NetError> {
-        let mut roots = rustls::RootCertStore::empty();
+        let mut roots = rustls::RootCertStore::empty(); // audit reports this root store as TLS_ROOTS
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let tls = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         let inner = reqwest::Client::builder()
             .tls_backend_preconfigured(tls)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none()) // audit reports this as REDIRECTS
+            .no_proxy() // audit reports this as HTTP_PROXY
             .https_only(policy.https_only())
             .http1_only()
             .connect_timeout(policy.connect_timeout)

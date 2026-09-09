@@ -42,10 +42,28 @@ jobs:
       - run: ./scripts/check-fixtures.sh
       - run: ./scripts/check-features.sh
       - name: Audit gate
+        # tests/fixtures/db/idc-audit.json's "version" field is not stripped
+        # below: a version bump must change it, so regenerate the fixture
+        # (spec 8.7) whenever the workspace version changes, and keep this
+        # comment for the docs/releasing.md checklist that should eventually
+        # own that step (task-20-fix-1.md minor 2).
         run: |
+          set -o pipefail
           cargo build --release --locked -p kiro-trust
+          # `audit`'s exit code would otherwise be masked by the `python3`
+          # stage of this pipe (task-20-fix-1.md minor 3): `pipefail` above
+          # makes the pipeline's status the rightmost non-zero status, and
+          # the explicit check below asserts it rather than relying on that
+          # alone.
+          set +e
           ./target/release/kiro-trust audit --json --kiro-db tests/fixtures/db/idc.sqlite3 --token-file /tmp/kiro-trust-audit/token \
             | python3 -c 'import json,sys; d=json.load(sys.stdin); d.pop("commit"); print(json.dumps(d, indent=2, sort_keys=True))' > /tmp/audit.json
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "expected 'kiro-trust audit' to exit 0 against the clean synthetic fixture, got $status" >&2
+            exit 1
+          fi
           diff tests/fixtures/db/idc-audit.json /tmp/audit.json
 
   audit:
