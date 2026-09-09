@@ -447,7 +447,8 @@ offline, documented as approximate.
 
 ## 6. Security contracts
 
-Each line here maps to a test in `tests/security/` (section 8.4).
+Each line here maps to a test in `crates/kiro-trust-tests/tests/security_net.rs`
+or `security_logging.rs` (section 8.4).
 
 ### 6.1 Credential database
 
@@ -501,11 +502,16 @@ Each line here maps to a test in `tests/security/` (section 8.4).
   beyond its basename.
 - There is no body-logging flag. Payload capture exists only behind the
   `capture` cargo feature and is compiled out of release builds.
-- `--log-level`/`KIRO_TRUST_LOG` only ever raises this project's own crates
+- `--log-level`/`KIRO_TRUST_LOG` accepts exactly `error`, `warn`, `info`,
+  `debug` (section 4.1); either source is validated at the CLI boundary, and
+  an unrecognized value is a usage error (exit 2), never a silent fallback.
+- A validated level only ever raises this project's own crates
   (`kiro_trust`, `kiro_trust_auth`, `kiro_trust_kiro`, `kiro_trust_net`).
   Third-party crates, notably `hyper`, `rustls`, and `reqwest`, stay at
-  `warn` at every level the CLI accepts, including `debug` and `trace`, so
-  they never log request data.
+  `warn` at every level the CLI accepts, so they never log request data. The
+  filter is built from the parsed level and a fixed target list, never by
+  interpolating the raw string into a directive list, so a `,` or `=`
+  inside it can never introduce or widen a directive for another target.
 
 ### 6.5 Telemetry
 
@@ -774,8 +780,10 @@ Fixtures are public. Record only marker prompts (`kiro-trust fixture probe:
 
 ### 8.4 Security tests
 
-One test per line, in `crates/kiro-trust-tests/tests/security.rs` (net and
-auth cases enable the `test-endpoints` feature from that crate only):
+One test per line, split across `crates/kiro-trust-tests/tests/security_net.rs`
+(net and auth cases, which enable the `test-endpoints` feature from that
+crate only) and `crates/kiro-trust-tests/tests/security_logging.rs` (the
+logging case):
 
 - `open_writable_is_impossible`: `UPDATE auth_kv` through the connection
   fails with an authorizer denial
@@ -784,10 +792,13 @@ auth cases enable the `test-endpoints` feature from that crate only):
 (unit tests in `crates/kiro-trust-auth/src/db.rs`, since they need the
 connection)
 
-- `authorization_never_logged`, `refresh_token_never_logged`,
-  `client_secret_never_logged`, `prompt_never_logged`,
-  `tool_args_never_logged`: run the full fixture suite with a capturing
-  subscriber at `debug` and assert none of the markers appear
+- `nothing_sensitive_reaches_the_logs` (`security_logging.rs`): runs real
+  `/v1/messages` flows (streaming, folded, an auth failure, and a malformed
+  body) at `debug` level against a process-wide capturing subscriber, and
+  asserts that none of a marker set covering every spec 6.4 forbidden
+  category (headers, prompt, tool name/argument/result, thinking text,
+  response text, conversation id, session id, token, home path, database
+  path, account id, ARN) appears in any captured log line
 - `oidc_redirect_rejected`, `runtime_redirect_rejected`: a 302 from a
   loopback test server is an error and no second request is made
 - `invalid_region_rejected`: `us-east-1/`, `evil.com`, `US-EAST-1`,

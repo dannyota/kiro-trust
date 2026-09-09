@@ -92,15 +92,28 @@ pub async fn run(cfg: ServeConfig) -> Result<(), String> {
             let _ = ctrl_c.await;
         }
         tracing::info!("shutdown requested, draining for up to 10s");
-        // Stop new clients first, then bound the drain: open streams get
-        // 10 s, after which the process exits regardless (spec 4.1).
+        // Delete the token file the instant the signal arrives, so no new
+        // client can read a valid token during the drain that follows.
+        // `axum::serve`'s graceful shutdown stops accepting new connections
+        // only once this future returns, which happens right after the
+        // deadline task below is spawned; existing connections then get up
+        // to 10 s to finish before that task force-exits regardless
+        // (spec 4.1).
         if wrote_file {
             let _ = token::remove_token_file(&token_file);
         }
         tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(10)).await;
             tracing::warn!("drain deadline reached, exiting");
-            std::process::exit(0);
+            // Non-zero: reaching this branch means the graceful drain did
+            // not finish within the bound, which is not the same outcome
+            // as the normal path below returning `Ok(())` in time. Using
+            // `0` unconditionally here would report success even when the
+            // still-pending `axum::serve` future was heading toward a real
+            // error, since this call terminates the process before that
+            // future ever gets to resolve and flow through the normal
+            // `Result`-to-exit-code mapping in `lib.rs`.
+            std::process::exit(1);
         });
     };
     let result = axum::serve(listener, build_router(state))
@@ -131,21 +144,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("no-such-data.sqlite3");
         let token_file = dir.path().join("run").join("token");
-        let cli = Cli::try_parse_from([
-            "kiro-trust",
-            "serve",
-            "--kiro-db",
-            db_path.to_str().unwrap(),
-            "--token-file",
-            token_file.to_str().unwrap(),
-            "--listen",
-            "127.0.0.1:0",
-        ])
-        .unwrap();
-        let Command::Serve(args) = cli.command else {
-            panic!()
+        let cfg = {
+            // Guards against a concurrent test's KIRO_TRUST_LOG mutation
+            // (see `config::LOG_LEVEL_ENV_TEST_LOCK`) only for as long as
+            // parsing actually reads the environment; released before the
+            // `.await` below so it is never held across one.
+            let _guard = crate::config::LOG_LEVEL_ENV_TEST_LOCK.lock().unwrap();
+            let cli = Cli::try_parse_from([
+                "kiro-trust",
+                "serve",
+                "--kiro-db",
+                db_path.to_str().unwrap(),
+                "--token-file",
+                token_file.to_str().unwrap(),
+                "--listen",
+                "127.0.0.1:0",
+            ])
+            .unwrap();
+            let Command::Serve(args) = cli.command else {
+                panic!()
+            };
+            ServeConfig::from_args(args).unwrap()
         };
-        let cfg = ServeConfig::from_args(args).unwrap();
         let err = run(cfg).await.unwrap_err();
         assert!(!err.is_empty());
         assert!(

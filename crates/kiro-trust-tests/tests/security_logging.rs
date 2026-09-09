@@ -5,7 +5,7 @@ mod common {
 }
 
 use axum::body::Body;
-use axum::http::Request;
+use axum::http::{Request, StatusCode};
 use common::{TOKEN, app, body_string};
 use kiro_trust_protocol::eventstream::encode_event_frame;
 use std::io::Write;
@@ -55,7 +55,11 @@ fn capture() -> Capture {
             .with_env_filter(kiro_trust::logging::filter("debug"))
             .with_writer(capture.clone())
             .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
+        // A silently discarded error here would leave the capture inert
+        // (an empty buffer) with no indication why every marker assertion
+        // below is vacuously true.
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("capture subscriber installed once");
         capture
     })
     .clone()
@@ -66,7 +70,18 @@ async fn nothing_sensitive_reaches_the_logs() {
     let capture = capture();
 
     let dir = tempfile::tempdir().unwrap();
+    // Well-formed tool_use/tool_result pair (Important 3): a bare orphan
+    // tool_result would be textualized by `normalize_messages` before it
+    // ever reaches history (see `translate/normalize.rs`'s
+    // `textualize_orphan_tool_results`), changing the message shape instead
+    // of exercising the tool-result path. Pairing the id with a `tool_use`
+    // in the immediately preceding assistant message keeps it a real block
+    // (see `translate/history.rs`'s `extract_tool_results`).
     let frames: Vec<u8> = [
+        encode_event_frame(
+            "reasoningContentEvent",
+            br#"{"text":"THINKING_MARKER_c4f","signature":"s"}"#,
+        ),
         encode_event_frame("assistantResponseEvent", br#"{"content":"RESPONSE_MARKER_9f1"}"#),
         encode_event_frame(
             "toolUseEvent",
@@ -84,9 +99,18 @@ async fn nothing_sensitive_reaches_the_logs() {
     for stream in [true, false] {
         let req = serde_json::json!({
             "model": "claude-sonnet-4-6", "max_tokens": 50, "stream": stream,
+            "thinking": {"type": "enabled"},
             "system": format!("SYSTEM_MARKER_3a4 {home}/private"),
             "tools": [{"name": "mcp__secretserver__tool", "description": "TOOL_DESC_MARKER", "input_schema": {"type": "object"}}],
-            "messages": [{"role": "user", "content": "PROMPT_MARKER_5b6 with a fake key sk-ant-MARKER"}]
+            "messages": [
+                {"role": "user", "content": "PROMPT_MARKER_5b6 with a fake key sk-ant-MARKER"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_pair1", "name": "mcp__secretserver__tool", "input": {"path": "x"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_pair1", "content": "TOOL_RESULT_MARKER_8d3"}
+                ]}
+            ]
         });
         let r = app
             .clone()
@@ -99,9 +123,20 @@ async fn nothing_sensitive_reaches_the_logs() {
             )
             .await
             .unwrap();
-        let _ = body_string(r).await;
+        // A 200 proves this request reached the code that could log it,
+        // rather than failing earlier for an unrelated reason.
+        assert_eq!(r.status(), StatusCode::OK, "stream={stream}");
+        let body = body_string(r).await;
+        if !stream {
+            // Proves the response marker actually traversed translation and
+            // the response-logging call site, not just the request side.
+            assert!(
+                body.contains("RESPONSE_MARKER_9f1"),
+                "non-streaming response body missing the response marker: {body}"
+            );
+        }
     }
-    // Force an auth failure and a bad request too.
+    // An auth failure (fails in require_token, before any body parsing).
     let r = app
         .clone()
         .oneshot(
@@ -112,10 +147,42 @@ async fn nothing_sensitive_reaches_the_logs() {
         )
         .await
         .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let _ = body_string(r).await;
+    // An authenticated but malformed body, so the 400 `invalid_request`
+    // path (a plausible leak site for a parse error) is genuinely exercised
+    // too, not just the auth-failure path above.
+    let r = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("x-api-key", TOKEN)
+                .body(Body::from("{not valid json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     let _ = body_string(r).await;
 
     let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-    assert!(logs.contains("request"), "logging is active: {logs}");
+    // Important 2: `logs.contains("request")` used to pass on any of the 22
+    // `common::` tests' output sharing this process-wide buffer (the
+    // `request_id` field name and the literal "request failed" message both
+    // contain "request"), so it proved nothing about whether *this* test's
+    // own flows reached a log line. A line carrying both `path` set to
+    // `/v1/messages` and `input_bytes` only ever comes from the one log
+    // call site this test depends on (`messages.rs`'s initial per-request
+    // "request" log), so this still catches the failure mode the guard
+    // exists for: if a catalog rename, a token change, a route change, or a
+    // middleware change ever stopped *any* `/v1/messages` request in this
+    // binary from reaching that call site, this line would stop appearing
+    // and the assertion would fail.
+    assert!(
+        logs.lines()
+            .any(|l| l.contains("path=\"/v1/messages\"") && l.contains("input_bytes=")),
+        "logging is active: no /v1/messages request line with input_bytes seen:\n{logs}"
+    );
     for marker in [
         "RESPONSE_MARKER",
         "ARG_MARKER",
@@ -134,6 +201,9 @@ async fn nothing_sensitive_reaches_the_logs() {
         home.as_str(),
         "000000000000",
         "arn:aws",
+        "TOOL_RESULT_MARKER",
+        "THINKING_MARKER",
+        dir.path().to_str().unwrap(),
     ] {
         assert!(!logs.contains(marker), "{marker} leaked into logs:\n{logs}");
     }
