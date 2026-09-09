@@ -10,6 +10,9 @@ use serde::Deserialize;
 use std::time::{Duration, SystemTime};
 
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Identity Center issues one-hour tokens; anything larger indicates a
+/// malformed response rather than a legitimate long-lived token.
+const MAX_EXPIRES_IN_SECS: i64 = 31_536_000;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,29 +39,36 @@ pub(crate) async fn refresh(net: &Client, creds: &Credentials) -> Result<Credent
     let dest = Destination::Oidc {
         sso_region: creds.sso_region.clone(),
     };
-    let resp = tokio::time::timeout(
-        REFRESH_TIMEOUT,
-        net.post(&dest, "/token", headers, serde_json::to_vec(&body).unwrap()),
-    )
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    // Bound the whole exchange, including the body read: a 200 response
+    // that drips bytes must not hold the refresh gate up to the read-idle
+    // timeout (spec 7.3 says 30s total).
+    let bytes = tokio::time::timeout(REFRESH_TIMEOUT, async {
+        let resp = net.post(&dest, "/token", headers, body_bytes).await?;
+        if resp.status != 200 {
+            return Err(AuthError::RefreshRejected {
+                status: resp.status,
+            });
+        }
+        let bytes = resp.bytes_limited().await?;
+        Ok::<_, AuthError>(bytes)
+    })
     .await
     .map_err(|_| AuthError::Refresh("timed out".into()))??;
-    if resp.status != 200 {
-        return Err(AuthError::RefreshRejected {
-            status: resp.status,
-        });
-    }
-    let bytes = resp.bytes_limited().await?;
     let parsed: TokenResponse = serde_json::from_slice(&bytes)
         .map_err(|_| AuthError::Refresh("response was not the expected JSON".into()))?;
     if parsed.access_token.is_empty() {
         return Err(AuthError::Refresh("empty accessToken".into()));
     }
-    if parsed.expires_in <= 0 {
+    if parsed.expires_in <= 0 || parsed.expires_in > MAX_EXPIRES_IN_SECS {
         return Err(AuthError::Refresh(format!(
             "invalid expiresIn {}",
             parsed.expires_in
         )));
     }
+    let expires_at = SystemTime::now()
+        .checked_add(Duration::from_secs(parsed.expires_in as u64))
+        .ok_or_else(|| AuthError::Refresh("expiresIn out of range".into()))?;
     Ok(Credentials {
         access_token: SecretString::from(parsed.access_token),
         refresh_token: parsed
@@ -68,7 +78,7 @@ pub(crate) async fn refresh(net: &Client, creds: &Credentials) -> Result<Credent
             .unwrap_or_else(|| creds.refresh_token.clone()),
         client_id: creds.client_id.clone(),
         client_secret: creds.client_secret.clone(),
-        expires_at: SystemTime::now() + Duration::from_secs(parsed.expires_in as u64),
+        expires_at,
         sso_region: creds.sso_region.clone(),
         runtime_region: creds.runtime_region.clone(),
         profile_arn: creds.profile_arn.clone(),

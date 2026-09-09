@@ -97,3 +97,31 @@ async fn refresh_failure_is_an_error_and_invalidate_forces_reread() {
     src.invalidate().await;
     assert_eq!(src.with_token(|t| t.to_string()).await.unwrap(), "relogin");
 }
+
+#[tokio::test]
+async fn absurd_expires_in_is_rejected() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"accessToken": "a", "expiresIn": 9223372036854775807i64}),
+        ))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let src = source(&server, make_db(dir.path(), "2020-01-01T00:00:00Z")).await;
+    let err = src.with_token(|t| t.to_string()).await.unwrap_err();
+    assert!(matches!(err, AuthError::Refresh(_)), "{err}");
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"accessToken": "a", "expiresIn": 0})),
+        )
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let src = source(&server, make_db(dir.path(), "2020-01-01T00:00:00Z")).await;
+    let err = src.with_token(|t| t.to_string()).await.unwrap_err();
+    assert!(matches!(err, AuthError::Refresh(_)), "{err}");
+}
