@@ -40,3 +40,8 @@ time = { version = "0.3.55", features = ["formatting"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Test-only: builds the synthetic audit-gate database inside
+# `#[cfg(test)] mod tests` in src/audit.rs. Never a [dependencies] entry
+# (task-20-rulings.md ruling 2); CLAUDE.md: the Kiro database is opened only
+# through KiroDb::open_read_only.
+rusqlite = { version = "0.40.2", features = ["bundled"] }

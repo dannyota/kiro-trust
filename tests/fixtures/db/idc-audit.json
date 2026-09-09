@@ -1,0 +1,32 @@
+{
+  "allowed_outbound": [
+    "oidc.us-east-1.amazonaws.com",
+    "runtime.us-east-1.kiro.dev"
+  ],
+  "authentication": {
+    "sso_region": "us-east-1",
+    "token_expires": "2099-01-01T00:00:00Z (refresh on demand)",
+    "type": "AWS IAM Identity Center"
+  },
+  "automatic_updates": "disabled",
+  "build_features": [],
+  "content_sharing": "opted out (x-amzn-codewhisperer-optout: true)",
+  "credential_source": {
+    "mode": "read-only, authorizer enforced",
+    "path": "tests/fixtures/db/idc.sqlite3"
+  },
+  "dynamic_model_discovery": "disabled",
+  "http_proxy": "disabled (environment ignored)",
+  "local_authentication": "required (token file 0600)",
+  "local_listener": "127.0.0.1:3456",
+  "problems": [],
+  "redirects": "rejected",
+  "request_body_logging": "disabled (no flag exists)",
+  "runtime": {
+    "region": "us-east-1",
+    "source": "from profile"
+  },
+  "telemetry": "none",
+  "tls_roots": "webpki-roots (compiled in)",
+  "version": "0.1.0"
+}

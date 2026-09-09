@@ -996,6 +996,7 @@ dependencies = [
  "kiro-trust-kiro",
  "kiro-trust-net",
  "kiro-trust-protocol",
+ "rusqlite",
  "secrecy",
  "serde",
  "serde_json",

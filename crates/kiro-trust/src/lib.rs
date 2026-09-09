@@ -1,8 +1,8 @@
 //! See docs/specs/kiro-trust-design.md.
 
-pub mod audit; // Task 20
+pub mod audit;
 pub mod config;
-pub mod env_cmd; // Task 20
+pub mod env_cmd;
 pub mod logging;
 pub mod serve;
 pub mod server;

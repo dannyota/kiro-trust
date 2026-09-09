@@ -44,12 +44,9 @@ jobs:
       - name: Audit gate
         run: |
           cargo build --release --locked -p kiro-trust
-          if [ -f tests/fixtures/db/idc.sqlite3 ]; then
-            ./target/release/kiro-trust audit --json --kiro-db tests/fixtures/db/idc.sqlite3 > /tmp/audit.json
-            diff <(python3 -m json.tool tests/fixtures/db/idc-audit.json) <(python3 -m json.tool /tmp/audit.json)
-          else
-            echo "audit fixture not present yet"
-          fi
+          ./target/release/kiro-trust audit --json --kiro-db tests/fixtures/db/idc.sqlite3 --token-file /tmp/kiro-trust-audit/token \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); d.pop("commit"); print(json.dumps(d, indent=2, sort_keys=True))' > /tmp/audit.json
+          diff tests/fixtures/db/idc-audit.json /tmp/audit.json
 
   audit:
     runs-on: ubuntu-latest

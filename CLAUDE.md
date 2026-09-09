@@ -63,8 +63,12 @@ kiro-trust (bin)  →  kiro-trust-kiro  →  kiro-trust-net, kiro-trust-protocol
   the fields in spec 6.4. There is no body-logging flag; do not add one. Payload
   capture exists only behind the `capture` feature.
 - Secrets are `secrecy::SecretString`. Call `expose_secret()` only inside
-  `TokenSource::with_token` and the OIDC refresh request builder. Never derive
-  `Serialize`, or a `Debug` that prints content, for a type holding one.
+  `TokenSource::with_token`, the OIDC refresh request builder,
+  `server::require_token`, `token::write_token_file`, and `env_cmd::run` (the
+  fifth site: `env`'s whole purpose is printing the token, spec 4.3, so there
+  is no way to implement it without one; the token goes to stdout only, never
+  to a log, stderr, or any error path). Never derive `Serialize`, or a `Debug`
+  that prints content, for a type holding one.
 - The Kiro database is opened only through `open_read_only`. Never add another
   constructor, never write, never copy the file, never read a table other than
   `auth_kv` and `state`.
