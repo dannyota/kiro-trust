@@ -247,14 +247,26 @@ starts a listener and never performs a network request.
 
 ### 4.3 `kiro-trust env [--shell sh|fish]`
 
-Prints the exports Claude Code needs, reading the token file:
+Prints the exports Claude Code needs, reading the token file. Before
+printing, the token is checked against the shape `token::generate` produces
+(43 characters of base64url without padding, spec 6.3); anything else is
+rejected without being echoed, not even a prefix.
 
 ```sh
-export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
-export ANTHROPIC_AUTH_TOKEN=<local token>
+export ANTHROPIC_BASE_URL='http://127.0.0.1:3456'
+export ANTHROPIC_AUTH_TOKEN='<local token>'
 ```
 
-Usage: `eval "$(kiro-trust env)"`. Exits 1 if no token file exists.
+`--shell fish` prints the fish form instead:
+
+```fish
+set -gx ANTHROPIC_BASE_URL 'http://127.0.0.1:3456'
+set -gx ANTHROPIC_AUTH_TOKEN '<local token>'
+```
+
+Both forms single-quote both values. Usage: `eval "$(kiro-trust env)"`.
+Exits 1 when the token file does not exist, cannot be read, or does not
+contain a well-formed token.
 
 ### 4.4 Exit codes
 

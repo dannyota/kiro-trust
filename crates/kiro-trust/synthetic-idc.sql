@@ -5,10 +5,17 @@
 -- the unit tests that exercise the same shape can never drift out of
 -- byte-identical sync (task-20-fix-1.md Important 4). `xtask` reaches this
 -- file by a relative path only, never a crate dependency: CLAUDE.md forbids
--- `xtask` depending on the binary crate, and this file lives outside
--- `crates/kiro-trust` and outside `tests/fixtures/` so it stays out of both
--- the binary package and the fixture scanner's scope
--- (scripts/check-fixtures.sh's `DIR=tests/fixtures`).
+-- `xtask` depending on the binary crate.
+--
+-- This file lives inside `crates/kiro-trust/`, the package that includes it
+-- from `audit.rs`, so `cargo package --package kiro-trust` ships it and the
+-- published crate can run its own unit tests (task-20-fix-2.md Minor 3: it
+-- previously lived under `crates/kiro-trust-auth/`, outside the package
+-- that consumes it, so the published `kiro-trust` crate omitted it). It
+-- still sits outside `tests/fixtures/`, so it stays out of the fixture
+-- scanner's scope (scripts/check-fixtures.sh's `DIR=tests/fixtures`); that
+-- scanner exists for recorded protocol fixtures, and this file holds only
+-- placeholder database rows, never real credential material.
 --
 -- Never a real credential; the SSO region and ARN are the fixture's own
 -- (task-20-rulings.md ruling 1, ruling 4). The refresh_token and

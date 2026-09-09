@@ -13,26 +13,81 @@ use kiro_trust_net::{Destination, RuntimeRegion};
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 
-/// Replaces every occurrence of the real home directory in `s` with `~`
+/// Abbreviating the real home directory to `~` in audit output
 /// (task-20-fix-1.md Important 1). Audit output is what a user pastes into
 /// a bug report to show their configuration is safe, and a bare path leaks
 /// the OS username the way a log line must not (CLAUDE.md; spec 6.4).
-/// `String::replace` rather than a prefix strip because the second call
-/// site embeds the path mid-sentence, inside rusqlite's own error text, not
-/// only at the start of the field.
-fn abbreviate_home(s: &str) -> String {
-    let home = directories::BaseDirs::new()
+///
+/// The two call sites need different mechanisms (task-20-fix-2.md Minor 1).
+/// `credential_source.path` is a whole path, so `abbreviate_home_path`
+/// strips the home as a path prefix with `Path::strip_prefix`, which
+/// matches whole components: that fixes both `HOME=/` (which a plain
+/// substring replace would turn into a `~` at every separator) and a
+/// sibling directory that merely shares the home as a string prefix
+/// (`/home/x-backup` under `HOME=/home/x`, which a substring replace would
+/// mangle into `~-backup`). The `problems` string embeds the path
+/// mid-sentence inside rusqlite's own error text, where a prefix strip
+/// cannot reach it, so `abbreviate_home_in_message` keeps a substring
+/// replacement, guarded to require the match be followed by a path
+/// separator or the end of the string, for the same reason a sibling
+/// directory must be left alone.
+///
+/// Both mechanisms treat `""` and `/` as "no abbreviation possible" and
+/// return the input unchanged: an empty home has nothing to strip, and `/`
+/// as home would eat the leading separator of every absolute path.
+fn real_home() -> String {
+    directories::BaseDirs::new()
         .map(|b| b.home_dir().to_string_lossy().into_owned())
-        .unwrap_or_default();
-    abbreviate_home_with(s, &home)
+        .unwrap_or_default()
 }
 
-fn abbreviate_home_with(s: &str, home: &str) -> String {
-    if home.is_empty() {
-        s.to_string()
-    } else {
-        s.replace(home, "~")
+fn is_usable_home(home: &str) -> bool {
+    !home.is_empty() && home != "/"
+}
+
+/// Abbreviates a whole path by stripping the home directory as a path
+/// prefix. See the module-level comment above `real_home` for why this
+/// call site needs `Path::strip_prefix` rather than a substring replace.
+fn abbreviate_home_path(s: &str) -> String {
+    abbreviate_home_path_with(s, &real_home())
+}
+
+fn abbreviate_home_path_with(s: &str, home: &str) -> String {
+    if !is_usable_home(home) {
+        return s.to_string();
     }
+    match std::path::Path::new(s).strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => s.to_string(),
+    }
+}
+
+/// Abbreviates a home-directory occurrence embedded mid-sentence inside a
+/// message. See the module-level comment above `real_home` for why this
+/// call site keeps a substring replace instead of a prefix strip, and why
+/// each match is only abbreviated when followed by a path separator or the
+/// end of the string.
+fn abbreviate_home_in_message(s: &str) -> String {
+    abbreviate_home_in_message_with(s, &real_home())
+}
+
+fn abbreviate_home_in_message_with(s: &str, home: &str) -> String {
+    if !is_usable_home(home) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut remaining = s;
+    while let Some(idx) = remaining.find(home) {
+        let (before, at_match) = remaining.split_at(idx);
+        out.push_str(before);
+        let after = &at_match[home.len()..];
+        let boundary_ok = after.is_empty() || after.starts_with('/') || after.starts_with('\\');
+        out.push_str(if boundary_ok { "~" } else { home });
+        remaining = after;
+    }
+    out.push_str(remaining);
+    out
 }
 
 #[derive(Serialize, Default)]
@@ -156,7 +211,7 @@ pub fn report(args: &AuditArgs) -> Result<AuditReport, String> {
             // full database path; abbreviate the whole formatted string,
             // not a pre-extracted path fragment, since the path is not
             // leading in this text (task-20-fix-1.md Important 1).
-            problems.push(abbreviate_home(&format!("credential: {e}")));
+            problems.push(abbreviate_home_in_message(&format!("credential: {e}")));
             (
                 Authentication {
                     kind: "unavailable".into(),
@@ -196,7 +251,7 @@ pub fn report(args: &AuditArgs) -> Result<AuditReport, String> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         commit: env!("KIRO_TRUST_COMMIT").to_string(),
         credential_source: CredentialSource {
-            path: abbreviate_home(&db_path.display().to_string()),
+            path: abbreviate_home_path(&db_path.display().to_string()),
             mode,
         },
         authentication: auth,
@@ -323,8 +378,11 @@ mod tests {
     /// (task-20-fix-1.md Important 4). This crate still carries no
     /// `rusqlite` in `[dependencies]` (CLAUDE.md: `KiroDb::open_read_only`
     /// is the only opener); `rusqlite` here is a `[dev-dependencies]` entry
-    /// used only inside this `#[cfg(test)]` module.
-    const SYNTHETIC_IDC_SQL: &str = include_str!("../../kiro-trust-auth/synthetic-idc.sql");
+    /// used only inside this `#[cfg(test)]` module. The file lives in this
+    /// package's own directory, not `kiro-trust-auth`'s, so `cargo package`
+    /// ships it and the published crate can run its own unit tests
+    /// (task-20-fix-2.md Minor 3).
+    const SYNTHETIC_IDC_SQL: &str = include_str!("../synthetic-idc.sql");
 
     fn make_synthetic_db(path: &Path) -> Result<(), String> {
         let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
@@ -462,16 +520,32 @@ mod tests {
         assert_eq!(r.content_sharing, "enabled (--share-content)");
         assert!(render_text(&r).contains("enabled (--share-content)"));
         // --share-content alone never produces a `problems` entry (spec
-        // conformant, task-20-fix-1.md minor 1). `cargo test -p kiro-trust`
-        // alone compiles no development feature into this crate or
-        // kiro-trust-net; `cargo test --workspace` can unify
-        // `test-endpoints` in regardless of this test
-        // (report_has_every_line_and_no_secrets above explains why), which
-        // is a real, unrelated problem this test must not paper over, so
-        // the exit-0 assertion only applies when that signal is absent.
-        if !kiro_trust_net::TEST_ENDPOINTS_COMPILED && !cfg!(feature = "capture") {
-            assert_eq!(exit_code(&r), 0, "{:?}", r.problems);
+        // conformant, task-20-fix-1.md minor 1). Build the expected
+        // problems from exactly the compiled-in feature signals, the same
+        // invocation-independent pattern `report_has_every_line_and_no_secrets`
+        // above uses, instead of guarding the assertion on those signals:
+        // that proves --share-content contributes nothing under either
+        // `cargo test -p kiro-trust` or `cargo test --workspace`, rather
+        // than skipping the proof under the invocation where it could
+        // matter (task-20-fix-2.md Minor 2).
+        let mut expected_features = Vec::new();
+        if cfg!(feature = "capture") {
+            expected_features.push("capture".to_string());
         }
+        if kiro_trust_net::TEST_ENDPOINTS_COMPILED {
+            expected_features.push("test-endpoints".to_string());
+        }
+        let expected_problems: Vec<String> = expected_features
+            .iter()
+            .map(|f| format!("development feature {f} is compiled in"))
+            .collect();
+        assert_eq!(r.problems, expected_problems);
+        assert_eq!(
+            exit_code(&r),
+            if expected_problems.is_empty() { 0 } else { 1 },
+            "{:?}",
+            r.problems
+        );
     }
 
     // task-20-fix-1.md minor 7: an invalid --runtime-region must be
@@ -534,62 +608,83 @@ mod tests {
         )));
     }
 
-    // task-20-fix-1.md Important 1: derived from the real $HOME at test
-    // time, like the Task 19 log-leak test, rather than a hardcoded path,
-    // per CLAUDE.md's rule against a real home path in a test. The file is
-    // never created, only referenced, so `KiroDb::open_read_only` fails and
-    // `AuthError::Open` embeds this path in its message, exercising both
-    // call sites (task-20-fix-1.md Important 1) at once: `credential_source
-    // .path`, and the `problems` entry the error produces.
+    // task-20-fix-2.md Minor 1, Minor 4: both abbreviation mechanisms
+    // tested directly against a synthetic, hardcoded home, never a real one
+    // and never read from the environment (CLAUDE.md's rule against a real
+    // home path in a test; task-20-fix-2.md Minor 4 against reading a
+    // process-wide environment variable in a test at all, since the
+    // previous version's `std::env::var("HOME")` diverged from how the
+    // code under test derives home on Windows). `abbreviate_home_path_with`
+    // backs `credential_source.path`; `abbreviate_home_in_message_with`
+    // backs the `problems` entry, where the path sits mid-sentence inside
+    // rusqlite's own error text (task-20-fix-1.md Important 1 exercised
+    // both call sites; this covers each mechanism directly instead).
     #[test]
-    fn a_db_path_under_home_is_tilde_abbreviated_in_text_and_json() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/nonexistent-home".to_string());
-        let missing = std::path::PathBuf::from(&home).join(format!(
-            "kiro-trust-audit-test-missing-{}.sqlite3",
-            std::process::id()
-        ));
-        let args = AuditArgs {
-            json: false,
-            listen: "127.0.0.1:3456".into(),
-            kiro_db: Some(missing),
-            runtime_region: None,
-            token_file: None,
-            share_content: false,
-        };
-        let r = report(&args).unwrap();
-        assert!(
-            r.credential_source.path.starts_with('~'),
-            "{}",
-            r.credential_source.path
+    fn abbreviate_home_path_with_covers_home_root_sibling_and_outside_cases() {
+        // Under home: the whole remainder becomes a `~`-relative path.
+        assert_eq!(
+            abbreviate_home_path_with("/home/someone/kiro-cli/data.sqlite3", "/home/someone"),
+            "~/kiro-cli/data.sqlite3"
         );
-        assert!(!r.credential_source.path.contains(&home));
-        assert!(
-            r.problems
-                .iter()
-                .any(|p| p.contains('~') && !p.contains(&home)),
-            "{:?}",
-            r.problems
+        assert_eq!(
+            abbreviate_home_path_with("/home/someone", "/home/someone"),
+            "~"
         );
-        let text = render_text(&r);
-        assert!(!text.contains(&home), "home path leaked in text:\n{text}");
-        let json = serde_json::to_string(&r).unwrap();
-        assert!(!json.contains(&home), "home path leaked in json:\n{json}");
+        // A sibling directory that only shares the home as a string prefix
+        // is left alone: `Path::strip_prefix` matches whole components.
+        assert_eq!(
+            abbreviate_home_path_with("/home/x-backup/data.sqlite3", "/home/x"),
+            "/home/x-backup/data.sqlite3"
+        );
+        // `HOME=/` is degenerate: abbreviating would turn every path
+        // separator into `~`, so it is a no-op instead.
+        assert_eq!(
+            abbreviate_home_path_with("/tests/fixtures/db/idc.sqlite3", "/"),
+            "/tests/fixtures/db/idc.sqlite3"
+        );
+        // A relative path outside home is unchanged.
+        assert_eq!(
+            abbreviate_home_path_with("tests/fixtures/db/idc.sqlite3", "/home/someone"),
+            "tests/fixtures/db/idc.sqlite3"
+        );
     }
 
     #[test]
-    fn a_path_outside_home_is_unchanged_by_abbreviate_home() {
+    fn abbreviate_home_in_message_with_covers_home_root_sibling_and_outside_cases() {
+        // Under home, mid-sentence: only the path is abbreviated.
         assert_eq!(
-            abbreviate_home_with("tests/fixtures/db/idc.sqlite3", "/home/someone"),
-            "tests/fixtures/db/idc.sqlite3"
-        );
-        assert_eq!(
-            abbreviate_home_with(
+            abbreviate_home_in_message_with(
                 "credential: cannot open the Kiro CLI database read-only: unable to open \
                  database file: /home/someone/nonexistent.sqlite3",
                 "/home/someone"
             ),
             "credential: cannot open the Kiro CLI database read-only: unable to open \
              database file: ~/nonexistent.sqlite3"
+        );
+        // A sibling directory sharing the home as a string prefix is left
+        // literal, not partially abbreviated into `~-backup/...`.
+        assert_eq!(
+            abbreviate_home_in_message_with(
+                "credential: unable to open database file: /home/x-backup/data.sqlite3",
+                "/home/x"
+            ),
+            "credential: unable to open database file: /home/x-backup/data.sqlite3"
+        );
+        // `HOME=/` is degenerate: a no-op, same as the path-typed version.
+        assert_eq!(
+            abbreviate_home_in_message_with(
+                "credential: unable to open database file: /tests/fixtures/db/idc.sqlite3",
+                "/"
+            ),
+            "credential: unable to open database file: /tests/fixtures/db/idc.sqlite3"
+        );
+        // A path outside home is unchanged.
+        assert_eq!(
+            abbreviate_home_in_message_with(
+                "credential: unable to open database file: tests/fixtures/db/idc.sqlite3",
+                "/home/someone"
+            ),
+            "credential: unable to open database file: tests/fixtures/db/idc.sqlite3"
         );
     }
 

@@ -5,9 +5,14 @@
 /// `crates/kiro-trust/src/audit.rs` so the two can never drift out of
 /// byte-identical sync (task-20-fix-1.md Important 4). A relative-path
 /// `include_str!`, not a crate dependency: `xtask` must not depend on the
-/// binary crate (task-20-rulings.md ruling 2). See the SQL file's own
-/// header for what it contains and why.
-const SYNTHETIC_IDC_SQL: &str = include_str!("../../crates/kiro-trust-auth/synthetic-idc.sql");
+/// binary crate (task-20-rulings.md ruling 2). The file lives in
+/// `crates/kiro-trust/`, the same package that `audit.rs` includes it
+/// from, so `cargo package --package kiro-trust` ships it
+/// (task-20-fix-2.md Minor 3); `xtask` is never published
+/// (`publish = false` in `xtask/Cargo.toml`), so this relative include
+/// stays fine either way. See the SQL file's own header for what it
+/// contains and why.
+const SYNTHETIC_IDC_SQL: &str = include_str!("../../crates/kiro-trust/synthetic-idc.sql");
 
 fn make_synthetic_db(path: &str) {
     let conn = rusqlite::Connection::open(path).expect("open");
