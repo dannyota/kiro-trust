@@ -18,6 +18,15 @@ rust-version = "1.98.1"
 license = "Apache-2.0"
 repository = "https://github.com/dannyota/kiro-trust"
 authors = ["Danny"]
+# final-fix-2.md Minor 7: unset in every crate, so each crates.io page
+# rendered with no README. Path is relative to *this* file (workspace-package
+# path fields resolve from the workspace root, then Cargo re-derives each
+# inheriting crate's relative path automatically); `cargo package` copies the
+# out-of-tree file into the published tarball the same way it does for
+# NOTICE (Important 1), so no crate needs its own README.md copy.
+readme = "README.md"
+keywords = ["claude-code", "kiro", "proxy", "aws"]
+categories = ["command-line-utilities", "network-programming"]
 
 [workspace.dependencies]
 kiro-trust-protocol = { path = "crates/kiro-trust-protocol", version = "0.1.0" }

@@ -8,6 +8,18 @@ updates:
     groups:
       minor-and-patch:
         update-types: ["minor", "patch"]
+  # fuzz/ is excluded from the workspace (root Cargo.toml `exclude =
+  # ["fuzz"]`) and has its own Cargo.lock, which ci.yml checks with
+  # `--locked`; without this entry it never got Dependabot updates
+  # (final-fix-2.md Minor 8).
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

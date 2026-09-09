@@ -26,19 +26,25 @@ PY
 
 check_package() {
   local package=$1 entrypoint=$2 files
+  shift 2
   files=$(cargo package --package "$package" --list --locked --allow-dirty)
   if grep -Eq '(^|/)tests/fixtures/' <<<"$files"; then
     echo "$package package contains fixture data" >&2
     return 1
   fi
-  for required in Cargo.toml Cargo.toml.orig Cargo.lock "$entrypoint"; do
+  for required in Cargo.toml Cargo.toml.orig Cargo.lock README.md "$entrypoint" "$@"; do
     grep -Fxq "$required" <<<"$files" || { echo "$package package is missing $required" >&2; return 1; }
   done
 }
 
-check_package kiro-trust-protocol src/lib.rs
+# NOTICE is required only on the crates that hold kirocc-derived code
+# (final-fix-2.md Important 1; see each crate's own NOTICE header and the
+# crate_notice_matches_workspace_notice test): kiro-trust-net and
+# kiro-trust-auth carry none, so they get README.md only, like every other
+# published crate.
+check_package kiro-trust-protocol src/lib.rs NOTICE
 check_package kiro-trust-net src/lib.rs
 check_package kiro-trust-auth src/lib.rs
-check_package kiro-trust-kiro src/lib.rs
-check_package kiro-trust src/main.rs
+check_package kiro-trust-kiro src/lib.rs NOTICE
+check_package kiro-trust src/main.rs NOTICE
 echo "packages ok"

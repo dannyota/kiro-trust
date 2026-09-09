@@ -47,3 +47,22 @@ pub fn run() -> i32 {
         Command::Env(args) => env_cmd::run(args),
     }
 }
+
+// NOTICE distribution (final-fix-2.md Important 1; Apache-2.0 section 4(d)):
+// `server::models::get_models` builds the `GET /v1/models` envelope
+// transcribed from kirocc `internal/server/handlers.go` (see NOTICE), so
+// this crate needs its own copy since `cargo package` never reaches outside
+// the crate directory. This test guards the copy at `crates/kiro-trust/NOTICE`
+// against drifting from the workspace-root original.
+#[cfg(test)]
+mod notice_sync {
+    #[test]
+    fn crate_notice_matches_workspace_notice() {
+        assert_eq!(
+            include_str!("../NOTICE"),
+            include_str!("../../../NOTICE"),
+            "crates/kiro-trust/NOTICE has drifted from the workspace-root \
+             NOTICE; keep them byte-identical"
+        );
+    }
+}

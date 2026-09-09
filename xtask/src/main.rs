@@ -1,4 +1,8 @@
-//! Developer tasks: fixture scrubbing, version checks, synthetic databases.
+//! Developer tasks: fixture scrubbing, the leak-scan re-run, synthetic
+//! databases. `check-versions` was removed (final-fix-2.md Critical 2): it
+//! printed "versions ok" unconditionally and checked nothing, while
+//! `scripts/check-packages.sh` already does the real version check and is
+//! the one CI runs.
 
 #[cfg(test)]
 use kiro_trust_protocol::eventstream::encode_event_frame;
@@ -58,6 +62,11 @@ pub struct ScrubRules {
     pub home: String,
     pub hostname: String,
     pub conversation_ids: Vec<String>,
+    /// The operator's personal name (final-fix-2.md Important 3). Unlike
+    /// home/hostname, there is nothing to detect: a name has no recognizable
+    /// shape, so this stays `None` unless the operator passes `--name`, and
+    /// no rewrite happens when it does not.
+    pub name: Option<String>,
 }
 
 /// Replace every `arn:aws:codewhisperer:...` token with the fixture ARN.
@@ -139,6 +148,33 @@ fn hostname_candidates(hostname: &str) -> Vec<&str> {
     }
 }
 
+/// Replace `name` with `operator`, bounded to whole words like
+/// `replace_hostname_token` (final-fix-2.md Important 3): a short personal
+/// name is exactly the kind of string that can also occur as a substring of
+/// an unrelated word, so an unbounded match would risk corrupting content
+/// that carries no identity at all.
+fn replace_name_token(input: &str, name: &str) -> String {
+    if name.is_empty() {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(rel) = rest.find(name) {
+        let before_ok = !rest[..rel].chars().next_back().is_some_and(is_word_char);
+        let after = &rest[rel + name.len()..];
+        let after_ok = !after.chars().next().is_some_and(is_word_char);
+        out.push_str(&rest[..rel]);
+        if before_ok && after_ok {
+            out.push_str("operator");
+        } else {
+            out.push_str(name);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 fn scrub_string(s: &str, rules: &ScrubRules) -> String {
     let mut out = replace_arns(s);
 
@@ -162,6 +198,10 @@ fn scrub_string(s: &str, rules: &ScrubRules) -> String {
 
     for candidate in hostname_candidates(&rules.hostname) {
         out = replace_hostname_token(&out, candidate);
+    }
+
+    if let Some(name) = &rules.name {
+        out = replace_name_token(&out, name);
     }
 
     out
@@ -420,6 +460,7 @@ fn scrub_capture_dir(
     source: &str,
     home: &str,
     hostname: &str,
+    name: Option<&str>,
     allow_truncated: bool,
 ) {
     let mut requests: Vec<PathBuf> = std::fs::read_dir(capture_dir)
@@ -476,6 +517,7 @@ fn scrub_capture_dir(
             home: home.to_string(),
             hostname: hostname.to_string(),
             conversation_ids: ids,
+            name: name.map(str::to_string).filter(|n| !n.is_empty()),
         };
 
         // The Anthropic request's own `stream` field decides which
@@ -571,15 +613,27 @@ fn scrub_capture_dir(
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("check-versions") => println!("versions ok"),
         Some("make-db") => {
             let path = args.get(1).expect("usage: cargo xtask make-db <path>");
             make_synthetic_db(path);
             println!("wrote {path}");
         }
+        // Re-runs `scripts/check-fixtures.sh` rather than reimplementing the
+        // leak scan (final-fix-2.md Important 5, spec 3.6): a second
+        // implementation of the same rules is exactly the kind of thing
+        // that drifts, the same reasoning `cargo xtask check-versions` was
+        // removed for (final-fix-2.md Critical 2) instead of getting a
+        // duplicate implementation of `scripts/check-packages.sh`'s check.
+        Some("fixtures-verify") => {
+            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/check-fixtures.sh");
+            let status = std::process::Command::new(&script)
+                .status()
+                .unwrap_or_else(|e| panic!("cannot run {}: {e}", script.display()));
+            std::process::exit(status.code().unwrap_or(1));
+        }
         Some("scrub") => {
             let usage = "usage: cargo xtask scrub <capture-dir> <fixture-dir> --source \"<text>\" \
-                          [--hostname <name>] [--home <path>] [--allow-truncated]";
+                          [--hostname <name>] [--home <path>] [--name <text>] [--allow-truncated]";
             let capture_dir = args.get(1).unwrap_or_else(|| panic!("{usage}"));
             let fixture_dir = args.get(2).unwrap_or_else(|| panic!("{usage}"));
             let source = args
@@ -598,6 +652,14 @@ fn main() {
                 .iter()
                 .position(|a| a == "--home")
                 .and_then(|i| args.get(i + 1));
+            // Unlike home/hostname, there is nothing to detect here, so
+            // there is no `$NAME` fallback: the operator's name only gets
+            // scrubbed when `--name` names it (final-fix-2.md Important 3;
+            // spec 8.3).
+            let name_arg = args
+                .iter()
+                .position(|a| a == "--name")
+                .and_then(|i| args.get(i + 1));
             // Explicit opt-in to writing a truncated capture's complete
             // frames (task-21-fix-2 Important): spec 8.2 needs "cancellation
             // mid-stream" and "truncated stream" fixture cases, which an
@@ -613,12 +675,13 @@ fn main() {
                 source,
                 &home,
                 &hostname,
+                name_arg.map(String::as_str),
                 allow_truncated,
             );
         }
         other => {
             eprintln!(
-                "usage: cargo xtask <check-versions|make-db <path>|scrub <capture-dir> <fixture-dir> --source \"<text>\" [--hostname <name>] [--home <path>] [--allow-truncated]>; got {other:?}"
+                "usage: cargo xtask <fixtures-verify|make-db <path>|scrub <capture-dir> <fixture-dir> --source \"<text>\" [--hostname <name>] [--home <path>] [--name <text>] [--allow-truncated]>; got {other:?}"
             );
             std::process::exit(2);
         }
@@ -642,6 +705,7 @@ mod tests {
                 home: home.into(),
                 hostname: "laptop.local".into(),
                 conversation_ids: vec!["real-conv".into()],
+                name: None,
             },
         );
         assert_eq!(out["profileArn"], FIXTURE_ARN);
@@ -675,6 +739,7 @@ mod tests {
             home: String::new(),
             hostname: String::new(),
             conversation_ids: ids,
+            name: None,
         };
         let text = scrub_string("session was buried-id, no other id here", &rules);
         assert_eq!(
@@ -692,6 +757,7 @@ mod tests {
             home: "/home/someone/".into(),
             hostname: String::new(),
             conversation_ids: vec![],
+            name: None,
         };
         assert_eq!(
             scrub_string("cwd is /home/someone/project", &trailing),
@@ -708,6 +774,7 @@ mod tests {
             home: "/home/someone".into(),
             hostname: String::new(),
             conversation_ids: vec![],
+            name: None,
         };
         // Mid-string: "/home/someone" appears immediately followed by more
         // characters with no path separator between them.
@@ -725,6 +792,7 @@ mod tests {
             home: String::new(),
             hostname: String::new(),
             conversation_ids: vec![],
+            name: None,
         };
         for arn in [
             "arn:aws:codewhisperer:us-east-1:1234:profile/SHORT",
@@ -742,6 +810,7 @@ mod tests {
             home: String::new(),
             hostname: "laptop.local".into(),
             conversation_ids: vec![],
+            name: None,
         };
         assert_eq!(
             scrub_string("reachable at somelaptop.localhost today", &rules),
@@ -752,6 +821,31 @@ mod tests {
             scrub_string("reachable at laptop.local today", &rules),
             "reachable at host today"
         );
+    }
+
+    // final-fix-2.md Important 3: `--name` is optional and, when given,
+    // rewrites the operator's name to a fixed placeholder, bounded to whole
+    // words like the hostname rule, and does nothing when it is absent.
+    #[test]
+    fn name_is_scrubbed_only_when_given_and_only_as_a_whole_word() {
+        let rules = ScrubRules {
+            home: String::new(),
+            hostname: String::new(),
+            conversation_ids: vec![],
+            name: Some("Alex".into()),
+        };
+        assert_eq!(
+            scrub_string("commit by Alex, see Alexander for context", &rules),
+            "commit by operator, see Alexander for context"
+        );
+
+        let no_name = ScrubRules {
+            home: String::new(),
+            hostname: String::new(),
+            conversation_ids: vec![],
+            name: None,
+        };
+        assert_eq!(scrub_string("commit by Alex", &no_name), "commit by Alex");
     }
 
     // Ruling 5, case 5: a payload with no identity fields at all round-trips
@@ -768,6 +862,7 @@ mod tests {
             home: "/home/someone".into(),
             hostname: "laptop.local".into(),
             conversation_ids: vec!["real-conv".into()],
+            name: None,
         };
         let out = scrub_value(v.clone(), &rules);
         assert_eq!(out, v);
@@ -847,6 +942,7 @@ mod tests {
             home: String::new(),
             hostname: "laptop.corp.example.com".into(),
             conversation_ids: vec![],
+            name: None,
         };
         // The capture holds only the short label; detection returned the
         // FQDN. Scrubbing the FQDN alone would never match this.
@@ -877,6 +973,7 @@ mod tests {
             home: "/home/someone".into(),
             hostname: "laptop.local".into(),
             conversation_ids: vec!["real-conv".into()],
+            name: None,
         };
         let assistant_payload = br#"{"content":"error at /home/someone/proj on laptop.local"}"#;
         let metadata_payload =
@@ -919,6 +1016,7 @@ mod tests {
             home: String::new(),
             hostname: String::new(),
             conversation_ids: vec![],
+            name: None,
         };
         let raw = encode_event_frame("assistantResponseEvent", b"not json");
         scrub_eventstream(&raw, &rules, Path::new("test.eventstream"), false);
@@ -940,6 +1038,7 @@ mod tests {
             home: String::new(),
             hostname: String::new(),
             conversation_ids: vec![],
+            name: None,
         };
         let mut corrupted = encode_event_frame("assistantResponseEvent", br#"{"content":"hi"}"#);
         let last_payload_byte = corrupted.len() - 5; // before the trailing 4-byte message CRC
@@ -959,6 +1058,7 @@ mod tests {
             home: String::new(),
             hostname: String::new(),
             conversation_ids: vec![],
+            name: None,
         };
         let raw = truncated_stream_fixture();
         scrub_eventstream(&raw, &rules, Path::new("0001-upstream.eventstream"), false);
@@ -972,6 +1072,7 @@ mod tests {
             home: String::new(),
             hostname: String::new(),
             conversation_ids: vec![],
+            name: None,
         };
         let raw = truncated_stream_fixture();
         let out = scrub_eventstream(&raw, &rules, Path::new("0001-upstream.eventstream"), true);
@@ -1004,6 +1105,7 @@ mod tests {
             home: String::new(),
             hostname: String::new(),
             conversation_ids: vec![],
+            name: None,
         };
         assert_eq!(
             scrub_eventstream(&[], &rules, Path::new("test.eventstream"), false),
@@ -1042,6 +1144,7 @@ mod tests {
             home: String::new(),
             hostname: String::new(),
             conversation_ids: ids,
+            name: None,
         };
         let scrubbed_request = scrub_value(request, &rules);
         assert_eq!(scrubbed_request["utteranceId"], FIXTURE_CONVERSATION_ID);
@@ -1061,6 +1164,7 @@ mod tests {
             home: String::new(),
             hostname: String::new(),
             conversation_ids: vec![],
+            name: None,
         };
         let input = "first arn:aws:codewhisperer:us-east-1:111111111111:profile/AAAA then \
                      arn:aws:codewhisperer:eu-central-1:222222222222:profile/BBBB end";
@@ -1082,6 +1186,7 @@ mod tests {
             home: String::new(),
             hostname: String::new(),
             conversation_ids: vec![],
+            name: None,
         };
         let out = scrub_value(v, &rules);
         assert_eq!(out["a"]["profileArn"], FIXTURE_ARN);
@@ -1145,6 +1250,7 @@ mod tests {
             "capture kiro-cli 2.21.1 2026-09-09 from /home/someone",
             "/home/someone",
             "laptop.local",
+            None,
             false,
         );
 
@@ -1222,6 +1328,7 @@ mod tests {
             "capture test",
             "/home/x",
             "host.example.com",
+            None,
             false,
         );
 

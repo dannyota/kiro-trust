@@ -119,6 +119,16 @@ Pure data and pure functions. Everything here is testable from a fixture file.
 Body types implement neither `Display` nor a `Debug` that prints content.
 `Debug` on a request prints counts and lengths only.
 
+Most of the kirocc-derived code in this workspace lives here (NOTICE), so
+`cargo package` for this crate would otherwise ship without attribution:
+`cargo package` only ever includes files inside a crate's own directory, so
+the repository-root `NOTICE` cannot be referenced from outside it. This
+crate, `kiro-trust-kiro`, and `kiro-trust` each carry a byte-identical copy
+of the root `NOTICE` at their own crate root; each crate's `lib.rs` has a
+test (`notice_sync::crate_notice_matches_workspace_notice`) that fails if
+its copy drifts from the original. `kiro-trust-net` and `kiro-trust-auth`
+hold no kirocc-derived code and carry no copy.
+
 ### 3.2 kiro-trust-net
 
 The single outbound policy. Public surface:
@@ -132,9 +142,9 @@ pub struct Region(String);          // validated pattern, section 6.2
 pub struct RuntimeRegion(Region);   // pattern plus allowlist
 pub struct Client { /* reqwest::Client with the fixed policy */ }
 impl Client {
-    pub fn new(policy: Policy) -> Result<Self, Error>;
-    pub async fn post_json(&self, dest: Destination, path: &str,
-        headers: HeaderMap, body: Bytes) -> Result<Response, Error>;
+    pub fn new(policy: Policy) -> Result<Self, NetError>;
+    pub async fn post(&self, dest: &Destination, path: &str,
+        headers: HeaderMap, body: Vec<u8>) -> Result<Response, NetError>;
 }
 ```
 
@@ -209,10 +219,15 @@ the `tracing` subscriber; it is installed once, from `logging::init`, before
 ### 3.6 xtask
 
 `cargo xtask scrub <capture-dir> <fixture-dir> --source "<text>"` (section
-8.3), `cargo xtask check-versions`, `cargo xtask fixtures-verify` which
-re-runs the leak scan, and `cargo xtask make-db <path>` which builds the
-synthetic placeholder database for the audit gate (section 8.7). Depends on
-`kiro-trust-protocol` and `rusqlite` only.
+8.3), `cargo xtask fixtures-verify` which shells out to
+`scripts/check-fixtures.sh` rather than reimplementing the leak scan (a
+second implementation is exactly the kind of thing that drifts from the
+first), and `cargo xtask make-db <path>` which builds the synthetic
+placeholder database for the audit gate (section 8.7). There is no
+`check-versions`: an earlier version was `println!("versions ok")`
+regardless of whether versions matched, a gate that failed open with nothing
+in CI to catch it, and `scripts/check-packages.sh` already does the real
+check. Depends on `kiro-trust-protocol`, `serde_json`, and `rusqlite` only.
 
 ## 4. Command surface
 
@@ -231,8 +246,9 @@ synthetic placeholder database for the audit gate (section 8.7). Depends on
 
 Precedence: flag, then env, then default. Startup order: parse and validate
 config, open the database read-only and read credentials (fail fast with a
-clear message), write the token file, bind, print one line with the listener
-and token file path, serve. A failure at any step before the token file is
+clear message), write the token file, bind, print two lines to stderr (the
+listener address and token file path, then a reminder to run `kiro-trust
+env`), serve. A failure at any step before the token file is
 written leaves no token file behind; a failure after binding removes it. On
 SIGINT or SIGTERM: delete the token file and stop accepting immediately (no
 new client can read a valid token during the drain that follows), drain
@@ -772,7 +788,14 @@ not mean the forced-refresh path ran.
 
 `tests/fixtures/<case>/` holds:
 
-- `meta.json`: `{"source": "capture kiro-cli 2.21.1 2026-09-10" | "kirocc v0.11.1 <test name>", "features": ["text","stream","tool_use",...], "stream": true|false}`
+- `meta.json`: `{"source": "capture kiro-cli 2.21.1 2026-09-10" | "kirocc v0.11.1 <test name>", "features": ["text","stream","tool_use",...]}`.
+  `source` is the only field the fixture harness checks
+  (`crates/kiro-trust-tests/tests/fixtures.rs`); `features` is
+  documentation, not read back by any test. Streaming behavior comes from
+  `request.json`'s own `stream` field, since that is what a real client
+  actually sent; `cargo xtask scrub` additionally writes a `stream` key to
+  `meta.json` as a human-readable summary of the same value, but nothing
+  reads it, so a hand-written fixture may omit it.
 - `request.json`: the Anthropic request as the client sent it
 - `expected-payload.json`: the Kiro payload kiro-trust must produce
 - `upstream.eventstream`: raw bytes from the runtime, when the case has a
@@ -810,8 +833,9 @@ symlink at one of these four names is never overwritten or followed:
 and reported by `audit` with exit 1.
 
 `cargo xtask scrub <capture-dir> <fixture-dir> --source "<text>" [--hostname
-<name>] [--home <path>] [--allow-truncated]` replaces the profile ARN and
-account id with `arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE`, conversation
+<name>] [--home <path>] [--name <text>] [--allow-truncated]` replaces the
+profile ARN and account id with
+`arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE`, conversation
 and utterance ids (collected from the request and the Kiro payload, wherever
 either key appears) with a fixed id, the home directory with `/home/user`
 (matched wherever it occurs, since it is specific enough that a mid-string
@@ -830,6 +854,15 @@ failure aborts the scrub rather than silently scrubbing with an empty rule:
 an unset or empty `$HOME`, a missing, failing, or non-UTF-8 `hostname`
 command, or an explicitly empty `--home`/`--hostname` value, is a hard error
 naming the offending flag.
+
+**An operator recording a fixture must also pass `--name "<their name>"`**
+(final-fix-2.md Important 3). Unlike the home directory and hostname, a
+personal name has no detectable shape and no `$NAME`-equivalent environment
+variable to fall back on, so the scrubber cannot infer it: when `--name` is
+omitted, nothing rewrites it. `--name` matches only as a whole token, the
+same as the hostname rule, and rewrites to `operator`. Pass the same value to
+`FIXTURE_SCRUB_NAME` when running `scripts/check-fixtures.sh` locally against
+an unpublished capture, so the scanner checks for the name too.
 
 It writes one case per captured request under `<fixture-dir>/<n>/`:
 `meta.json` (`source`, scrubbed like every other field; `features`; `stream`,
@@ -859,8 +892,13 @@ mid-stream" and "truncated stream" fixture cases (section 8.2) reachable.
 
 `scripts/check-fixtures.sh` fails when any file under `tests/fixtures/`
 contains a 12-digit account id, `arn:aws:` outside the fixture ARN, the
-owner's home path, an `aoa`-prefixed or `eyJ`-prefixed token-shaped string,
-or a `kiro.dev` hostname with a real region other than the fixture's.
+owner's home path (with or without a trailing separator), an `aoa`-prefixed
+or `eyJ`-prefixed token-shaped string, an email address, or a `kiro.dev`
+hostname with a real region other than the fixture's. When
+`FIXTURE_SCRUB_NAME` is set it also fails on that exact word, matching
+`scrub --name`'s corresponding rule above; unset, it checks nothing for a
+name, since (unlike the other rules) there is no shape to check for without
+being told what to look for.
 
 Fixtures are public. Record only marker prompts (`kiro-trust fixture probe:
 ...`) so no real source code enters the repository.
@@ -886,17 +924,31 @@ connection)
   category (headers, prompt, tool name/argument/result, thinking text,
   response text, conversation id, session id, token, home path, database
   path, account id, ARN) appears in any captured log line
-- `oidc_redirect_rejected`, `runtime_redirect_rejected`: a 302 from a
-  loopback test server is an error and no second request is made
-- `invalid_region_rejected`: `us-east-1/`, `evil.com`, `US-EAST-1`,
-  `ap-southeast-1` (not allowlisted for runtime) all fail before any hostname
-  exists
-- `proxy_env_ignored`: with `HTTPS_PROXY` set to a listening socket, no
-  connection reaches it
-- `non_loopback_bind_fails`: `0.0.0.0:3456` and `192.168.1.10:3456` are
-  config errors
-- `missing_token_401`, `wrong_token_401`, `health_needs_no_token`
-- `no_url_in_net_api`: compile-time, `Destination` is the only host input
+- `oidc_redirect_rejected`, `runtime_redirect_rejected`
+  (`security_net.rs`): a 302 from a loopback test server is an error and no
+  second request is made
+- `region_pattern` (`crates/kiro-trust-net/src/region.rs`): `us-east-1/`,
+  `evil.com`, `US-EAST-1`, and eight more malformed inputs are all pattern
+  errors; `runtime_allowlist` (same file): `ap-southeast-1` is
+  pattern-valid but fails the runtime allowlist, both before any hostname
+  is built (final-fix-2.md Important 4 renamed this from
+  `invalid_region_rejected`, which named no real test)
+- `proxy_env_ignored` (`security_net.rs`): with `HTTPS_PROXY` set to a
+  listening socket, no connection reaches it
+- `only_loopback_addresses_are_accepted`
+  (`crates/kiro-trust/src/config.rs`): `0.0.0.0:3456` and
+  `192.168.1.10:3456` are config errors (final-fix-2.md Important 4 renamed
+  this from `non_loopback_bind_fails`, which named no real test)
+- `health_needs_no_token_but_everything_else_does` (`server.rs`): `/health`
+  needs no token; a missing token and a wrong one (`Bearer wrong`) both 401
+  on every other route; a valid token in either `authorization` or
+  `x-api-key` succeeds (final-fix-2.md Important 4 renamed this from three
+  names, `missing_token_401`, `wrong_token_401`, and `health_needs_no_token`,
+  that named no real tests: all three conditions live in this one test)
+- `no_url_in_net_api`: unpinned. No test or CI script currently enforces
+  that `Destination` is the only host input in `kiro-trust-net`'s public
+  API; it holds today by code review against CLAUDE.md's architecture rules
+  and spec 3.2 alone (final-fix-2.md Important 4)
 - `binary_has_no_dev_features`: `cargo tree -e features -p kiro-trust`
   contains neither `capture` nor `test-endpoints` (script in CI). The check
   and every release build select `-p kiro-trust` alone, because a workspace
@@ -1023,6 +1075,11 @@ cargo-dist 0.32.0, `dist-workspace.toml`:
 - installers: `shell`, `powershell`
 - `profile.dist`: `lto = "thin"`, `codegen-units = 1`, `strip = true`,
   `panic = "abort"`
+- `include = ["NOTICE"]`: every per-target archive's `[misc]` files are
+  `CHANGELOG.md`, `LICENSE`, `NOTICE`, `README.md` (`dist plan` confirms
+  it); Apache-2.0 section 4(d) requires a redistribution to carry it, and
+  before this it reached only `source.tar.gz`, which packages the whole
+  repository regardless of `include`
 
 Every workflow pins actions by commit SHA with the tag in a comment.
 `release.yml` is generated by `dist` then hand-edited to `contents: read`
@@ -1173,4 +1230,4 @@ Deferred with reasons; each becomes a spec change before code.
 | GPT models | different reasoning schema |
 | cosign step in addition to attestations | attestations already Sigstore-backed |
 | Homebrew tap | must not strip quarantine; needs notarization |
-| header read timeout | `axum::serve` exposes no header-read deadline; a manual `hyper_util` accept loop would add it. Loopback plus the mandatory token keeps the exposure to local processes. `axum::serve` also spawns a task per connection with no cap, and the `MAX_CONCURRENT` semaphore is not acquired until Task 18, so until then a local process can hold unbounded idle connections open. |
+| header read timeout | `axum::serve` exposes no header-read deadline; a manual `hyper_util` accept loop would add it. Loopback plus the mandatory token keeps the exposure to local processes. `axum::serve` also spawns a task per connection with no cap; the `MAX_CONCURRENT` semaphore (`crates/kiro-trust/src/server/messages.rs`) bounds concurrent `/v1/messages` requests but not idle connections that never reach the handler. |

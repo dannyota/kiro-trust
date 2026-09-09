@@ -51,6 +51,11 @@ reads its Identity Center credential and never performs its own login flow.
 
 ```bash
 kiro-trust serve
+```
+
+`serve` blocks the terminal, so run the rest in a second shell:
+
+```bash
 eval "$(kiro-trust env)"
 claude
 ```
@@ -75,8 +80,9 @@ spec for every flag and environment variable.
 - Request and response bodies are never logged, and no flag exists to log
   them.
 - No telemetry, no update checks, no dynamic model discovery.
-- `kiro-trust audit` prints the effective configuration so you can check
-  every line above.
+- `kiro-trust audit` prints the effective configuration, and checks the
+  three of these guarantees that a running build can check for itself (see
+  Audit below).
 
 ## Audit
 
@@ -87,8 +93,21 @@ kiro-trust audit [--json]
 Prints the effective security configuration: listener address, credential
 database path, outbound hosts, TLS roots, and whether any developer-only
 feature (such as `capture`, which writes real prompts and responses to disk)
-is compiled into this build. It exits 1 when a guarantee above does not hold
-and never starts a listener or makes a network request itself.
+is compiled into this build. It exits 1 when a developer-only feature is
+compiled in, the listener is not loopback, or the credential database could
+not be opened read-only (spec 4.2); it never starts a listener or makes a
+network request itself.
+
+Only some of the lines above are measurements of this running build: the
+listener address, credential database path and mode, outbound hosts, TLS
+roots, HTTP proxy setting, and redirect policy are read back from the code
+that actually enforces them. The `Telemetry`, `Request body logging`,
+`Dynamic model discovery`, and `Automatic updates` lines are fixed text,
+printed the same way regardless of build or configuration, because they each
+assert that a whole category of code does not exist in this binary; no field
+you can print proves an absence better than the source itself does. Read
+those four as a pointer to go verify the claim in the source (or `NOTICE`),
+not as something `audit` checked for you.
 
 ## Limitations
 

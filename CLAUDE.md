@@ -67,8 +67,10 @@ kiro-trust (bin)  →  kiro-trust-kiro  →  kiro-trust-net, kiro-trust-protocol
   `server::require_token`, `token::write_temp_file`, and `env_cmd::run` (the
   fifth site: `env`'s whole purpose is printing the token, spec 4.3, so there
   is no way to implement it without one; the token goes to stdout only, never
-  to a log, stderr, or any error path). Never derive `Serialize`, or a `Debug`
-  that prints content, for a type holding one.
+  to a log, stderr, or any error path). Test code is exempt: a `#[cfg(test)]`
+  function may call `expose_secret()` on a value it constructed itself, to
+  assert on it, without becoming a sixth production site. Never derive
+  `Serialize`, or a `Debug` that prints content, for a type holding one.
 - The Kiro database is opened only through `open_read_only`. Never add another
   constructor, never write, never copy the file, never read a table other than
   `auth_kv` and `state`.

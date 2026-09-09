@@ -3,7 +3,8 @@ use kiro_trust_protocol::catalog;
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The shape Claude Code's gateway discovery accepts (spec 5.2).
+/// The shape Claude Code's gateway discovery accepts (spec 5.2), transcribed
+/// from kirocc `internal/server/handlers.go` (see NOTICE).
 pub async fn get_models() -> Json<Value> {
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)

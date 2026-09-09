@@ -31,7 +31,12 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz
-      - run: cargo install cargo-fuzz --locked
+      # Pinned (final-fix-2.md Minor 9): unlike cargo-auditable (spec 9.1),
+      # there is no second install site this needs to stay in sync with, so
+      # nothing here argues for tracking latest. Dependabot cannot bump a
+      # version embedded in a `run:` line, so a bump is manual; check
+      # https://crates.io/crates/cargo-fuzz for a newer release periodically.
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
       # Seed anthropic_request corpus from tests/fixtures/*/request.json (spec 8.5).
       # tests/fixtures/ is the only seed source anywhere in this project; a
       # capture directory is never one, even for a quick local corpus boost.

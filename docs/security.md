@@ -15,7 +15,13 @@ a test behind it.
 - No telemetry, crash reporting, update checks, or model discovery.
 
 Run `kiro-trust audit` to see the effective configuration. It exits non-zero
-when a promise does not hold for the running build.
+for three of the promises above: a developer-only feature compiled into the
+build, a listener that is not loopback, or a credential database that could
+not be opened read-only (spec 4.2). The rest of the promises above (no body
+logging, no telemetry, no crash reporting, no update checks, no model
+discovery) are things `audit` states, not things it measures: they hold
+because the corresponding code was never written, and no runtime check can
+prove that better than reading the source (or `NOTICE`) can.
 
 ## Verifying a release
 
