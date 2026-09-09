@@ -1,9 +1,8 @@
 //! Upstream error classification (spec 5.6). Transcribed from kirocc
 //! internal/kiroclient/aws_error.go.
 
+use kiro_trust_protocol::sanitize::{self, MAX_MESSAGE_BYTES};
 use serde_json::Value;
-
-pub const MAX_MESSAGE_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpstreamErrorKind {
@@ -38,14 +37,8 @@ impl UpstreamError {
         exception_type: Option<String>,
         message: impl Into<String>,
     ) -> Self {
-        let mut message: String = message.into();
-        if message.len() > MAX_MESSAGE_BYTES {
-            let mut end = MAX_MESSAGE_BYTES;
-            while !message.is_char_boundary(end) {
-                end -= 1;
-            }
-            message.truncate(end);
-        }
+        let message: String = message.into();
+        let message = sanitize::cap(&message, MAX_MESSAGE_BYTES);
         UpstreamError {
             kind,
             status,
@@ -78,53 +71,7 @@ pub fn parse_exception_message(body: &[u8]) -> String {
         .ok()
         .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string))
         .unwrap_or_default();
-    scrub_identifiers(&raw)
-}
-
-/// Removes AWS identifiers that must never reach a client or a log
-/// (`CLAUDE.md`): an ARN becomes `arn:***`, and a bare 12-digit account id
-/// becomes `***`. Applied before the 1 KiB cap in [`UpstreamError::new`] so a
-/// truncated ARN cannot survive.
-fn scrub_identifiers(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if s[i..].starts_with("arn:") {
-            let mut j = i + "arn:".len();
-            while j < bytes.len() {
-                let b = bytes[j];
-                if b.is_ascii_whitespace() || b == b'"' || b == b'\'' {
-                    break;
-                }
-                j += 1;
-            }
-            out.push_str("arn:***");
-            i = j;
-            continue;
-        }
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            let mut j = i;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-            if j - start == 12 {
-                out.push_str("***");
-            } else {
-                out.push_str(&s[start..j]);
-            }
-            i = j;
-            continue;
-        }
-        let ch = s[i..]
-            .chars()
-            .next()
-            .expect("i < bytes.len() is a char boundary");
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
+    sanitize::scrub_identifiers(&raw)
 }
 
 pub fn is_retryable_exception(t: &str) -> bool {
@@ -183,36 +130,5 @@ mod tests {
             "Application/VND.Amazon.EventStream; charset=utf-8"
         ));
         assert!(!is_event_stream_content_type("application/json"));
-    }
-
-    #[test]
-    fn scrub_identifiers_masks_arns_with_no_surviving_digits() {
-        assert_eq!(
-            scrub_identifiers(
-                "denied for arn:aws:codewhisperer:us-east-1:123456789012:profile/AAA"
-            ),
-            "denied for arn:***"
-        );
-    }
-
-    #[test]
-    fn scrub_identifiers_masks_a_bare_twelve_digit_account_id() {
-        assert_eq!(
-            scrub_identifiers("account 123456789012 rejected"),
-            "account *** rejected"
-        );
-    }
-
-    #[test]
-    fn scrub_identifiers_leaves_a_thirteen_digit_run_untouched() {
-        assert_eq!(
-            scrub_identifiers("stamp 1234567890123"),
-            "stamp 1234567890123"
-        );
-    }
-
-    #[test]
-    fn scrub_identifiers_leaves_an_eleven_digit_run_untouched() {
-        assert_eq!(scrub_identifiers("short 12345678901"), "short 12345678901");
     }
 }

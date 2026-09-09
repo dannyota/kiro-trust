@@ -4,6 +4,7 @@ use axum::extract::rejection::BytesRejection;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use kiro_trust_kiro::{UpstreamError, UpstreamErrorKind};
+use kiro_trust_protocol::sanitize::{self, MAX_MESSAGE_BYTES};
 use serde_json::json;
 
 #[derive(Debug, Clone)]
@@ -14,11 +15,19 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    // Scrub before capping (spec 5.6), matching `kiro-trust-kiro`'s
+    // `UpstreamError::new`: applying this here rather than only in
+    // `failure_to_error` covers every error constructor, including ones
+    // added later, and re-scrubbing a message that already went through
+    // `parse_exception_message` is idempotent and harmless.
     fn new(status: StatusCode, kind: &'static str, message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        let message = sanitize::scrub_identifiers(&message);
+        let message = sanitize::cap(&message, MAX_MESSAGE_BYTES);
         ApiError {
             status,
             kind,
-            message: message.into(),
+            message,
         }
     }
     pub fn invalid_request(m: impl Into<String>) -> Self {
@@ -47,6 +56,13 @@ impl ApiError {
     #[allow(clippy::self_named_constructors)]
     pub fn api_error(m: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, "api_error", m)
+    }
+    // The real Anthropic API returns 413 `request_too_large` for a body over
+    // the 32 MiB Messages API limit (spec 5.6), distinct from 400
+    // `invalid_request_error`: a client can tell "retry with a smaller
+    // request" from "your JSON is malformed".
+    pub fn request_too_large(m: impl Into<String>) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", m)
     }
 
     pub fn body(&self) -> serde_json::Value {
@@ -82,7 +98,7 @@ impl From<UpstreamError> for ApiError {
 impl From<BytesRejection> for ApiError {
     fn from(e: BytesRejection) -> Self {
         if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            Self::invalid_request(format!(
+            Self::request_too_large(format!(
                 "request body exceeds the {}-byte limit",
                 super::MAX_BODY_BYTES
             ))

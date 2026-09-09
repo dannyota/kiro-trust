@@ -6,5 +6,6 @@ pub mod catalog;
 pub mod estimate;
 pub mod eventstream;
 pub mod kiro;
+pub mod sanitize;
 pub mod sse;
 pub mod translate;

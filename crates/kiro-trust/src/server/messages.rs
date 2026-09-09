@@ -3,7 +3,6 @@
 use crate::server::AppState;
 use crate::server::error::ApiError;
 use crate::server::pump::{Chunk, Primed, Pump};
-use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::extract::rejection::BytesRejection;
@@ -155,9 +154,16 @@ pub async fn post_messages(
         "request"
     );
 
+    // `retry_count` is the invalid-state retry gate (spec 5.4: at most one,
+    // and only before output starts); `upstream_attempts` accumulates each
+    // `generate()` call's own retries (kiro-trust-kiro's 429/5xx backoff, up
+    // to `MAX_ATTEMPTS`), which would otherwise never reach a log line. Both
+    // together are what the `retry_count` log field reports.
     let mut retry_count = 0u32;
+    let mut upstream_attempts = 0u32;
     loop {
         let upstream = state.upstream.generate(&built.payload).await?;
+        upstream_attempts += upstream.attempts.saturating_sub(1);
         let mut pump = Pump::new(upstream.bytes, opts());
         match pump.prime().await {
             Primed::Failed(f) if retry_count == 0 && retryable(&f) => {
@@ -177,7 +183,7 @@ pub async fn post_messages(
                     &request_id,
                     started,
                     err.status.as_u16(),
-                    retry_count,
+                    retry_count + upstream_attempts,
                     &pump,
                     "upstream_failure",
                 );
@@ -189,13 +195,14 @@ pub async fn post_messages(
                     &request_id,
                     started,
                     err.status.as_u16(),
-                    retry_count,
+                    retry_count + upstream_attempts,
                     &pump,
                     "upstream_broken",
                 );
                 return Err(err);
             }
             Primed::Ready(first) | Primed::Ended(first) => {
+                let retry_count = retry_count + upstream_attempts;
                 if req.stream {
                     return Ok(stream_response(
                         request_id,
@@ -210,32 +217,37 @@ pub async fn post_messages(
                 while !done {
                     match pump.next().await {
                         Chunk::Events(_) => done = pump.ended_or_stopped(),
-                        Chunk::Failed(f) => {
+                        Chunk::Failed(_events, f) => {
+                            let err = failure_to_error(&f);
                             log_done(
                                 &request_id,
                                 started,
-                                502,
+                                err.status.as_u16(),
                                 retry_count,
                                 &pump,
                                 "upstream_failure",
                             );
-                            return Err(failure_to_error(&f));
+                            return Err(err);
                         }
-                        Chunk::Broken(e) => {
+                        Chunk::Broken(_events, e) => {
+                            let err: ApiError = e.into();
                             log_done(
                                 &request_id,
                                 started,
-                                502,
+                                err.status.as_u16(),
                                 retry_count,
                                 &pump,
                                 "upstream_broken",
                             );
-                            return Err(e.into());
+                            return Err(err);
                         }
                         Chunk::Done => done = true,
                     }
                 }
                 let usage = pump.translator.usage();
+                let msg = pump.translator.into_message();
+                let response_body =
+                    serde_json::to_vec(&msg).expect("OutMessage has no fallible field types");
                 log_usage(
                     &request_id,
                     started,
@@ -244,10 +256,12 @@ pub async fn post_messages(
                     pump.frames,
                     usage.input_tokens,
                     usage.output_tokens,
-                    0,
+                    response_body.len(),
+                    None,
                 );
-                let msg = pump.translator.into_message();
-                return Ok(Json(msg).into_response());
+                return Ok(
+                    ([(header::CONTENT_TYPE, "application/json")], response_body).into_response(),
+                );
             }
         }
     }
@@ -288,26 +302,30 @@ fn stream_response(
                     }
                     Ok(c) => c,
                 };
-                let (text, finished) = match chunk {
+                let (text, finished, error_type) = match chunk {
                     Chunk::Events(evs) => {
                         let text: String = evs.iter().map(sse::encode).collect();
-                        (text, pump.ended_or_stopped())
+                        (text, pump.ended_or_stopped(), None)
                     }
-                    Chunk::Failed(f) => {
+                    Chunk::Failed(evs, f) => {
                         let err = failure_to_error(&f);
-                        (
-                            sse::encode(&ResponseTranslator::error_event(err.kind, &err.message)),
-                            true,
-                        )
+                        let mut text: String = evs.iter().map(sse::encode).collect();
+                        text.push_str(&sse::encode(&ResponseTranslator::error_event(
+                            err.kind,
+                            &err.message,
+                        )));
+                        (text, true, Some("upstream_failure"))
                     }
-                    Chunk::Broken(e) => {
+                    Chunk::Broken(evs, e) => {
                         let err: ApiError = e.into();
-                        (
-                            sse::encode(&ResponseTranslator::error_event(err.kind, &err.message)),
-                            true,
-                        )
+                        let mut text: String = evs.iter().map(sse::encode).collect();
+                        text.push_str(&sse::encode(&ResponseTranslator::error_event(
+                            err.kind,
+                            &err.message,
+                        )));
+                        (text, true, Some("upstream_broken"))
                     }
-                    Chunk::Done => (String::new(), true),
+                    Chunk::Done => (String::new(), true, None),
                 };
                 counter.fetch_add(text.len(), Ordering::Relaxed);
                 if finished {
@@ -321,6 +339,7 @@ fn stream_response(
                         usage.input_tokens,
                         usage.output_tokens,
                         counter.load(Ordering::Relaxed),
+                        error_type,
                     );
                 }
                 Some((Ok(Bytes::from(text)), (pump, finished, permit)))
@@ -370,16 +389,78 @@ fn log_usage(
     input_tokens: u64,
     output_tokens: u64,
     output_bytes: usize,
+    // Set only when a stream ended in `Chunk::Failed`/`Chunk::Broken` (spec
+    // 6.4's `error_type` field): the HTTP status stays 200 either way (the
+    // response really did start with a 200), but an operator otherwise has
+    // no way to tell a stream failed mid-flight from one that finished
+    // cleanly.
+    error_type: Option<&str>,
 ) {
-    tracing::info!(
-        %request_id,
-        status,
-        duration_ms = started.elapsed().as_millis() as u64,
-        retry_count,
-        frames,
-        input_tokens,
-        output_tokens,
-        output_bytes,
-        "response"
-    );
+    match error_type {
+        Some(error_type) => tracing::info!(
+            %request_id,
+            status,
+            duration_ms = started.elapsed().as_millis() as u64,
+            retry_count,
+            frames,
+            input_tokens,
+            output_tokens,
+            output_bytes,
+            error_type,
+            "response"
+        ),
+        None => tracing::info!(
+            %request_id,
+            status,
+            duration_ms = started.elapsed().as_millis() as u64,
+            retry_count,
+            frames,
+            input_tokens,
+            output_tokens,
+            output_bytes,
+            "response"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A non-UTF-8 `X-Claude-Code-Session-Id` header value fails
+    // `HeaderValue::to_str()` in `post_messages`, so it reaches
+    // `conversation_id` exactly like a missing header: as `None`. This test
+    // exercises `conversation_id` directly, which is where the id-derivation
+    // rule (spec 5.3 step 8) actually lives; the header-to-`Option<&str>`
+    // step is one line of `post_messages` and is not re-tested here.
+    #[test]
+    fn conversation_id_derivation() {
+        let salt_a = [1u8; 16];
+        let salt_b = [2u8; 16];
+
+        // Same session id under the same salt is stable.
+        assert_eq!(
+            conversation_id(&salt_a, Some("session-abc")),
+            conversation_id(&salt_a, Some("session-abc"))
+        );
+
+        // Same session id under two different salts differs.
+        assert_ne!(
+            conversation_id(&salt_a, Some("session-abc")),
+            conversation_id(&salt_b, Some("session-abc"))
+        );
+
+        // An empty header value yields a fresh id per call.
+        assert_ne!(
+            conversation_id(&salt_a, Some("")),
+            conversation_id(&salt_a, Some(""))
+        );
+
+        // A non-UTF-8 header (indistinguishable from an absent one once
+        // `to_str()` fails) yields a fresh id per call.
+        assert_ne!(
+            conversation_id(&salt_a, None),
+            conversation_id(&salt_a, None)
+        );
+    }
 }

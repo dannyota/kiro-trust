@@ -18,6 +18,12 @@ pub const TOKEN: &str = "test-local-token";
 pub struct Scripted {
     pub responses: Mutex<Vec<Result<Vec<u8>, UpstreamError>>>,
     pub payloads: Mutex<Vec<serde_json::Value>>,
+    /// Raw byte chunk size the response is delivered in. 7 (the historical
+    /// default, kept so no existing test changes behavior) crosses frame
+    /// seams across chunk boundaries; a large value (`usize::MAX`) delivers
+    /// a whole response in one chunk, needed to reproduce a failure sharing
+    /// a chunk with real output.
+    pub chunk_size: usize,
 }
 
 #[async_trait::async_trait]
@@ -29,9 +35,8 @@ impl Upstream for Scripted {
             .push(serde_json::to_value(payload).unwrap());
         let next = self.responses.lock().unwrap().remove(0);
         let bytes = next?;
-        // Deliver in 7-byte chunks so frame seams cross chunk boundaries.
         let chunks: Vec<Result<bytes::Bytes, UpstreamError>> = bytes
-            .chunks(7)
+            .chunks(self.chunk_size.max(1))
             .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
             .collect();
         Ok(UpstreamStream {
@@ -55,11 +60,20 @@ pub fn app(
     dir: &std::path::Path,
     responses: Vec<Result<Vec<u8>, UpstreamError>>,
 ) -> (axum::Router, Arc<Scripted>) {
+    app_with_chunk_size(dir, responses, 7)
+}
+
+pub fn app_with_chunk_size(
+    dir: &std::path::Path,
+    responses: Vec<Result<Vec<u8>, UpstreamError>>,
+    chunk_size: usize,
+) -> (axum::Router, Arc<Scripted>) {
     let net = Arc::new(Client::new(Policy::loopback_plain_http(1)).unwrap());
     let tokens = Arc::new(TokenSource::new(test_db(dir), net, None));
     let scripted = Arc::new(Scripted {
         responses: Mutex::new(responses),
         payloads: Mutex::new(vec![]),
+        chunk_size,
     });
     let state = Arc::new(AppState {
         tokens,
@@ -218,6 +232,7 @@ async fn an_empty_token_never_authenticates_even_against_an_empty_local_token() 
     let upstream = Arc::new(Scripted {
         responses: Mutex::new(vec![]),
         payloads: Mutex::new(vec![]),
+        chunk_size: 7,
     });
     let state = Arc::new(AppState {
         tokens,
@@ -439,12 +454,12 @@ async fn oversized_body_returns_the_error_envelope_not_axums_default_rejection()
         .unwrap();
     assert_eq!(
         r.status(),
-        StatusCode::BAD_REQUEST,
-        "spec 5.6: 400 invalid_request_error, not axum's 413"
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "spec 5.6: 413 request_too_large, not axum's default rejection"
     );
     assert_eq!(r.headers()["content-type"], "application/json");
     let body = body_string(r).await;
-    assert!(body.contains("\"invalid_request_error\""));
+    assert!(body.contains("\"request_too_large\""));
     assert!(
         !body.to_lowercase().contains("failed to buffer"),
         "not axum's default text"
@@ -521,6 +536,212 @@ async fn upstream_errors_map_to_the_envelope() {
     }
 }
 
+// Critical 1: an upstream exception message can carry the caller's profile
+// ARN and account id (a real AWS `AccessDeniedException` routinely echoes
+// them); both must be scrubbed before the message reaches a client, on
+// every path that can deliver one.
+#[tokio::test]
+async fn exception_message_arn_is_scrubbed_in_the_http_error_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(
+        dir.path(),
+        vec![Ok(encode_exception_frame(
+            "AccessDeniedException",
+            br#"{"message":"User: arn:aws:codewhisperer:us-east-1:123456789012:profile/EXAMPLE is not authorized"}"#,
+        ))],
+    );
+    let r = app
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    let body = body_string(r).await;
+    assert!(body.contains("arn:***"), "{body}");
+    assert!(!body.contains("123456789012"), "{body}");
+    assert!(!body.contains("EXAMPLE"), "{body}");
+}
+
+#[tokio::test]
+async fn exception_message_arn_is_scrubbed_in_the_sse_error_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut body = frames(&[("assistantResponseEvent", r#"{"content":"hi there"}"#)]);
+    body.extend(encode_exception_frame(
+        "AccessDeniedException",
+        br#"{"message":"User: arn:aws:codewhisperer:us-east-1:123456789012:profile/EXAMPLE is not authorized"}"#,
+    ));
+    let (app, _) = app(dir.path(), vec![Ok(body)]);
+    let r = app
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let text = body_string(r).await;
+    assert!(text.contains("\"text\":\"hi there\""));
+    assert!(text.contains("event: error"));
+    assert!(text.contains("arn:***"), "{text}");
+    assert!(!text.contains("123456789012"), "{text}");
+}
+
+#[tokio::test]
+async fn exception_message_is_capped_at_one_kib() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = "x".repeat(4096);
+    let (app, _) = app(
+        dir.path(),
+        vec![Ok(encode_exception_frame(
+            "InternalServerException",
+            serde_json::json!({"message": long}).to_string().as_bytes(),
+        ))],
+    );
+    let r = app
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.len() <= 1024, "message was {} bytes", message.len());
+}
+
+#[tokio::test]
+async fn exception_message_caps_on_a_char_boundary_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let exception_type = "InternalServerException";
+    // `failure_to_error` formats "{type}: {message}" before the cap applies
+    // (spec 5.6), so the multi-byte run is placed to straddle byte offset
+    // 1024 of that combined string, not of `message` alone.
+    let prefix_len = exception_type.len() + ": ".len();
+    let n = 1023usize.saturating_sub(prefix_len);
+    let message = format!("{}{}", "a".repeat(n), "é".repeat(50));
+    let (app, _) = app(
+        dir.path(),
+        vec![Ok(encode_exception_frame(
+            exception_type,
+            serde_json::json!({"message": message})
+                .to_string()
+                .as_bytes(),
+        ))],
+    );
+    let r = app
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+    // `body_string` itself panics on invalid UTF-8 via `String::from_utf8`;
+    // reaching the asserts below already proves that did not happen.
+    let body = body_string(r).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let got = v["error"]["message"].as_str().unwrap();
+    assert!(got.len() <= 1024, "message was {} bytes", got.len());
+    assert!(
+        !got.contains('é'),
+        "the multi-byte char must be cut whole, not sliced: {got:?}"
+    );
+}
+
+// Critical 2: a single upstream chunk can carry a text frame followed by a
+// frame that fails or breaks the stream. The events already decoded from
+// that chunk must reach the client before the failure does, not be dropped
+// with it.
+#[tokio::test]
+async fn a_failure_sharing_a_chunk_with_text_does_not_drop_the_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut raw = frames(&[("assistantResponseEvent", r#"{"content":"hello"}"#)]);
+    raw.extend(encode_exception_frame(
+        "InternalServerException",
+        br#"{"message":"boom"}"#,
+    ));
+    // The whole response arrives as one chunk, so the pump discovers the
+    // text and the exception in the same `next()` call, at prime time
+    // (before any other output): this must be a 200 with the text and the
+    // error event, not an HTTP error.
+    let (app, _) = app_with_chunk_size(dir.path(), vec![Ok(raw)], usize::MAX);
+    let r = app
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let text = body_string(r).await;
+    let text_pos = text.find("\"text\":\"hello\"").expect("text delta present");
+    let error_pos = text.find("event: error").expect("error event present");
+    assert!(text_pos < error_pos, "text must precede the error event");
+}
+
+#[tokio::test]
+async fn a_failure_sharing_a_later_chunk_with_text_does_not_drop_the_text() {
+    let dir = tempfile::tempdir().unwrap();
+    // A long first frame primes the stream with real output. The second and
+    // third frames (more text, then an exception) are kept short enough
+    // that, chunked at exactly the first frame's byte length, they land
+    // together in the *next* chunk: the failure now surfaces from the
+    // ongoing `next()` loop in `stream_response`, not from `prime()`.
+    let frame1 = encode_event_frame(
+        "assistantResponseEvent",
+        format!("{{\"content\":\"{}\"}}", "z".repeat(500)).as_bytes(),
+    );
+    let frame2 = encode_event_frame("assistantResponseEvent", br#"{"content":"more"}"#);
+    let frame3 = encode_exception_frame("InternalServerException", br#"{"message":"boom"}"#);
+    let rest_len = frame2.len() + frame3.len();
+    assert!(
+        frame1.len() >= rest_len,
+        "test setup: frame1 ({} bytes) must be at least as long as frame2+frame3 ({rest_len} bytes)",
+        frame1.len()
+    );
+    let mut raw = frame1.clone();
+    raw.extend(&frame2);
+    raw.extend(&frame3);
+    let (app, _) = app_with_chunk_size(dir.path(), vec![Ok(raw)], frame1.len());
+    // `max_tokens` well above the 500-char padding frame's estimated token
+    // count (~125, at the translator's 4-chars-per-token local enforcement):
+    // a `max_tokens` local stop must not cut this test's setup short before
+    // the exception frame is even reached.
+    let r = app
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 1000, "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let text = body_string(r).await;
+    let more_pos = text
+        .find("\"text\":\"more\"")
+        .expect("second text delta present");
+    let error_pos = text.find("event: error").expect("error event present");
+    assert!(more_pos < error_pos, "text must precede the error event");
+}
+
+#[tokio::test]
+async fn a_broken_frame_sharing_a_chunk_with_text_does_not_drop_the_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut raw = frames(&[("assistantResponseEvent", r#"{"content":"hello"}"#)]);
+    // 12 zero bytes parse as a syntactically complete prelude (enough bytes
+    // present) with a CRC of 0, which the real CRC of 8 zero bytes never
+    // matches: a `FrameError::PreludeCrc`, decoded in the same read as the
+    // valid text frame above.
+    raw.extend([0u8; 12]);
+    let (app, _) = app_with_chunk_size(dir.path(), vec![Ok(raw)], usize::MAX);
+    let r = app
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let text = body_string(r).await;
+    let text_pos = text.find("\"text\":\"hello\"").expect("text delta present");
+    let error_pos = text.find("event: error").expect("error event present");
+    assert!(text_pos < error_pos, "text must precede the error event");
+}
+
 #[tokio::test]
 async fn retryable_invalid_state_clears_the_conversation_id_once() {
     {
@@ -562,6 +783,36 @@ async fn retryable_invalid_state_clears_the_conversation_id_once() {
     }
 }
 
+// A second retryable invalid state must not trigger a second retry (spec
+// 5.4: at most one). With only two responses queued, a regression that
+// retried twice would panic on `Scripted::generate`'s `remove(0)` against an
+// empty vec rather than fail this assertion.
+#[tokio::test]
+async fn a_second_retryable_invalid_state_is_not_retried_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = frames(&[(
+        "invalidStateEvent",
+        r#"{"reason":"STALE_CONVERSATION","message":"stale"}"#,
+    )]);
+    let second = frames(&[(
+        "invalidStateEvent",
+        r#"{"reason":"STALE_CONVERSATION","message":"stale again"}"#,
+    )]);
+    let (app, scripted) = app(dir.path(), vec![Ok(first), Ok(second)]);
+    let r = app
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        scripted.payloads.lock().unwrap().len(),
+        2,
+        "exactly two upstream calls: the retry, and no more"
+    );
+}
+
 #[tokio::test]
 async fn local_stop_drops_the_rest_of_the_upstream() {
     let dir = tempfile::tempdir().unwrap();
@@ -592,6 +843,7 @@ async fn concurrency_cap_returns_429() {
     let scripted = Arc::new(Scripted {
         responses: Mutex::new(vec![]),
         payloads: Mutex::new(vec![]),
+        chunk_size: 7,
     });
     let limiter = Arc::new(tokio::sync::Semaphore::new(1));
     let state = Arc::new(AppState {
@@ -610,6 +862,68 @@ async fn concurrency_cap_returns_429() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+// Important 3: pins both the hold and the release of the streaming permit
+// (spec 5.5), not just that an exhausted semaphore returns 429. A refactor
+// that moved the permit back to a `let _permit` local dropped at the end of
+// the handler (releasing it before the SSE body is ever read) would still
+// pass `concurrency_cap_returns_429`, since that test never holds a
+// streaming response open; it would fail the middle assertion here.
+#[tokio::test]
+async fn streaming_permit_is_held_for_the_connection_and_released_on_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(Client::new(Policy::loopback_plain_http(1)).unwrap());
+    let tokens = Arc::new(TokenSource::new(test_db(dir.path()), net, None));
+    let scripted = Arc::new(Scripted {
+        responses: Mutex::new(vec![
+            Ok(frames(&[(
+                "assistantResponseEvent",
+                r#"{"content":"first"}"#,
+            )])),
+            Ok(frames(&[(
+                "assistantResponseEvent",
+                r#"{"content":"third"}"#,
+            )])),
+        ]),
+        payloads: Mutex::new(vec![]),
+        chunk_size: 7,
+    });
+    let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+    let state = Arc::new(AppState {
+        tokens,
+        upstream: scripted,
+        local_token: SecretString::from(TOKEN.to_string()),
+        limiter: limiter.clone(),
+        conversation_salt: [4u8; 16],
+    });
+    let app = build_router(state);
+    let stream_req = || {
+        messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 10,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+    };
+
+    // Hold the first response without consuming its body. `Body::from_stream`
+    // stores the `stream::unfold` state (which carries the permit) eagerly,
+    // not lazily on first poll, so the permit is held from this point on.
+    let first = app.clone().oneshot(stream_req()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    // The one permit is still held by `first`: a second request is rejected.
+    let second = app.clone().oneshot(stream_req()).await.unwrap();
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Dropping `first` drops its body's stream state, and with it the
+    // permit. `tokio::sync::Semaphore`'s permit release runs synchronously
+    // in `Drop`, so no delay is needed before the next acquire observes it.
+    drop(first);
+
+    let third = app.clone().oneshot(stream_req()).await.unwrap();
+    assert_eq!(third.status(), StatusCode::OK);
 }
 
 #[tokio::test]

@@ -392,7 +392,8 @@ tracks the current block (`thinking`, `text`, `tool_use`, or none) and emits:
 - End of stream: close the open block, `message_delta` with `stop_reason` and
   usage, `message_stop`.
 - Idle keep-alive: an SSE comment line `: keep-alive` every 15 s without an
-  event.
+  event. Keep-alive comments start after the first event; there is none
+  before it.
 
 Non-streaming: the same events folded into one `Message` JSON body.
 
@@ -401,7 +402,7 @@ Non-streaming: the same events folded into one `Message` JSON body.
 | Limit | Value |
 | --- | --- |
 | Request body | 32 MiB |
-| Concurrent requests | 32; excess gets 429 `rate_limit_error` |
+| Concurrent requests | 32; excess gets 429 `rate_limit_error`. An open SSE connection holds its slot for the life of the connection, not just while the upstream call is being primed. |
 | JSON nesting | serde_json default recursion limit (128) |
 | Tools per request | 512 |
 | Messages per request | 4096 |
@@ -416,7 +417,8 @@ Every failure uses `{"type":"error","error":{"type":"<t>","message":"<m>"}}`.
 | Condition | Status | `error.type` |
 | --- | --- | --- |
 | missing or wrong local token | 401 | `authentication_error` |
-| body too large, bad JSON, unknown model, invalid field | 400 | `invalid_request_error` |
+| bad JSON, unknown model, invalid field | 400 | `invalid_request_error` |
+| request body over 32 MiB | 413 | `request_too_large` |
 | unknown route | 404 | `not_found_error` |
 | method not allowed | 405 | `invalid_request_error` |
 | Kiro credential unusable (no database, refresh failed) | 401 | `authentication_error` |
