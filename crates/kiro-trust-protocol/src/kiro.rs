@@ -158,6 +158,8 @@ pub struct HistoryUserInputMessage {
     pub origin: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_input_message_context: Option<UserInputMessageContext>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<Image>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_point: Option<CachePoint>,
 }
@@ -295,6 +297,42 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&h).unwrap(),
             r#"{"assistantResponseMessage":{"messageId":"m1","content":"ok","toolUses":[{"toolUseId":"t1","name":"Read","input":{"path":"a"}}]}}"#
+        );
+    }
+
+    fn history_user_input_message(images: Vec<Image>) -> HistoryUserInputMessage {
+        HistoryUserInputMessage {
+            content: "hi".into(),
+            model_id: None,
+            origin: None,
+            user_input_message_context: None,
+            images,
+            cache_point: None,
+        }
+    }
+
+    // Spec 5.3 step 6: history carries images with the same shape as the
+    // current message's `images` field.
+    #[test]
+    fn history_images_serialize_with_format_and_bytes() {
+        let h = HistoryEntry::UserInputMessage(history_user_input_message(vec![Image {
+            format: "png".into(),
+            source: ImageSource {
+                bytes: "AAAA".into(),
+            },
+        }]));
+        assert_eq!(
+            serde_json::to_string(&h).unwrap(),
+            r#"{"userInputMessage":{"content":"hi","images":[{"format":"png","source":{"bytes":"AAAA"}}]}}"#
+        );
+    }
+
+    #[test]
+    fn empty_history_images_are_omitted() {
+        let h = HistoryEntry::UserInputMessage(history_user_input_message(vec![]));
+        assert_eq!(
+            serde_json::to_string(&h).unwrap(),
+            r#"{"userInputMessage":{"content":"hi"}}"#
         );
     }
 }
