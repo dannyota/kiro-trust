@@ -1,0 +1,190 @@
+name: Publish crates
+
+# Publishes the five crates to crates.io for one already-released tag. This is
+# never automatic: the owner dispatches it with the tag, and the `crates-io`
+# environment requires the owner's approval before the publish job runs. It
+# publishes only after the GitHub Release for that tag carries the complete
+# asset list, because a crates.io version cannot be deleted while a tag and a
+# Release can. Credentials come from crates.io Trusted Publishing (OIDC), so no
+# long-lived token is stored in the repository. Both jobs check that every
+# crate exists and is owned by dannyota before token exchange or upload. Registry
+# uploads are not atomic, so this readiness check cannot replace the required
+# Trusted Publishing settings review. Actions are pinned by commit because this
+# is the one workflow that holds a live publish token.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Released tag to publish, for example v0.6.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-crates
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Require a release-shaped tag
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "tag must look like v1.2.3 or v1.2.3-rc.1" >&2
+            exit 1
+          fi
+
+      # `refs/tags/` is load-bearing: a bare name would resolve a branch of
+      # the same name before the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Record the tagged commit
+        id: commit
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Require every workspace version field to match the tag
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          python3 - "$TAG" <<'PY'
+          import sys, tomllib
+          tag = sys.argv[1]
+          want = tag[1:]
+          with open("Cargo.toml", "rb") as f:
+              root = tomllib.load(f)
+          fields = {"[workspace.package] version": root["workspace"]["package"]["version"]}
+          for name in ("kiro-trust-protocol", "kiro-trust-net", "kiro-trust-auth", "kiro-trust-kiro", "kiro-trust"):
+              fields[f"[workspace.dependencies] {name}"] = root["workspace"]["dependencies"][name]["version"]
+          for name, directory in (
+              ("kiro-trust-protocol", "kiro-trust-protocol"),
+              ("kiro-trust-net", "kiro-trust-net"),
+              ("kiro-trust-auth", "kiro-trust-auth"),
+              ("kiro-trust-kiro", "kiro-trust-kiro"),
+              ("kiro-trust", "kiro-trust"),
+          ):
+              with open(f"crates/{directory}/Cargo.toml", "rb") as f:
+                  version = tomllib.load(f)["package"]["version"]
+              fields[f"package {name}"] = root["workspace"]["package"]["version"] if version == {"workspace": True} else version
+          wrong = {k: v for k, v in fields.items() if v != want}
+          for k, v in wrong.items():
+              print(f"{k} is {v}, tag is {tag}", file=sys.stderr)
+          if wrong:
+              sys.exit(1)
+          print(f"all {len(fields)} version fields equal {want}")
+          PY
+
+      - name: Require a complete GitHub Release for the tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          COMMIT: ${{ steps.commit.outputs.sha }}
+        run: |
+          release="$(gh release view "$TAG" --json isDraft,targetCommitish,assets 2>/dev/null || true)"
+          if [ -z "$release" ] || [ "$(jq -r .isDraft <<<"$release")" != "false" ]; then
+            echo "release $TAG is missing or still a draft" >&2
+            exit 1
+          fi
+          built_from="$(jq -r .targetCommitish <<<"$release")"
+          if [[ "$built_from" =~ ^[0-9a-f]{40}$ ]] && [ "$built_from" != "$COMMIT" ]; then
+            echo "release $TAG was built from $built_from but the tag now points at $COMMIT" >&2
+            exit 1
+          fi
+          mapfile -t assets < <(jq -r '.assets[] | select(.state == "uploaded") | .name' <<<"$release")
+          expected=(dist-manifest.json sha256.sum source.tar.gz source.tar.gz.sha256
+            kiro-trust-installer.sh kiro-trust-installer.ps1)
+          targets="$(sed -n 's/^targets = \[\(.*\)\]/\1/p' dist-workspace.toml | tr -d '",')"
+          if [ -z "$targets" ]; then
+            echo "no targets parsed from dist-workspace.toml; the array must be on one line" >&2
+            exit 1
+          fi
+          for target in $targets; do
+            case "$target" in
+              *-windows-*) archive="kiro-trust-$target.zip" ;;
+              *) archive="kiro-trust-$target.tar.xz" ;;
+            esac
+            expected+=("$archive" "$archive.sha256")
+          done
+          if [ "${#expected[@]}" -lt 9 ]; then
+            echo "expected asset list is implausibly short (${#expected[@]})" >&2
+            exit 1
+          fi
+          missing=()
+          for name in "${expected[@]}"; do
+            printf '%s\n' "${assets[@]}" | grep -qxF -- "$name" || missing+=("$name")
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "release $TAG is missing assets: ${missing[*]}" >&2
+            exit 1
+          fi
+          echo "release $TAG carries all ${#expected[@]} expected assets"
+
+      - name: Require crates.io package ownership
+        shell: bash
+        run: ./scripts/check-crates-io-publish-ready.sh
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Verify the packages before uploading anything
+        shell: bash
+        run: cargo publish --workspace --dry-run --locked --registry crates-io
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Require the commit the verify job checked
+        shell: bash
+        env:
+          EXPECTED: ${{ needs.verify.outputs.commit }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [ -z "$EXPECTED" ] || [ "$actual" != "$EXPECTED" ]; then
+            echo "tag moved between verify ($EXPECTED) and publish ($actual)" >&2
+            exit 1
+          fi
+
+      - name: Require crates.io package ownership
+        shell: bash
+        run: ./scripts/check-crates-io-publish-ready.sh
+
+      # No build cache here: this job holds the publish token, and a restored
+      # cache is writable from any branch. The rebuild costs minutes, not risk.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+
+      - name: Publish all five crates together
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --workspace --locked --registry crates-io

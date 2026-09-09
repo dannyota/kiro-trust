@@ -1007,8 +1007,11 @@ Every workflow pins actions by commit SHA with the tag in a comment.
 with `write` only on the `host` job; `allow-dirty = ["ci"]` keeps the edits.
 
 Verification a user can run: `gh attestation verify <archive> --owner
-dannyota`, and `sha256sum -c`. The SBOM is a `.cdx.json` per package on the
-release.
+dannyota`, and `sha256sum -c`. The SBOM is a `.cdx.xml` per package on the
+release: `cargo-cyclonedx`'s own default, and what `dist`'s generated
+`release.yml` looks for by name; `release-preflight.yml` exercises the tool
+with `--format json` only to prove it runs, not to match the release's
+output format.
 
 No Homebrew tap and no quarantine removal.
 

@@ -24,13 +24,22 @@ separate local token that is useless outside this machine.
 
 ## Install
 
-Download the binary, its SHA-256 sum, and its attestation for your platform
-from [GitHub Releases](https://github.com/dannyota/kiro-trust/releases),
-verify the sum, and put the binary on your `PATH`.
+Download the archive for your platform from
+[GitHub Releases](https://github.com/dannyota/kiro-trust/releases), then
+verify it before running:
 
-`cargo install kiro-trust` works once a given version has also been published
-to crates.io; that publish needs the owner's explicit approval per release and
-is not guaranteed to happen for every tag (see
+```sh
+gh attestation verify kiro-trust-x86_64-unknown-linux-gnu.tar.xz --owner dannyota
+sha256sum -c kiro-trust-x86_64-unknown-linux-gnu.tar.xz.sha256
+```
+
+Each release also carries a CycloneDX SBOM per crate and binaries built with
+`cargo auditable`, so `cargo audit bin` can inspect what actually shipped. Put
+the verified binary on your `PATH`.
+
+`cargo install kiro-trust --locked` works once a given version has also been
+published to crates.io; that publish needs the owner's explicit approval per
+release and is not guaranteed to happen for every tag (see
 [section 9](docs/specs/kiro-trust-design.md#9-distribution-and-release) of the
 design spec). The GitHub release is the one guaranteed artifact for every
 version.

@@ -33,6 +33,8 @@ jobs:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked
       # Seed anthropic_request corpus from tests/fixtures/*/request.json (spec 8.5).
+      # tests/fixtures/ is the only seed source anywhere in this project; a
+      # capture directory is never one, even for a quick local corpus boost.
       # Corpus isn't cached or committed, so it is rebuilt on each run. This step
       # runs only for the anthropic_request matrix leg (see if guard below).
       - name: Seed anthropic_request corpus from fixtures
