@@ -48,11 +48,19 @@ pub const REDIRECTS: &str = "rejected";
 pub struct Client {
     inner: reqwest::Client,
     policy: Policy,
+    /// Test-only: how many trust anchors `new` built the TLS config with, so
+    /// a test can prove the real constructor honored the policy's extra CA
+    /// rather than only proving `build_roots` would have. Never read in
+    /// production code and never exposed outside this crate.
+    #[cfg(test)]
+    configured_root_count: usize,
 }
 
 impl Client {
     pub fn new(policy: Policy) -> Result<Self, NetError> {
         let roots = Self::build_roots(&policy);
+        #[cfg(test)]
+        let configured_root_count = roots.roots.len();
         let tls = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -67,7 +75,12 @@ impl Client {
             .pool_max_idle_per_host(4)
             .build()
             .map_err(|e| NetError::Build(e.without_url().to_string()))?;
-        Ok(Client { inner, policy })
+        Ok(Client {
+            inner,
+            policy,
+            #[cfg(test)]
+            configured_root_count,
+        })
     }
 
     /// Builds the root store this client's TLS config trusts: the compiled
@@ -90,6 +103,24 @@ impl Client {
     #[cfg(test)]
     fn root_count(policy: &Policy) -> usize {
         Self::build_roots(policy).roots.len()
+    }
+
+    /// Test-only: the number of trust anchors this client's *own* TLS config
+    /// was built with, recorded at construction.
+    ///
+    /// This exists because every other test in this module can only reach
+    /// `build_roots`, directly or through a helper that assembles its own
+    /// `ClientConfig`. That left the one line in `Client::new` that consumes
+    /// `build_roots` untested: replacing `Client::new`'s body with the
+    /// pre-`ExtraCa` form, which ignores `policy.extra_ca()` entirely, kept
+    /// every test green while the shipped client silently stopped honoring
+    /// `--extra-ca` (v020-net-review.md, finding 2). Recording the count the
+    /// real constructor actually used closes that gap: a `Client::new` that
+    /// stops routing through `build_roots` fails
+    /// `client_new_uses_the_extra_ca_from_its_policy` below.
+    #[cfg(test)]
+    fn configured_root_count(&self) -> usize {
+        self.configured_root_count
     }
 
     fn url(&self, dest: &Destination, path: &str) -> String {
@@ -340,6 +371,37 @@ mod tests {
             result.is_ok(),
             "a policy carrying the signing CA must connect: {:?}",
             result.err()
+        );
+    }
+
+    /// The regression test for v020-net-review.md finding 2: it fails if
+    /// `Client::new` stops routing through `build_roots`, which is the edit
+    /// that silently disabled `--extra-ca` while all 15 other tests stayed
+    /// green. Asserts on the real constructor, not on a helper's own
+    /// `ClientConfig`.
+    #[test]
+    fn client_new_uses_the_extra_ca_from_its_policy() {
+        let compiled = webpki_roots::TLS_SERVER_ROOTS.len();
+
+        let plain = Client::new(Policy::production()).unwrap();
+        assert_eq!(
+            plain.configured_root_count(),
+            compiled,
+            "a client with no extra CA must be built with exactly the compiled roots"
+        );
+
+        let extra_ca = {
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let pem = params.self_signed(&key).unwrap().pem();
+            ExtraCa::from_pem(pem.as_bytes()).unwrap()
+        };
+        let with_ca = Client::new(Policy::production().with_extra_ca(extra_ca)).unwrap();
+        assert_eq!(
+            with_ca.configured_root_count(),
+            compiled + 1,
+            "the real constructor must add the policy's extra CA to the compiled roots"
         );
     }
 

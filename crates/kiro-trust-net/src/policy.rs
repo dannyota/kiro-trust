@@ -19,11 +19,21 @@ pub struct ExtraCa {
 
 impl ExtraCa {
     /// Parses every certificate block in `pem`. Rejects PEM that fails to
-    /// parse, PEM that parses but holds zero certificates, and any
-    /// certificate that is not a usable trust anchor: each parsed
-    /// certificate is validated by adding it to a `RootCertStore`, so input
-    /// that merely looks like PEM without being a usable trust anchor fails
-    /// here rather than silently doing nothing (spec 6.2).
+    /// parse, PEM that parses but holds zero certificates, more than
+    /// `MAX_EXTRA_CA_CERTIFICATES` of them, and any block whose decoded
+    /// bytes are not a structurally valid X.509 certificate, which
+    /// `RootCertStore::add` establishes.
+    ///
+    /// What that check does not establish, measured against rustls 0.23.44
+    /// (v020-net-review.md, finding 3): it does not verify expiry, key usage,
+    /// or `basicConstraints`, so an expired certificate or a `CA:FALSE` leaf
+    /// is accepted here. That is acceptable rather than overlooked. The
+    /// operator names this file themselves, it only ever adds anchors, and
+    /// rustls ignores anchor expiry during verification anyway, so a stricter
+    /// check here would reject files that would in fact work. The guarantee
+    /// this function provides is "structurally valid X.509, in a bundle small
+    /// enough to verify", not "a certificate authority worth trusting"
+    /// (spec 6.2).
     pub fn from_pem(pem: &[u8]) -> Result<Self, NetError> {
         let mut roots = RootCertStore::empty();
         let mut count = 0;
@@ -33,6 +43,11 @@ impl ExtraCa {
                 .add(cert)
                 .map_err(|_| NetError::ExtraCa(ExtraCaError::NotATrustAnchor))?;
             count += 1;
+            if count > MAX_EXTRA_CA_CERTIFICATES {
+                return Err(NetError::ExtraCa(ExtraCaError::TooManyCertificates {
+                    count,
+                }));
+            }
         }
         if count == 0 {
             return Err(NetError::ExtraCa(ExtraCaError::NoCertificateFound));
@@ -56,6 +71,21 @@ impl std::fmt::Debug for ExtraCa {
     }
 }
 
+/// Upper bound on certificates in one `--extra-ca` file (spec 6.2).
+///
+/// Not an arbitrary tidiness limit. rustls-webpki spends a global budget of
+/// 100 signature checks per verification, and exhausting it is a fatal
+/// `MaximumSignatureChecksExceeded` that halts path building rather than
+/// skipping one anchor, so a large enough bundle makes the runtime host stop
+/// verifying even though its genuine compiled root is still present and
+/// still first in the store (v020-net-review.md, finding 1; the budget's own
+/// upstream comment notes it has been hit in real applications). A bundle
+/// this size is refused at startup with an actionable message instead of
+/// silently turning every outbound call into an opaque TLS failure. 16 sits
+/// far above any plausible legitimate bundle and far below the measured
+/// threshold where verification begins to fail.
+pub const MAX_EXTRA_CA_CERTIFICATES: usize = 16;
+
 /// Reason class for an `ExtraCa::from_pem` failure. Never carries certificate
 /// bytes or a file path (spec 6.2): the caller (a later slice's `--extra-ca`
 /// handling) attaches the path itself when it reports the configuration
@@ -68,6 +98,10 @@ pub enum ExtraCaError {
     NoCertificateFound,
     #[error("certificate is not a usable trust anchor")]
     NotATrustAnchor,
+    #[error(
+        "too many certificates: {count} exceeds the limit of {MAX_EXTRA_CA_CERTIFICATES}, which would exhaust the TLS verifier's signature budget and stop trusted hosts from verifying"
+    )]
+    TooManyCertificates { count: usize },
 }
 
 #[derive(Clone)]
@@ -218,6 +252,48 @@ mod tests {
         combined.push_str(&test_root_pem());
         let extra_ca = ExtraCa::from_pem(combined.as_bytes()).unwrap();
         assert_eq!(extra_ca.count, 2);
+    }
+
+    // v020-net-review.md finding 1: the TLS verifier spends a global budget
+    // of 100 signature checks, and exhausting it halts path building
+    // entirely, so an oversized bundle would stop the runtime host from
+    // verifying even with its genuine compiled root present and first. The
+    // cap turns that into an actionable startup error.
+    #[test]
+    fn a_bundle_at_the_limit_is_accepted_and_one_over_is_rejected() {
+        let mut at_limit = String::new();
+        for _ in 0..MAX_EXTRA_CA_CERTIFICATES {
+            at_limit.push_str(&test_root_pem());
+        }
+        let ca = ExtraCa::from_pem(at_limit.as_bytes()).unwrap();
+        assert_eq!(ca.count, MAX_EXTRA_CA_CERTIFICATES);
+
+        let mut over = at_limit;
+        over.push_str(&test_root_pem());
+        let err = ExtraCa::from_pem(over.as_bytes()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            NetError::ExtraCa(ExtraCaError::TooManyCertificates {
+                count: MAX_EXTRA_CA_CERTIFICATES + 1
+            })
+            .to_string()
+        );
+    }
+
+    /// The limit must stay well under the verifier's signature budget of 100
+    /// per verification, or the cap would stop preventing the
+    /// `MaximumSignatureChecksExceeded` failure it exists to prevent. A
+    /// `const` assertion rather than a runtime one: this is a fact about the
+    /// constant, so it belongs at compile time.
+    const _: () = assert!(MAX_EXTRA_CA_CERTIFICATES <= 32);
+
+    #[test]
+    fn the_too_many_error_names_no_certificate_content() {
+        let rendered =
+            NetError::ExtraCa(ExtraCaError::TooManyCertificates { count: 99 }).to_string();
+        assert!(rendered.contains("99"));
+        assert!(rendered.contains("signature budget"));
+        assert!(!rendered.contains("BEGIN CERTIFICATE"));
     }
 
     #[test]

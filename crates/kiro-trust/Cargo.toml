@@ -41,6 +41,14 @@ directories = "6.0.0"
 subtle = "2.6"
 time = { version = "0.3.55", features = ["formatting"] }
 
+# Unix only, and only for one call: reinstating SIG_IGN on SIGPIPE after a
+# failed `exec` in `exec_cmd::run`, which leaves the default disposition
+# behind and would otherwise make that failure path exit 141 instead of 1
+# (spec 4.5). Already compiled into this binary transitively through
+# `directories`, so declaring it adds an explicit edge, not new code.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
 [dev-dependencies]
 tempfile.workspace = true
 # Test-only: builds the synthetic audit-gate database inside

@@ -316,7 +316,24 @@ the environment of any process but the child.
 On Unix it replaces itself with the child through `exec`, so no wrapper process
 survives; elsewhere it spawns the child and forwards its exit code. Exits 1 when
 the token file does not exist, cannot be read, or does not hold a well-formed
-token, and 2 when no command is given.
+token, and 2 when no command is given or when `--listen` is not a loopback
+address. `--listen` is validated, not merely interpolated: it decides where the
+child sends the token and every prompt, so a non-loopback value would hand both
+to a remote host. It is rejected before the token file is read.
+
+`exec` never constructs a shell invocation, never passes a command string to be
+word-split, and never lets an argument be reinterpreted, so nothing the caller
+writes can be expanded or injected. It does not override `execvp(3)`'s POSIX
+behavior of running an executable file with no shebang through `/bin/sh`; that
+child gets the token as intended, since the caller named the program.
+
+`CommandExt::exec` resets `SIGPIPE` to `SIG_DFL` before `execvp` and does not
+restore it when `execvp` fails, so this command reinstates `SIG_IGN` on that
+failure path. Without it, writing the error message to a stderr with no reader
+killed the process with `SIGPIPE` (exit 141), outside the codes section 4.5
+allows. This is the one direct `libc` use in the binary, declared
+`[target.'cfg(unix)'.dependencies]`; `libc` is already compiled in through
+`directories`.
 
 This is the sixth and last permitted `expose_secret()` site (section 6.1). The
 justification matches `env`'s: passing the token to the child is the command's
@@ -753,6 +770,23 @@ Automatic updates      disabled
 
 Build features         none
 ```
+
+One PEM file may hold at most `MAX_EXTRA_CA_CERTIFICATES` (16) certificates.
+The bound is not tidiness: rustls-webpki spends a global budget of 100
+signature checks per verification, and exhausting it is a fatal
+`MaximumSignatureChecksExceeded` that halts path building rather than skipping
+one anchor, so a large enough bundle stops the runtime host from verifying even
+though its genuine compiled root is still present and still first in the store.
+Measured against rustls-webpki 0.103.14: 51 anchors verify, 100 fail. An
+oversized file is therefore a configuration error at startup, naming the count
+and the limit, rather than an opaque TLS failure on every later call.
+
+Validation establishes that each block is a structurally valid X.509
+certificate, which is what `RootCertStore::add` checks. It does not check
+expiry, key usage, or `basicConstraints`, so an expired certificate or a
+`CA:FALSE` leaf is accepted. That is deliberate: the operator names the file,
+it only ever adds anchors, and rustls ignores anchor expiry during verification
+anyway, so a stricter check would reject files that would in fact work.
 
 `Extra CA` shows the PEM path when `--extra-ca` is set, and the word `none`
 otherwise, so an added anchor is never invisible. The path goes through

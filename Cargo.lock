@@ -1071,6 +1071,7 @@ dependencies = [
  "kiro-trust-kiro",
  "kiro-trust-net",
  "kiro-trust-protocol",
+ "libc",
  "rusqlite",
  "secrecy",
  "serde",

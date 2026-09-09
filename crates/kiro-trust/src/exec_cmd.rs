@@ -21,6 +21,18 @@
 //! success), so the fallback branch below is the failure path, not a
 //! secondary implementation. Elsewhere, `run` spawns the child and waits,
 //! forwarding its exit code.
+//!
+//! One precise limit on "no shell": this command never *constructs* a shell
+//! invocation, never passes a command string to be word-split, and never
+//! lets an argument be reinterpreted, so nothing the caller writes can be
+//! expanded or injected. It does not, and cannot, prevent `execvp(3)` from
+//! doing what POSIX specifies when the named program is an executable file
+//! with no shebang: run it with `/bin/sh` (v020-exec-review.md, Medium 2).
+//! That child then has the token in its environment, which is the intended
+//! outcome, since the caller named that program and a shell script is a
+//! legitimate thing to hand it. What matters for the token is that argv
+//! boundaries survive intact and no shell metacharacter is ever interpreted
+//! on kiro-trust's behalf.
 
 use crate::config::{ExecArgs, parse_listen, resolve_token_file};
 use crate::token::{read_token_file, token_shape_is_valid};
@@ -94,6 +106,23 @@ pub fn run(args: ExecArgs) -> i32 {
         // executable), which is why everything after this call is the
         // failure path.
         let err = command.exec();
+        // `CommandExt::exec` resets SIGPIPE to SIG_DFL before calling
+        // execvp, for the child's benefit, and does not restore Rust's
+        // SIG_IGN when execvp fails, so this process is left with the
+        // default disposition. Writing the message below to a stderr with no
+        // reader would then kill this process with SIGPIPE, exiting 141:
+        // outside the 0/1/2 spec 4.5 allows, and inconsistent with every
+        // other failure path in this command (v020-exec-review.md, Medium 1).
+        // Catching the write error is not enough, because the signal arrives
+        // at the write syscall itself, so the disposition has to be put back.
+        //
+        // SAFETY: reinstating SIG_IGN on SIGPIPE, which is what the Rust
+        // runtime itself installs at startup. Sound precisely because execvp
+        // failed: no child exists to inherit this disposition, and this is
+        // the same process that had it a moment ago.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        }
         eprintln!("kiro-trust exec: cannot run {}: {err}", program.display());
         1
     }
@@ -148,14 +177,37 @@ mod tests {
     #[test]
     fn non_loopback_listen_is_a_usage_error_before_the_token_is_read() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("token");
-        std::fs::write(&path, "A".repeat(43)).unwrap();
+        // Deliberately absent, not merely invalid: a token file that does not
+        // exist makes the token path return 1, so exit 2 here can only come
+        // from the listen check running first. With a valid token file this
+        // test would still pass even if the ordering were reversed, which is
+        // what made the original version no evidence at all
+        // (v020-exec-review.md, Low finding on ordering).
+        let missing = dir.path().join("no-such-token");
         let args = ExecArgs {
             listen: "10.0.0.1:3456".into(),
-            token_file: Some(path),
+            token_file: Some(missing),
             cmd: vec![OsString::from("true")],
         };
-        assert_eq!(run(args), 2);
+        assert_eq!(
+            run(args),
+            2,
+            "the loopback check must run before the token file is read"
+        );
+    }
+
+    // The other half of that ordering claim: with a loopback address, the
+    // same missing token file reaches the token path and returns 1.
+    #[test]
+    fn a_loopback_listen_lets_the_token_path_report_its_own_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-token");
+        let args = ExecArgs {
+            listen: "127.0.0.1:3456".into(),
+            token_file: Some(missing),
+            cmd: vec![OsString::from("true")],
+        };
+        assert_eq!(run(args), 1);
     }
 
     #[test]

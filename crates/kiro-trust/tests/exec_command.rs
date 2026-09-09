@@ -255,6 +255,49 @@ fn forwards_the_childs_exit_code() {
     );
 }
 
+// v020-exec-review.md Medium 1: `CommandExt::exec` resets SIGPIPE to SIG_DFL
+// before execvp and does not restore it when execvp fails, so this path used
+// to die from SIGPIPE (exit 141) when stderr had no reader, outside the
+// 0/1/2 spec 4.5 allows and unlike every other failure path here. The fix
+// reinstates SIG_IGN; this test pins that the exec-failure path no longer
+// diverges from the malformed-token path in signal disposition.
+#[cfg(unix)]
+#[test]
+fn exec_failure_is_not_killed_by_sigpipe_when_stderr_has_no_reader() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (token_file, _token) = write_valid_token(dir.path());
+
+    // A pipe whose read end is closed: any write to it raises SIGPIPE.
+    let mut fds = [0i32; 2];
+    // SAFETY: `pipe(2)` with a two-element array, the documented contract.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: both are fresh, owned descriptors from the call above.
+    let (read_end, write_end) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    drop(read_end);
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_kiro-trust"))
+        .args([
+            "exec",
+            "--token-file",
+            token_file.to_str().unwrap(),
+            "--",
+            "/nonexistent-program-for-this-test",
+        ])
+        .stderr(std::process::Stdio::from(write_end))
+        .status()
+        .unwrap();
+
+    assert_eq!(
+        status.signal(),
+        None,
+        "the exec-failure path must not be killed by a signal when stderr has no reader"
+    );
+}
+
 #[test]
 fn launch_failure_is_exit_1_without_leaking_command_env_or_token() {
     let dir = tempfile::tempdir().unwrap();
