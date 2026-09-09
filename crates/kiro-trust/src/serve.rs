@@ -1,6 +1,7 @@
 //! `kiro-trust serve` (spec 4.1).
 
 use crate::config::ServeConfig;
+use crate::listener::{ConnectionInfo, GuardedListener, HEADER_READ_TIMEOUT, MAX_CONNECTIONS};
 use crate::server::{AppState, MAX_CONCURRENT, build_router};
 use crate::token;
 use kiro_trust_auth::{KiroDb, TokenSource};
@@ -128,10 +129,13 @@ pub async fn run(cfg: ServeConfig) -> Result<(), String> {
             std::process::exit(0);
         });
     };
-    let result = axum::serve(listener, build_router(state))
-        .with_graceful_shutdown(shutdown)
-        .await
-        .map_err(|e| e.to_string());
+    let result = axum::serve(
+        GuardedListener::new(listener, MAX_CONNECTIONS, HEADER_READ_TIMEOUT),
+        build_router(state).into_make_service_with_connect_info::<ConnectionInfo>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .map_err(|e| e.to_string());
     // The shutdown future above already removes the file on a graceful
     // signal; this second removal is the harmless idempotent path for
     // whichever way `serve` actually returns (spec 6.3).

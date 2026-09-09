@@ -4,6 +4,7 @@ pub mod audit;
 pub mod config;
 pub mod env_cmd;
 pub mod exec_cmd;
+pub mod listener;
 pub mod logging;
 pub mod serve;
 pub mod server;
