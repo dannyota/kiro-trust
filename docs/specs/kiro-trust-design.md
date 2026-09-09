@@ -53,9 +53,25 @@ Out of scope for v0.1, each a deliberate decision rather than an omission:
 - plugin system, arbitrary upstream URLs, generic OpenAI gateway
 - config file, log file rotation, CORS
 - Homebrew tap, background service installation
-- enterprise CA or HTTP proxy support
+- HTTP proxy support
 
 Section 13 lists the backlog with the reason each item was deferred.
+
+Four of those out-of-scope items are closed decisions rather than schedule
+slips, and 0.2.0 removed them from the backlog so that table stops implying
+they are coming: proxy-side Tool Search, `models sync`, social login, and Kiro
+API keys. `CLAUDE.md` forbids porting each. Social login and API keys would add
+a second credential type, widening the trust boundary this project exists to
+keep narrow; `models sync` and Tool Search would add an outbound host and
+server-tool emulation, and section 6.5 bans model discovery outright, flag or
+no flag.
+
+0.2.0 moves three former backlog items into scope: `kiro-trust exec`
+(section 4.5), an additive enterprise CA flag (section 4.1), and a header read
+timeout with an idle connection cap (section 6.3). It also completes image
+support: format validation and per-image and per-request limits (section 5.3),
+and images in history entries (section 5.3, pending the live test in
+section 8.6).
 
 ## 2. Decisions
 
@@ -242,6 +258,7 @@ check. Depends on `kiro-trust-protocol`, `serde_json`, and `rusqlite` only.
 | (none) | `KIRO_TRUST_TOKEN` | generated | explicit local token; when set, no file is written |
 | `--log-level <l>` | `KIRO_TRUST_LOG` | `info` | `error`, `warn`, `info`, `debug` |
 | `--share-content` | `KIRO_TRUST_SHARE_CONTENT` | off | sends `x-amzn-codewhisperer-optout: false` (section 7.4); shown in audit |
+| `--extra-ca <pem>` | `KIRO_TRUST_EXTRA_CA` | — | additional PEM trust anchor, added to the compiled roots, never replacing them (section 6.2); shown in audit |
 | `--capture-dir <path>` | — | — | only with the `capture` feature (section 8.3) |
 
 Precedence: flag, then env, then default. Startup order: parse and validate
@@ -285,7 +302,26 @@ Both forms single-quote both values. Usage: `eval "$(kiro-trust env)"`.
 Exits 1 when the token file does not exist, cannot be read, or does not
 contain a well-formed token.
 
-### 4.4 Exit codes
+### 4.4 `kiro-trust exec -- <cmd> [args...]`
+
+Runs a command with `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` set and
+nothing else in the environment changed. It reads and validates the token file
+exactly as `env` does (section 4.3), rejecting a malformed token without
+echoing it, then hands the token to the child. Compared with
+`eval "$(kiro-trust env)"`, the token never enters a shell, a shell history, or
+the environment of any process but the child.
+
+On Unix it replaces itself with the child through `exec`, so no wrapper process
+survives; elsewhere it spawns the child and forwards its exit code. Exits 1 when
+the token file does not exist, cannot be read, or does not hold a well-formed
+token, and 2 when no command is given.
+
+This is the sixth and last permitted `expose_secret()` site (section 6.1). The
+justification matches `env`'s: passing the token to the child is the command's
+entire purpose, and there is no implementation without one. The token reaches
+the child's environment only, never a log, stderr, or an error path.
+
+### 4.5 Exit codes
 
 `0` success, `1` runtime failure, `2` usage or configuration error.
 
@@ -373,10 +409,42 @@ conversation id (derived per step 8), and the effort level. Output: `Payload`.
 5. Current message: text content, `modelId`, `origin: KIRO_CLI`, tool
    results reordered to the preceding assistant turn's `tool_use` order with
    `status` success or error and content blocks, and images
-   (transcribe from `tool_results.go`, `images.go`).
+   (transcribe from `tool_results.go`, `images.go`). Images nested inside a
+   tool result are promoted to the message and noted in that result's `stdout`,
+   because a Kiro tool result cannot carry an image: `ToolResultContent` is
+   text or JSON only, on both the Kiro CLI and kirocc. `userInputMessage.images`
+   is the only image channel for a turn.
+
+   `format` comes from the `media_type` suffix and must be one of `gif`,
+   `jpeg`, `png`, `webp`: the closed `ImageFormat` enum in the Kiro CLI's
+   generated SDK (`amzn-codewhisperer-streaming-client`, `_image_format.rs`).
+   There is no `jpg` variant. Anything else is 400 `invalid_request_error`
+   naming the received media type and the four accepted ones. `image/jpg` is
+   rejected rather than corrected to `jpeg`: guessing a caller's intent is how
+   an invalid enum value reaches the runtime, which returns an opaque error
+   instead. Anthropic's four documented media types map onto the enum exactly,
+   so a well-formed request never sees this. Base64 that does not decode is
+   also 400. Per-image and per-request size limits are in section 5.5.
+
+   An image whose `source.type` is not `base64` (a URL) is skipped, not
+   rejected, matching both the Kiro CLI and kirocc. Nothing about a skipped or
+   rejected image is logged: section 6.4's allowlist has no field for one.
 6. Thinking and `redacted_thinking` blocks in history are dropped; only text
    and `tool_use` blocks reach `assistantResponseMessage`. (kirocc replays
-   redacted blobs for GPT models only, out of scope.)
+   redacted blobs for GPT models only, out of scope.) Images in a history user
+   entry are sent, with the same validation, limits, and tool-result promotion
+   as the current message. `history` is a list of the same `UserInputMessage`
+   type the current message uses, so the field exists there
+   (`_chat_message.rs`, `_user_input_message.rs`), and the Kiro CLI's shipped
+   `chat` path populates it (`into_history_entry` sets `images`, and the SDK
+   conversion calls `.set_images()` on the history builder). Its newer `agent`
+   path hardcodes `images: None` there, as kirocc does, and neither explains
+   why, so the SDK proves the field exists but not that the runtime honors it.
+   `history_image_is_accepted` (section 8.6) is that evidence and gates this
+   rule: without a passing live test, history images are dropped and this
+   paragraph says so instead. Without them, an image pasted in one turn is
+   invisible from the next turn on, because Claude Code resends the whole
+   conversation each time.
 7. `profileArn` is set from the credential.
 8. `conversationId`: UUID v5 of the `X-Claude-Code-Session-Id` header under a
    per-process random namespace, or a random UUID v4 when the header is
@@ -457,6 +525,8 @@ Non-streaming: the same events folded into one `Message` JSON body.
 | JSON nesting | serde_json default recursion limit (128) |
 | Tools per request | 512 |
 | Messages per request | 4096 |
+| Images per request | 10, counting images promoted out of tool results; excess is 400 `invalid_request_error` naming the limit. Transcribed from the Kiro CLI's `MAX_NUMBER_OF_IMAGES_PER_REQUEST`. That CLI drops the extras and warns on its terminal; kiro-trust has no such channel and section 6.4 forbids logging anything about an image, so a silent drop would leave the model answering about an image it never received. A 400 tells the caller. |
+| Image size | 10 MB of decoded bytes per image, over which is 400 `invalid_request_error` naming the limit. Transcribed from the Kiro CLI's `MAX_IMAGE_SIZE` and `MAX_IMAGE_SIZE_BYTES`. Measured on decoded length, not the base64 text, because upstream measures file size; validating that requires the base64 to decode at all, which is its own 400 (section 5.3). |
 | Upstream frame | 4 MiB |
 | Upstream error body | 64 KiB |
 | Tool input accumulation | 16 MiB per tool call |
@@ -489,8 +559,15 @@ string becomes `arn:***`, and any bare 12-digit run becomes `***`.
 ### 5.7 `count_tokens`
 
 `input_tokens = ceil(utf8_bytes(system + message text + tool_use inputs +
-tool_result text + tool definitions JSON) / 4) + 3 × messages`. Deterministic,
-offline, documented as approximate.
+tool_result text + tool definitions JSON) / 4) + 3 × messages +
+sum(ceil(decoded_image_bytes / 750))`. Deterministic, offline, documented as
+approximate.
+
+The image term is as rough as the rest of the estimate and is there to stop the
+endpoint being actively misleading: before 0.2.0 an image contributed nothing,
+so a 5 MB paste estimated as zero tokens. `count_tokens` applies no image
+validation and no limits from section 5.5, matching how it already tolerates a
+request the `/v1/messages` handler would reject.
 
 ## 6. Security contracts
 
@@ -509,6 +586,15 @@ or `security_logging.rs` (section 8.4).
   copy of the file is made, no table is created.
 - Secrets are `secrecy::SecretString` (zeroized on drop). They are never
   formatted, serialized, or included in an error message.
+- `expose_secret()` has exactly six call sites in production code:
+  `TokenSource::with_token`, the OIDC refresh request builder,
+  `server::require_token`, `token::write_temp_file`, `env_cmd::run`, and
+  `exec_cmd::run`. The last two exist because printing the token (section 4.3)
+  and handing it to a child process (section 4.4) are those commands' entire
+  purpose; in both, the token reaches only stdout or the child's environment,
+  never a log, stderr, or an error path. A `#[cfg(test)]` function may expose a
+  value it constructed itself in order to assert on it, which does not add a
+  seventh site.
 
 ### 6.2 Outbound network
 
@@ -520,7 +606,13 @@ or `security_logging.rs` (section 8.4).
 - HTTPS only. Redirects are errors: a 3xx from either host fails the request
   without following. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`
   are ignored. TLS roots are `webpki-roots` compiled in; `SSL_CERT_FILE` and
-  the system store are ignored.
+  the system store are ignored. `--extra-ca <pem>` (section 4.1) adds the
+  anchors in one PEM file to that compiled set. It is additive only: it cannot
+  remove or replace a compiled root, so the flag can let a corporate
+  interception proxy through but cannot narrow what is already trusted. A PEM
+  that does not parse, or holds no certificate, is a configuration error at
+  startup, never a silent fallback to the default roots. `audit` prints the
+  path so the deviation is visible.
 - Timeouts per 3.2. The Kiro bearer token appears in exactly one place: the
   `Authorization` header of a runtime request.
 
@@ -536,6 +628,33 @@ or `security_logging.rs` (section 8.4).
   or `x-api-key`, compared in constant time. A failure returns 401 with no
   `WWW-Authenticate` challenge.
 - No CORS headers. `OPTIONS` returns 405.
+- The listener is a `GuardedListener` implementing axum's `Listener` trait,
+  wrapping `TcpListener`. It caps concurrent connections at `MAX_CONNECTIONS`
+  and fails a connection that has not produced a response write within
+  `HEADER_READ_TIMEOUT` (15 s). Both bounds cover what the `MAX_CONCURRENT`
+  semaphore cannot: that semaphore bounds `/v1/messages` handlers, while these
+  bound connections that never reach a handler.
+
+  `accept` takes a semaphore permit before accepting, so at the cap the process
+  stops accepting rather than accepting and dropping. The trait's `accept`
+  cannot return an error, so backpressure has to work by not accepting; that is
+  why the permit is acquired ahead of the accept call. `Listener::Io` is a
+  wrapper holding the stream, the permit, and the deadline; the permit releases
+  when the wrapper drops.
+
+  The deadline runs from accept until the first attempted response write. The
+  server writes only after parsing a complete request, so first write is a
+  sound proxy for "request received", and a client trickling header bytes trips
+  the deadline. Once a write happens the deadline is disarmed, so a streaming
+  response runs unbounded, as it must.
+
+  `ListenerExt::tap_io` cannot express this: it lends `&mut Io` and cannot
+  substitute a wrapper type, so the `Listener` impl is hand-written. This
+  replaces the manual `hyper_util` accept loop the backlog once proposed.
+  `axum::serve` and its graceful shutdown stay in place deliberately: the drain
+  ordering, the token-file deletion before the drain, and the deadline task that
+  exits 0 (section 4.1) are load-bearing, and rebuilding them to gain a
+  header deadline would trade a small exposure for a large one.
 
 ### 6.4 Logging
 
@@ -593,11 +712,13 @@ Allowed outbound
   runtime.us-east-1.kiro.dev
 
 TLS roots              webpki-roots (compiled in)
+Extra CA               none
 HTTP proxy             disabled (environment ignored)
 Redirects              rejected
 
 Local listener         127.0.0.1:3456
 Local authentication   required (token file 0600)
+Connection limits      32 connections, 15s header read timeout
 
 Telemetry              none
 Kiro content sharing   opted out (x-amzn-codewhisperer-optout: true)
@@ -607,6 +728,10 @@ Automatic updates      disabled
 
 Build features         none
 ```
+
+`Extra CA` shows the PEM path when `--extra-ca` is set, and the word `none`
+otherwise, so an added anchor is never invisible. Because the flag is additive
+(section 6.2), the `TLS roots` line above it stays true either way.
 
 On Windows, `Local authentication` reads
 `required (token file, user profile ACL)`, matching 6.3: Windows sets no
@@ -1012,6 +1137,17 @@ thinking request produces a `thinking` block; a non-streaming call returns a
 byte counts, and durations only, never a prompt, a response body, a
 conversation id, a token, an ARN, or an account id.
 
+`history_image_is_accepted` decides whether images ship in history entries
+(section 5.3). It sends three messages, a user turn carrying a small synthetic
+PNG, an assistant turn, then a user follow-up, so the image lands in a history
+entry rather than the current message, and asserts a 200 with a well-formed
+stream. The test exists because the Kiro CLI's two code paths disagree about
+whether history carries images and neither says why, so the generated SDK
+proves the field exists but not that the runtime honors it. The image is
+synthetic and a few bytes; it is not a capture and not a credential, so this
+test needs no opt-in beyond `KIRO_TRUST_LIVE=1`. Should it fail, history images
+stay dropped and the test stays as the record of why.
+
 `forced_refresh_succeeds` sets a validity buffer
 (`TokenSource::with_validity_buffer`) longer than any real token lifetime, so
 `TokenSource` treats every call as expired and refreshes through AWS OIDC
@@ -1222,13 +1358,7 @@ Deferred with reasons; each becomes a spec change before code.
 | --- | --- |
 | retry of thinking-only responses (kirocc gate writer) | needs buffered SSE; measure how often Kiro returns no visible text first |
 | truncation notice injection | modifies the next prompt; decide after live use |
-| proxy-side Tool Search (`tool_search_tool_regex`, `bm25`) | server-tool emulation; all tools active is correct, only larger |
 | binary differential run against kirocc | kirocc cannot target a fake upstream without patching |
-| `kiro-trust exec -- claude` | keeps the token out of the shell; small, after `env` proves the flow |
-| enterprise CA flag | explicit `--extra-ca <pem>` shown in audit |
-| `models sync` command | user-initiated catalog fetch from `management.<region>.kiro.dev` |
-| social login, Kiro API key | separate refresh host and header; out of the v0.1 trust boundary |
 | GPT models | different reasoning schema |
 | cosign step in addition to attestations | attestations already Sigstore-backed |
 | Homebrew tap | must not strip quarantine; needs notarization |
-| header read timeout | `axum::serve` exposes no header-read deadline; a manual `hyper_util` accept loop would add it. Loopback plus the mandatory token keeps the exposure to local processes. `axum::serve` also spawns a task per connection with no cap; the `MAX_CONCURRENT` semaphore (`crates/kiro-trust/src/server/messages.rs`) bounds concurrent `/v1/messages` requests but not idle connections that never reach the handler. |

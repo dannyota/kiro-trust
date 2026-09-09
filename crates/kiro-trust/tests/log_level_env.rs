@@ -1,4 +1,4 @@
-//! `KIRO_TRUST_LOG` is validated the same way as `--log-level` (spec 4.4,
+//! `KIRO_TRUST_LOG` is validated the same way as `--log-level` (spec 4.5,
 //! 6.4): an unrecognized value is a usage error, exit code 2, never a silent
 //! fallback. This runs the real binary as a subprocess and asserts on its
 //! actual exit status, rather than a `clap::Error::exit_code()` observed

@@ -45,6 +45,25 @@ license and attribution:
   catalog.rs's resolves_aliases_dates_and_suffixes and
   effort_resolution_follows_model_enum)
 
+This project also uses aws/amazon-q-developer-cli
+(https://github.com/aws/amazon-q-developer-cli), Apache License 2.0,
+Copyright Amazon.com, Inc. or its affiliates, as a behavioral reference. It
+vendors the Smithy-generated SDK for the same runtime this project calls, so
+for wire shape it is the primary reference. The following pieces are
+transcribed from it and carry that license and attribution:
+
+- the `ImageFormat` enum and the `images` wire shape
+  (in crates/amzn-codewhisperer-streaming-client/src: types/_image_format.rs,
+  types/_image_block.rs, types/_image_source.rs,
+  protocol_serde/shape_image_block.rs, protocol_serde/shape_image_source.rs,
+  protocol_serde/shape_user_input_message.rs)
+- the presence of `images` on history entries
+  (crates/amzn-codewhisperer-streaming-client/src/types/_chat_message.rs,
+  _user_input_message.rs, crates/chat-cli/src/cli/chat/message.rs,
+  crates/chat-cli/src/api_client/model.rs)
+- per-image and per-request image limits
+  (crates/chat-cli/src/cli/chat/consts.rs, crates/agent/src/agent/consts.rs)
+
 Everything else is an independent implementation.
 
 This exact file is duplicated, byte for byte, at

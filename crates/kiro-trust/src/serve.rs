@@ -123,7 +123,7 @@ pub async fn run(cfg: ServeConfig) -> Result<(), String> {
             tracing::warn!("drain deadline reached, exiting");
             // The deadline is a policy bound, not a failure: a streaming
             // response can outlive the drain window, so exit 0 per spec 4.1
-            // and 4.4. The warn line above distinguishes this path. Known
+            // and 4.5. The warn line above distinguishes this path. Known
             // and accepted: an axum::serve error inside the window is masked.
             std::process::exit(0);
         });

@@ -11,7 +11,7 @@ pub mod token;
 use clap::Parser;
 use config::{Cli, Command};
 
-/// Parse the CLI, dispatch, and return the process exit code (spec 4.4):
+/// Parse the CLI, dispatch, and return the process exit code (spec 4.5):
 /// `0` success, `1` runtime failure, `2` usage or configuration error.
 pub fn run() -> i32 {
     let cli = Cli::parse();

@@ -64,12 +64,14 @@ kiro-trust (bin)  →  kiro-trust-kiro  →  kiro-trust-net, kiro-trust-protocol
   capture exists only behind the `capture` feature.
 - Secrets are `secrecy::SecretString`. Call `expose_secret()` only inside
   `TokenSource::with_token`, the OIDC refresh request builder,
-  `server::require_token`, `token::write_temp_file`, and `env_cmd::run` (the
-  fifth site: `env`'s whole purpose is printing the token, spec 4.3, so there
-  is no way to implement it without one; the token goes to stdout only, never
-  to a log, stderr, or any error path). Test code is exempt: a `#[cfg(test)]`
-  function may call `expose_secret()` on a value it constructed itself, to
-  assert on it, without becoming a sixth production site. Never derive
+  `server::require_token`, `token::write_temp_file`, `env_cmd::run`, and
+  `exec_cmd::run` (the fifth and sixth sites: `env`'s whole purpose is printing
+  the token, spec 4.3, and `exec`'s is handing it to a child process, spec 4.4,
+  so neither can be implemented without one; the token goes to stdout or the
+  child's environment only, never to a log, stderr, or any error path). Test
+  code is exempt: a `#[cfg(test)]` function may call `expose_secret()` on a
+  value it constructed itself, to assert on it, without becoming a seventh
+  production site. Never derive
   `Serialize`, or a `Debug` that prints content, for a type holding one.
 - The Kiro database is opened only through `open_read_only`. Never add another
   constructor, never write, never copy the file, never read a table other than
@@ -99,6 +101,17 @@ may read it without asking.
   hand-edit a captured fixture to make a test pass; re-capture and re-scrub.
 - No `.env` exists in this project. The proxy reads only `KIRO_TRUST_*`
   variables.
+
+## Kiro CLI reference
+
+`aws/amazon-q-developer-cli` is the Kiro CLI's upstream and vendors the
+Smithy-generated SDK for the runtime this project calls, so for wire shape it
+outranks kirocc, which was reverse engineered. Clone it into the session
+scratchpad or `~/src/kiro-cli-research` when needed; never vendor it. Same rule
+as kirocc: transcribe a named rule, record it in the spec, list the file in
+`NOTICE`. Its `agent` crate and its `chat-cli` crate sometimes disagree; `chat`
+is the shipped default path. Where they disagree and neither explains why,
+settle it with a live test rather than by picking one.
 
 ## kirocc reference
 
