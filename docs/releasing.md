@@ -208,6 +208,16 @@ Verify every crate's ownership and Trusted Publishing entry before dispatch;
 the workflow's registry checks confirm ownership but not that Trusted
 Publishing is configured.
 
+**That exception was used once and is closed.** Version 0.1.0 of all five
+crates was published locally on 2026-09-09 under the owner's explicit
+approval, because none of the five existed on crates.io and Trusted
+Publishing had nothing to attach to. Trusted Publishing is now configured on
+all five (owner `dannyota`, repository `kiro-trust`, workflow
+`publish-crates.yml`, environment `crates-io`), and the `crates-io`
+environment carries a required reviewer and a branch policy naming `master`.
+Every version after 0.1.0 publishes through `publish-crates.yml` and needs
+separate approval for that version. Do not publish locally again.
+
 Cross-platform artifacts are built by
 [`cargo-dist`](https://opensource.axo.dev/cargo-dist/); the matrix runs in CI.
 Prefer the release workflow for builds. If a local host build is needed, use
