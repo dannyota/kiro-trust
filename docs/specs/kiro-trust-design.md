@@ -390,7 +390,6 @@ Non-streaming: the same events folded into one `Message` JSON body.
 | Limit | Value |
 | --- | --- |
 | Request body | 32 MiB |
-| Header read timeout | 10 s |
 | Concurrent requests | 32; excess gets 429 `rate_limit_error` |
 | JSON nesting | serde_json default recursion limit (128) |
 | Tools per request | 512 |
@@ -934,3 +933,4 @@ Deferred with reasons; each becomes a spec change before code.
 | GPT models | different reasoning schema |
 | cosign step in addition to attestations | attestations already Sigstore-backed |
 | Homebrew tap | must not strip quarantine; needs notarization |
+| header read timeout | `axum::serve` exposes no header-read deadline; a manual `hyper_util` accept loop would add it. Loopback plus the mandatory token keeps the exposure to local processes. |
