@@ -18,27 +18,18 @@
 //! execution in the caller's shell, and the file path is
 //! attacker-influenceable through `--token-file`/`KIRO_TRUST_TOKEN_FILE`):
 //!
-//! 1. `token_shape_is_valid` rejects anything that is not exactly the shape
-//!    `token::generate` produces before it is ever printed. Checked here,
-//!    not in `read_token_file`: the server reads the same file at startup
-//!    and a shape change there is a separate decision.
+//! 1. `token::token_shape_is_valid` rejects anything that is not exactly the
+//!    shape `token::generate` produces before it is ever printed. Checked
+//!    here, not in `read_token_file`: the server reads the same file at
+//!    startup and a shape change there is a separate decision. `exec_cmd`
+//!    shares this same function rather than a copy (spec 4.4).
 //! 2. `quote_posix`/`quote_fish` single-quote both exports anyway. With (1)
 //!    in place neither escape can trigger; they are the safety net, not the
 //!    mechanism, kept in case the token shape ever changes.
 
 use crate::config::{EnvArgs, resolve_token_file};
-use crate::token::read_token_file;
+use crate::token::{read_token_file, token_shape_is_valid};
 use secrecy::ExposeSecret;
-
-/// `token::generate` produces exactly 43 characters of base64url without
-/// padding (spec 6.3). That is the only shape `env` ever prints; anything
-/// else is rejected without being echoed, not even a prefix, because a
-/// malformed token file may be attacker-controlled.
-fn token_shape_is_valid(t: &str) -> bool {
-    t.len() == 43
-        && t.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
 
 /// Quotes `s` for POSIX `sh`. Inside single quotes, `sh` treats every
 /// character as completely literal, with no escape sequence at all, so an
@@ -143,24 +134,8 @@ mod tests {
         assert_eq!(run(args), 1);
     }
 
-    #[test]
-    fn token_shape_accepts_only_43_base64url_characters() {
-        assert!(token_shape_is_valid(&"A".repeat(43)));
-        assert!(token_shape_is_valid(
-            crate::token::generate().expose_secret()
-        ));
-        assert!(!token_shape_is_valid(&"A".repeat(42)));
-        assert!(!token_shape_is_valid(&"A".repeat(44)));
-        assert!(!token_shape_is_valid(""));
-        // task-20-fix-1.md Critical 1 test list: `;`, a backtick, `$(`, and
-        // a single quote, each spliced into an otherwise-43-character
-        // value so only the character class, not the length, is on trial.
-        for bad in [";", "`", "$(", "'"] {
-            let mut s = "A".repeat(43);
-            s.replace_range(20..20 + bad.len(), bad);
-            assert!(!token_shape_is_valid(&s), "{s:?}");
-        }
-    }
+    // `token_shape_is_valid`'s own tests moved to `token.rs`, where the
+    // function now lives (shared with `exec_cmd`, spec 4.4).
 
     // Verified independently of the shape check (task-20-fix-1.md, "On the
     // shell-quoting fix"): the shape check means none of these characters

@@ -3,6 +3,7 @@
 use clap::{Args, Parser, Subcommand};
 use kiro_trust_net::{RegionError, RuntimeRegion};
 use secrecy::SecretString;
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -27,6 +28,8 @@ pub enum Command {
     Audit(AuditArgs),
     /// Print the exports Claude Code needs.
     Env(EnvArgs),
+    /// Run a command with the exports set in its environment (spec 4.4).
+    Exec(ExecArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -82,6 +85,22 @@ pub struct EnvArgs {
     pub token_file: Option<PathBuf>,
     #[arg(long, default_value = "sh", value_parser = ["sh", "fish"])]
     pub shell: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ExecArgs {
+    #[arg(long, env = "KIRO_TRUST_LISTEN", default_value = DEFAULT_LISTEN)]
+    pub listen: String,
+    #[arg(long, env = "KIRO_TRUST_TOKEN_FILE")]
+    pub token_file: Option<PathBuf>,
+    /// `<cmd> [args...]`, everything after `--`. `trailing_var_arg` plus
+    /// `allow_hyphen_values` (spec 4.4) means clap never interprets an
+    /// argument here as one of its own flags, and `required = true` makes
+    /// zero arguments a usage error (exit 2) rather than a silent no-op.
+    /// `OsString`, not `String`: the child's argv must carry whatever bytes
+    /// the caller passed, not just what is valid UTF-8.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+    pub cmd: Vec<OsString>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -293,5 +312,58 @@ mod tests {
             Cli::try_parse_from(["kiro-trust", "serve", "--debug-body"]).is_err(),
             "no body logging flag exists"
         );
+    }
+
+    // spec 4.4: `exec -- <cmd> [args...]` preserves argument boundaries and
+    // never treats a leading `-` in a child argument as one of clap's own
+    // flags, and no command at all is a usage error (exit 2).
+    #[test]
+    fn exec_preserves_argument_boundaries_and_requires_a_command() {
+        let cli = Cli::try_parse_from([
+            "kiro-trust",
+            "exec",
+            "--",
+            "echo",
+            "two words",
+            "-x",
+            "--flag",
+        ])
+        .unwrap();
+        let Command::Exec(args) = cli.command else {
+            panic!()
+        };
+        assert_eq!(
+            args.cmd,
+            vec![
+                OsString::from("echo"),
+                OsString::from("two words"),
+                OsString::from("-x"),
+                OsString::from("--flag"),
+            ]
+        );
+
+        let err = Cli::try_parse_from(["kiro-trust", "exec"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn exec_accepts_listen_and_token_file_before_the_double_dash() {
+        let cli = Cli::try_parse_from([
+            "kiro-trust",
+            "exec",
+            "--listen",
+            "127.0.0.1:9999",
+            "--token-file",
+            "/tmp/tok",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Command::Exec(args) = cli.command else {
+            panic!()
+        };
+        assert_eq!(args.listen, "127.0.0.1:9999");
+        assert_eq!(args.token_file, Some(PathBuf::from("/tmp/tok")));
+        assert_eq!(args.cmd, vec![OsString::from("true")]);
     }
 }

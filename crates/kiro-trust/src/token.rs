@@ -77,6 +77,19 @@ pub fn remove_token_file(path: &Path) -> io::Result<()> {
     }
 }
 
+/// `generate` produces exactly 43 characters of base64url without padding
+/// (spec 6.3). That is the only shape `env` (spec 4.3) and `exec`
+/// (spec 4.4) ever accept from a token file; anything else is rejected
+/// without being echoed, not even a prefix, because a malformed token file
+/// may be attacker-controlled. Shared by both commands rather than
+/// duplicated (spec 6.1 keeps `expose_secret()` to six sites; this
+/// function takes no secret and exposes none).
+pub(crate) fn token_shape_is_valid(t: &str) -> bool {
+    t.len() == 43
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +170,25 @@ mod tests {
         std::fs::write(&path, "   \n\t  \n").unwrap();
         let err = read_token_file(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // Moved from `env_cmd.rs` (spec 4.4): `token_shape_is_valid` is now
+    // shared between `env` and `exec`, so its tests live next to the
+    // function rather than with one caller.
+    #[test]
+    fn token_shape_accepts_only_43_base64url_characters() {
+        assert!(token_shape_is_valid(&"A".repeat(43)));
+        assert!(token_shape_is_valid(generate().expose_secret()));
+        assert!(!token_shape_is_valid(&"A".repeat(42)));
+        assert!(!token_shape_is_valid(&"A".repeat(44)));
+        assert!(!token_shape_is_valid(""));
+        // task-20-fix-1.md Critical 1 test list: `;`, a backtick, `$(`, and
+        // a single quote, each spliced into an otherwise-43-character
+        // value so only the character class, not the length, is on trial.
+        for bad in [";", "`", "$(", "'"] {
+            let mut s = "A".repeat(43);
+            s.replace_range(20..20 + bad.len(), bad);
+            assert!(!token_shape_is_valid(&s), "{s:?}");
+        }
     }
 }
