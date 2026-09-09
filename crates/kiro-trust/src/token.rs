@@ -17,32 +17,56 @@ pub fn write_token_file(path: &Path, token: &SecretString) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("token file has no parent directory"))?;
-    std::fs::create_dir_all(dir)?;
+    // Create the directory at 0700 only when it is missing. An existing
+    // directory keeps whatever mode it already has: the 0600 file is the
+    // protection, and `--token-file $HOME/tok` must not narrow `$HOME`.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)?;
     }
     let tmp = dir.join(format!(".token.{}.tmp", std::process::id()));
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
-        io::Write::write_all(&mut f, token.expose_secret().as_bytes())?;
-        f.sync_all()?;
+    if let Err(e) = write_temp_file(&tmp, token) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
+}
+
+fn write_temp_file(tmp: &Path, token: &SecretString) -> io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(tmp)?;
+    io::Write::write_all(&mut f, token.expose_secret().as_bytes())?;
+    f.sync_all()
 }
 
 pub fn read_token_file(path: &Path) -> io::Result<SecretString> {
     let raw = std::fs::read_to_string(path)?;
-    Ok(SecretString::from(raw.trim().to_string()))
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "token file is empty",
+        ));
+    }
+    Ok(SecretString::from(trimmed.to_string()))
 }
 
 pub fn remove_token_file(path: &Path) -> io::Result<()> {
@@ -104,5 +128,34 @@ mod tests {
         remove_token_file(&path).unwrap();
         assert!(!path.exists());
         assert!(remove_token_file(&path).is_ok(), "idempotent");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn existing_directory_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("token");
+        let t = generate();
+        write_token_file(&path, &t).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "an existing directory's mode must not be narrowed"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn read_token_file_rejects_whitespace_only_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "   \n\t  \n").unwrap();
+        let err = read_token_file(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

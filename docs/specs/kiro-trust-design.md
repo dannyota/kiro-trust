@@ -407,6 +407,7 @@ Every failure uses `{"type":"error","error":{"type":"<t>","message":"<m>"}}`.
 | missing or wrong local token | 401 | `authentication_error` |
 | body too large, bad JSON, unknown model, invalid field | 400 | `invalid_request_error` |
 | unknown route | 404 | `not_found_error` |
+| method not allowed | 405 | `invalid_request_error` |
 | Kiro credential unusable (no database, refresh failed) | 401 | `authentication_error` |
 | upstream 429 or `ThrottlingException` after retries | 429 | `rate_limit_error` |
 | upstream 5xx, malformed stream, idle timeout | 502 | `api_error` |
@@ -414,7 +415,10 @@ Every failure uses `{"type":"error","error":{"type":"<t>","message":"<m>"}}`.
 | local concurrency cap | 429 | `rate_limit_error` |
 
 The message carries the upstream exception type and message capped at 1 KiB.
-It never carries request content, the local token, or a Kiro token.
+It never carries request content, the local token, or a Kiro token. ARNs and
+12-digit account ids are scrubbed from the message before it reaches a
+client or a log: any `arn:` run up to the next whitespace, quote, or end of
+string becomes `arn:***`, and any bare 12-digit run becomes `***`.
 
 ### 5.7 `count_tokens`
 
@@ -933,4 +937,4 @@ Deferred with reasons; each becomes a spec change before code.
 | GPT models | different reasoning schema |
 | cosign step in addition to attestations | attestations already Sigstore-backed |
 | Homebrew tap | must not strip quarantine; needs notarization |
-| header read timeout | `axum::serve` exposes no header-read deadline; a manual `hyper_util` accept loop would add it. Loopback plus the mandatory token keeps the exposure to local processes. |
+| header read timeout | `axum::serve` exposes no header-read deadline; a manual `hyper_util` accept loop would add it. Loopback plus the mandatory token keeps the exposure to local processes. `axum::serve` also spawns a task per connection with no cap, and the `MAX_CONCURRENT` semaphore is not acquired until Task 18, so until then a local process can hold unbounded idle connections open. |

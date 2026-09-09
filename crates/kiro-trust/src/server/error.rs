@@ -39,9 +39,10 @@ impl ApiError {
     pub fn rate_limit(m: impl Into<String>) -> Self {
         Self::new(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", m)
     }
-    // The brief's interface (Task 17) fixes this name; it collides with the
-    // `kind` string "api_error" it sets, not with the `ApiError` type name,
-    // so the lint's premise does not apply here.
+    // The brief's interface (Task 17) fixes this method's name to
+    // `api_error`, which is `ApiError` in snake_case: the lint's premise
+    // does apply. The allow is deliberate, not a workaround for a false
+    // positive.
     #[allow(clippy::self_named_constructors)]
     pub fn api_error(m: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, "api_error", m)

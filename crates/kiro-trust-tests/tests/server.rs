@@ -185,4 +185,44 @@ async fn unknown_routes_and_methods_use_the_error_envelope() {
         r.headers().get("access-control-allow-origin").is_none(),
         "no CORS headers"
     );
+
+    // The unmatched-path and unmatched-method fallbacks sit behind the token
+    // check too: with no token at all, both return 401, not 404 or 405.
+    const UNAUTHENTICATED: &str = "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"missing or invalid local token\"}}";
+    let r = app
+        .clone()
+        .oneshot(Request::get("/v1/other").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_string(r).await, UNAUTHENTICATED);
+
+    let r = app
+        .clone()
+        .oneshot(
+            Request::options("/v1/messages")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_string(r).await, UNAUTHENTICATED);
+}
+
+#[tokio::test]
+async fn an_empty_bearer_token_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(dir.path(), vec![]);
+    let r = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/models")
+                .header("authorization", "Bearer ")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
 }

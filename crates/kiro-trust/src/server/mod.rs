@@ -36,12 +36,14 @@ fn presented_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
         && let Some(t) = v.strip_prefix("Bearer ")
     {
-        return Some(t.trim());
+        let t = t.trim();
+        return if t.is_empty() { None } else { Some(t) };
     }
     headers
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
+        .filter(|t| !t.is_empty())
 }
 
 async fn require_token(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
