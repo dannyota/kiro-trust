@@ -8,9 +8,10 @@ pub mod messages;
 mod models;
 pub mod pump;
 
+use crate::listener::ConnectionInfo;
 use crate::server::error::ApiError;
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -72,6 +73,33 @@ async fn require_token(State(state): State<Arc<AppState>>, req: Request, next: N
     next.run(req).await
 }
 
+/// Disarms the connection's header-read deadline (spec 6.3): once this runs,
+/// `GuardedIo::poll_read` stops racing the timer for the rest of the
+/// connection's lifetime. This is layered OUTSIDE `require_token` so it runs
+/// even for an unauthenticated or otherwise-rejected request; the deadline
+/// exists to bound how long an unparsed connection sits open, not to police
+/// authentication, so it must disarm before `require_token` gets a chance to
+/// reject anything.
+///
+/// Axum only invokes middleware after hyper has parsed a complete request on
+/// the connection, which is exactly the signal spec 6.3 calls for and why
+/// this is sound: it is never invoked for a connection that is still only
+/// partway through its request line or headers.
+///
+/// The connect info is read as `Option<ConnectInfo<ConnectionInfo>>` and
+/// this does nothing when it is absent. It is always absent in the 49+
+/// existing router tests that call `oneshot` directly with no connect info,
+/// and it would also be absent for any router served without
+/// `into_make_service_with_connect_info`, so a required extractor here would
+/// break both compiling tests and make an unauthenticated request
+/// panic-prone. `build_router`'s signature is unchanged.
+async fn headers_received(req: Request, next: Next) -> Response {
+    if let Some(ConnectInfo(info)) = req.extensions().get::<ConnectInfo<ConnectionInfo>>() {
+        info.header_deadline.disarm();
+    }
+    next.run(req).await
+}
+
 async fn health() -> Response {
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -100,6 +128,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
+        // Outside require_token (a later `.layer` call wraps, and therefore
+        // runs before, an earlier one): the deadline must disarm even for a
+        // request `require_token` goes on to reject (spec 6.3).
+        .layer(middleware::from_fn(headers_received))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
