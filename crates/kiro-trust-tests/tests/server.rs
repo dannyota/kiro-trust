@@ -438,6 +438,61 @@ async fn request_validation_errors() {
     assert!(body_string(r).await.contains("messages must not be empty"));
 }
 
+// Critical fix: `max_tokens` is `#[serde(default)]` on `anthropic::Request`
+// because `count_tokens` shares `parse_request` and legitimately omits the
+// field (spec 5.7); the requirement itself lives only in `post_messages`
+// (spec 5.1). This pins both halves: `/v1/messages` rejects an absent
+// `max_tokens`, and `count_tokens` is unaffected.
+#[tokio::test]
+async fn v1_messages_requires_max_tokens_but_count_tokens_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, scripted) = app(dir.path(), vec![]);
+    let r = app
+        .clone()
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(r).await;
+    assert!(body.contains("\"invalid_request_error\""));
+    assert!(body.contains("max_tokens"));
+    assert!(
+        scripted.payloads.lock().unwrap().is_empty(),
+        "rejected before any upstream call"
+    );
+
+    // An explicit 0 is rejected the same way as an absent field: the real
+    // Anthropic API also treats `max_tokens: 0` as invalid.
+    let r = app
+        .clone()
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 0, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+    let r = app
+        .oneshot(
+            Request::post("/v1/messages/count_tokens")
+                .header("x-api-key", TOKEN)
+                .body(Body::from(
+                    serde_json::json!({"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "count_tokens legitimately omits max_tokens (spec 5.7)"
+    );
+}
+
 #[tokio::test]
 async fn oversized_body_returns_the_error_envelope_not_axums_default_rejection() {
     let dir = tempfile::tempdir().unwrap();
@@ -813,6 +868,79 @@ async fn a_second_retryable_invalid_state_is_not_retried_again() {
     );
 }
 
+// Important 2: on the non-streaming path, nothing reaches the client until
+// the whole response is folded, so a retryable invalid state must still get
+// its one retry even after a content event (a `reasoningContentEvent`, say)
+// was already translated internally. Before this fix, `Pump::prime` treated
+// any buffered translator events as "output started" regardless of path,
+// so it returned `Primed::Ready` on the content event and the invalid state
+// discovered afterward, inside the non-streaming fold loop, had no retry
+// path at all.
+#[tokio::test]
+async fn non_streaming_retries_a_retryable_invalid_state_after_a_content_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = frames(&[
+        ("reasoningContentEvent", r#"{"text":"t","signature":"s"}"#),
+        (
+            "invalidStateEvent",
+            r#"{"reason":"STALE_CONVERSATION","message":"stale"}"#,
+        ),
+    ]);
+    let second = frames(&[("assistantResponseEvent", r#"{"content":"ok"}"#)]);
+    let (app, scripted) = app(dir.path(), vec![Ok(first), Ok(second)]);
+    let r = app
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(
+        v["content"].as_array().unwrap().last().unwrap()["text"],
+        "ok"
+    );
+    let p = scripted.payloads.lock().unwrap();
+    assert_eq!(p.len(), 2, "the retry actually happened");
+    assert!(p[0]["conversationState"]["conversationId"].is_string());
+    assert!(
+        p[1]["conversationState"].get("conversationId").is_none(),
+        "the retry clears the conversation id"
+    );
+}
+
+// Important 2, second half of the one-retry bound: a retryable invalid
+// state after a content event on the FIRST attempt retries once; a second
+// one on the retry attempt (also after a content event) must still end in
+// the HTTP error after exactly two upstream calls, not a second retry.
+#[tokio::test]
+async fn non_streaming_two_retryable_invalid_states_after_content_events_return_the_http_error_once()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let attempt = || {
+        frames(&[
+            ("reasoningContentEvent", r#"{"text":"t","signature":"s"}"#),
+            (
+                "invalidStateEvent",
+                r#"{"reason":"STALE_CONVERSATION","message":"stale"}"#,
+            ),
+        ])
+    };
+    let (app, scripted) = app(dir.path(), vec![Ok(attempt()), Ok(attempt())]);
+    let r = app
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        scripted.payloads.lock().unwrap().len(),
+        2,
+        "exactly two upstream calls: the retry, and no more"
+    );
+}
+
 #[tokio::test]
 async fn local_stop_drops_the_rest_of_the_upstream() {
     let dir = tempfile::tempdir().unwrap();
@@ -924,6 +1052,57 @@ async fn streaming_permit_is_held_for_the_connection_and_released_on_drop() {
 
     let third = app.clone().oneshot(stream_req()).await.unwrap();
     assert_eq!(third.status(), StatusCode::OK);
+}
+
+/// An upstream that starts a stream but never yields a byte. The priming
+/// deadline (Important 3) is the only thing that can end a request against
+/// it; without it, this would hang the request (and the permit it holds)
+/// forever.
+struct Stalled;
+
+#[async_trait::async_trait]
+impl Upstream for Stalled {
+    async fn generate(&self, _payload: &Payload) -> Result<UpstreamStream, UpstreamError> {
+        Ok(UpstreamStream {
+            attempts: 1,
+            bytes: futures_util::stream::pending().boxed(),
+        })
+    }
+}
+
+// Important 3: a slow-trickling (here, fully stalled) upstream must not pin
+// a concurrency permit indefinitely before any output exists.
+// `#[tokio::test(start_paused = true)]` starts the runtime's virtual clock
+// paused; when the only work left is a timer, tokio auto-advances the clock
+// to it, so this observes `pump::PRIMING_DEADLINE` firing without a real
+// 120 s wait. On expiry the request must fail and the permit must release.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_upstream_fails_after_the_priming_deadline_and_releases_the_permit() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(Client::new(Policy::loopback_plain_http(1)).unwrap());
+    let tokens = Arc::new(TokenSource::new(test_db(dir.path()), net, None));
+    let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+    let state = Arc::new(AppState {
+        tokens,
+        upstream: Arc::new(Stalled),
+        local_token: SecretString::from(TOKEN.to_string()),
+        limiter: limiter.clone(),
+        conversation_salt: [9u8; 16],
+    });
+    let app = build_router(state);
+    let r = app
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        limiter.available_permits(),
+        1,
+        "the permit is released once the priming deadline fails the request"
+    );
 }
 
 #[tokio::test]

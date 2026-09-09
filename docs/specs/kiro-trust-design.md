@@ -290,6 +290,12 @@ records the rule here before writing code.
 Any other path returns 404 with the Anthropic error envelope. Methods other
 than those listed return 405.
 
+`POST /v1/messages` requires `max_tokens`; an absent or zero value is 400
+`invalid_request_error` (section 5.6), matching the real Anthropic Messages
+API. The requirement lives in the `/v1/messages` handler, not in
+`anthropic::Request` or its shared parser: `count_tokens` parses the same
+`Request` type and legitimately omits the field (section 5.7).
+
 ### 5.2 Model catalog
 
 Static, shipped in `kiro-trust-protocol::catalog`, copied from kirocc's Claude
@@ -394,7 +400,11 @@ tracks the current block (`thinking`, `text`, `tool_use`, or none) and emits:
 - `stop_sequences` are matched across delta boundaries; on a match the text
   is cut, `stop_reason: stop_sequence` and `stop_sequence` are set, and the
   upstream body is dropped. `max_tokens` is enforced on output tokens with
-  `stop_reason: max_tokens`.
+  `stop_reason: max_tokens`. The translator's accumulated text, thinking,
+  tool-call input, and redacted content share one output-token counter that
+  is additionally bounded by a fixed absolute ceiling (section 5.5),
+  independent of the client's `max_tokens`: defense in depth so accumulation
+  stays bounded even if the field is ever made optional again.
 - `stop_reason` is `tool_use` when at least one tool block closed, else
   `end_turn`.
 - An `exception` frame or `invalidStateEvent` before any visible output
@@ -402,11 +412,17 @@ tracks the current block (`thinking`, `text`, `tool_use`, or none) and emits:
   SSE `error` event and the stream ends there, with no `message_stop`
   after it.
 - An `invalidStateEvent` with reason `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,
-  `INVALID_CONVERSATION_STATE`, or `STALE_CONVERSATION` arriving before any
-  output clears the conversation id and retries the request once (kirocc
-  `retryableInvalidStateReasons`); any other reason, or a retry that fails
-  again, is the HTTP error above. The retry never happens after output has
-  started.
+  `INVALID_CONVERSATION_STATE`, or `STALE_CONVERSATION` clears the
+  conversation id and retries the request once (kirocc
+  `retryableInvalidStateReasons`); any other reason, or a second retryable
+  failure, is the HTTP error above. What counts as "output has started",
+  which ends retry eligibility, is per path: streaming counts any content
+  already buffered as translated events as started, since those bytes are on
+  the wire once the handler flushes them, so the retry never happens once
+  the first content is buffered. Non-streaming holds everything back until
+  the whole response is folded, so a retryable invalid state still retries
+  even after earlier content (a `reasoningContentEvent`, say) has been
+  translated internally, as long as this is the request's first retry.
 - End of stream: close the open block, `message_delta` with `stop_reason` and
   usage, `message_stop`.
 - Idle keep-alive: an SSE comment line `: keep-alive` every 15 s without an
@@ -427,6 +443,8 @@ Non-streaming: the same events folded into one `Message` JSON body.
 | Upstream frame | 4 MiB |
 | Upstream error body | 64 KiB |
 | Tool input accumulation | 16 MiB per tool call |
+| Response accumulator ceiling | 2,000,000 output tokens (about 8,000,000 accumulated characters across text, thinking, tool-call input, and redacted content combined), independent of the client's `max_tokens` (section 5.4). Far above any legitimate response, so it never changes observable behavior for a real request; it exists only so a future change that makes `max_tokens` optional again cannot reopen unbounded accumulation. |
+| Priming deadline | 120 s wall-clock, from the first upstream read until the translator produces its first output (`ResponseTranslator::started`), on both the streaming and non-streaming paths. Generous next to the 10 s connect and 30 s response-header timeouts (section 3.2), and comfortably above a healthy request's time to a first token, including a heavy `max`-effort reasoning load; well under the 180 s per-read idle deadline, so it still meaningfully bounds a stalled connection. Corrects the earlier claim that `Pump::prime` was "bounded by the 180 s read-idle timeout": that timeout resets on every successful read, however small, so an upstream delivering one byte every 179 s never tripped it and could pin a concurrency permit indefinitely. Once output has started this deadline no longer applies for the rest of the response: a long generation is legitimate, and the per-read idle timeout and the SSE keep-alive (above) cover it. Expiry fails the request as an upstream `Transport` error (502 `api_error`, section 5.6) and releases the concurrency permit. |
 
 ### 5.6 Errors
 
@@ -435,13 +453,13 @@ Every failure uses `{"type":"error","error":{"type":"<t>","message":"<m>"}}`.
 | Condition | Status | `error.type` |
 | --- | --- | --- |
 | missing or wrong local token | 401 | `authentication_error` |
-| bad JSON, unknown model, invalid field | 400 | `invalid_request_error` |
+| bad JSON, unknown model, invalid field (including a missing or zero `max_tokens` on `/v1/messages`, section 5.1) | 400 | `invalid_request_error` |
 | request body over 32 MiB | 413 | `request_too_large` |
 | unknown route | 404 | `not_found_error` |
 | method not allowed | 405 | `invalid_request_error` |
 | Kiro credential unusable (no database, refresh failed) | 401 | `authentication_error` |
 | upstream 429 or `ThrottlingException` after retries | 429 | `rate_limit_error` |
-| upstream 5xx, malformed stream, idle timeout | 502 | `api_error` |
+| upstream 5xx, malformed stream, idle timeout (including the priming deadline, section 5.5) | 502 | `api_error` |
 | upstream 400-class other than 403/429 | 502 | `api_error` |
 | local concurrency cap | 429 | `rate_limit_error` |
 
@@ -506,8 +524,12 @@ or `security_logging.rs` (section 8.4).
 
 - `tracing` to stderr only. Allowed fields: `request_id`, `method`, `path`,
   `model`, `kiro_model`, `stream`, `status`, `duration_ms`, `retry_count`,
-  `input_bytes`, `output_bytes`, `input_tokens`, `output_tokens`,
+  `attempt`, `input_bytes`, `output_bytes`, `input_tokens`, `output_tokens`,
   `runtime_region`, `sso_region`, `frames`, `event_counts`, `error_type`.
+  `attempt` is `kiro-trust-kiro`'s per-call retry counter (the natural
+  sibling of `retry_count`, which is the higher-level invalid-state retry
+  gate); `crates/kiro-trust-tests/tests/security_logging.rs` asserts every
+  `field=` name on a captured log line is in this list.
 - Never logged: any header value, request or response body, prompt, tool
   name, tool argument, tool result, thinking text, conversation id, profile
   ARN, account id, token, client secret, refresh token, database path

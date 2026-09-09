@@ -12,6 +12,77 @@ use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
 use tower::ServiceExt;
 
+/// spec 6.4's allowed-fields list, transcribed here so a field reaching a
+/// log line without a matching spec update fails `nothing_sensitive_reaches_the_logs`
+/// below. Keep this in sync with `docs/specs/kiro-trust-design.md` section
+/// 6.4 by hand: a field added to one without the other is exactly the drift
+/// this list exists to catch.
+const ALLOWED_LOG_FIELDS: &[&str] = &[
+    "request_id",
+    "method",
+    "path",
+    "model",
+    "kiro_model",
+    "stream",
+    "status",
+    "duration_ms",
+    "retry_count",
+    "attempt",
+    "input_bytes",
+    "output_bytes",
+    "input_tokens",
+    "output_tokens",
+    "runtime_region",
+    "sso_region",
+    "frames",
+    "event_counts",
+    "error_type",
+];
+
+/// Every `name=` token in `line` that is not inside a quoted field value.
+/// `tracing_subscriber`'s default formatter writes `key=value` pairs
+/// space-separated after the level, target, and message, with string values
+/// quoted; scanning outside quotes keeps a value that happens to contain an
+/// `=` or a space from being mistaken for another field.
+fn field_names(line: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut ident_start: Option<usize> = None;
+    for (i, c) in line.char_indices() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_quotes = true;
+                ident_start = None;
+            }
+            'a'..='z' | 'A'..='Z' | '_' => {
+                if ident_start.is_none() {
+                    ident_start = Some(i);
+                }
+            }
+            '0'..='9' => {} // valid mid-identifier; tracing field names never start with one
+            '=' => {
+                if let Some(start) = ident_start {
+                    names.push(&line[start..i]);
+                }
+                ident_start = None;
+            }
+            _ => ident_start = None,
+        }
+    }
+    names
+}
+
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<u8>>>);
 impl Write for Capture {
@@ -210,5 +281,20 @@ async fn nothing_sensitive_reaches_the_logs() {
         dir.path().to_str().unwrap(),
     ] {
         assert!(!logs.contains(marker), "{marker} leaked into logs:\n{logs}");
+    }
+
+    // Important 1: spec 6.4's allowlist is only as good as something that
+    // fails when a field name drifts from it. This does not prove every
+    // allowed field is exercised, only that nothing beyond the allowlist
+    // ever appears on a line this test's flows produced; a new field
+    // reaching a `tracing::info!`/`warn!` call site without a matching spec
+    // update fails here.
+    for line in logs.lines() {
+        for name in field_names(line) {
+            assert!(
+                ALLOWED_LOG_FIELDS.contains(&name),
+                "field `{name}` is outside spec 6.4's allowlist:\n{line}"
+            );
+        }
     }
 }

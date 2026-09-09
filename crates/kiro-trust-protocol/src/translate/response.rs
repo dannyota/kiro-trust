@@ -14,12 +14,25 @@ use std::collections::HashMap;
 const OPEN_TAG: &str = "<thinking>";
 const CLOSE_TAG: &str = "</thinking>";
 
+/// Absolute cap on accumulated output (text + thinking + tool-call input +
+/// redacted content share one `output_chars` counter), independent of the
+/// client's `max_tokens`. `/v1/messages` requires `max_tokens` (spec 5.1,
+/// 5.6), so this should never bind for a well-formed request; it exists so a
+/// future change that makes the field optional again cannot reopen unbounded
+/// accumulation (spec 5.5). Far above any legitimate response: at 4 chars
+/// per token it allows roughly 8,000,000 accumulated characters.
+const ABSOLUTE_MAX_TOKENS: usize = 2_000_000;
+
 #[derive(Clone, Debug)]
 pub struct ResponseOptions {
     pub model: String,
     pub message_id: String,
     pub stop_sequences: Vec<String>,
-    /// 0 disables adapter-side enforcement.
+    /// The client's requested budget. 0 (an absent field reaching this far,
+    /// or an explicit 0) is treated as "use the absolute ceiling": the
+    /// HTTP boundary requires this field for `/v1/messages` (spec 5.1), so 0
+    /// should never arrive from a real request; this is defense in depth,
+    /// not the primary enforcement path.
     pub max_tokens: u32,
     /// short → original tool names.
     pub tool_names: HashMap<String, String>,
@@ -153,14 +166,22 @@ impl ResponseTranslator {
         }
     }
 
+    /// The requested budget clamped to the absolute ceiling, or the ceiling
+    /// itself when the requested value is 0. Always positive, so the two
+    /// callers below never need a separate "enforcement disabled" branch.
+    fn effective_max_tokens(&self) -> usize {
+        let requested = self.opts.max_tokens as usize;
+        if requested == 0 {
+            ABSOLUTE_MAX_TOKENS
+        } else {
+            requested.min(ABSOLUTE_MAX_TOKENS)
+        }
+    }
+
     /// kirocc applyMaxTokensBudget: chars / 4 as the token estimate.
     fn apply_max_tokens(&mut self, delta: &str) -> String {
-        let budget = self.opts.max_tokens as usize;
+        let budget = self.effective_max_tokens();
         let n = delta.chars().count();
-        if budget == 0 {
-            self.output_chars += n;
-            return delta.to_string();
-        }
         if (self.output_chars + n) / 4 < budget {
             self.output_chars += n;
             return delta.to_string();
@@ -184,8 +205,8 @@ impl ResponseTranslator {
 
     fn account_opaque(&mut self, content: &str) {
         self.output_chars += content.chars().count();
-        let budget = self.opts.max_tokens as usize;
-        if self.local_stop.is_none() && budget > 0 && self.output_chars / 4 >= budget {
+        let budget = self.effective_max_tokens();
+        if self.local_stop.is_none() && self.output_chars / 4 >= budget {
             self.latch(StopReason::MaxTokens, None);
         }
     }
@@ -912,6 +933,40 @@ mod tests {
             "estimate used when no metadata arrived"
         );
         assert_eq!(usage.output_tokens, 2);
+    }
+
+    // Critical fix: the absolute ceiling latches even when the client's
+    // budget is 0. `/v1/messages` requires `max_tokens` (spec 5.1), so 0
+    // should never reach here in production; this proves the defense in
+    // depth holds if it ever does, without relying on the client's value. A
+    // single delta far larger than the ceiling must leave the accumulator
+    // itself bounded, not merely flip a flag, which is the actual memory
+    // fix: `self.text` never grows past the ceiling regardless of how much
+    // more the delta carried.
+    #[test]
+    fn absolute_ceiling_latches_and_bounds_the_accumulator_when_max_tokens_is_zero() {
+        let mut t = ResponseTranslator::new(opts()); // opts().max_tokens == 0
+        let huge = "a".repeat(ABSOLUTE_MAX_TOKENS * 4 + 1);
+        let all = t.push(&text(&huge));
+        assert!(t.stopped(), "the absolute ceiling must latch a stop");
+        let StreamEvent::MessageDelta { delta, .. } = all
+            .iter()
+            .find(|e| matches!(e, StreamEvent::MessageDelta { .. }))
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(delta.stop_reason, StopReason::MaxTokens);
+        let emitted = deltas_text(&all);
+        assert_eq!(
+            emitted.len(),
+            ABSOLUTE_MAX_TOKENS * 4,
+            "the accumulator is capped at the ceiling, not merely flagged"
+        );
+        assert!(
+            emitted.len() < huge.len(),
+            "far less than the oversized input was retained"
+        );
     }
 
     // Regression: `finish()` must not flush a buffered `<thinking>`-tag

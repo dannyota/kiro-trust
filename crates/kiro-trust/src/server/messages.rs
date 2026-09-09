@@ -104,6 +104,19 @@ pub async fn post_messages(
     let request_id = Uuid::new_v4();
     let body = body?;
     let req = parse_request(&body)?;
+    // `max_tokens` is `#[serde(default)]` on `anthropic::Request` because
+    // `parse_request` is shared with `/v1/messages/count_tokens`, which
+    // legitimately omits it (spec 5.7). The real Anthropic Messages API
+    // requires the field on `/v1/messages`, so the requirement belongs here,
+    // at this route's own entry point, rather than in the shared parser or
+    // in `anthropic::Request` itself. A present-but-zero value is rejected
+    // the same way: the real API also treats `max_tokens: 0` as invalid, and
+    // treating the two alike is what lets `ResponseTranslator` use 0 as its
+    // own "no client budget" sentinel for the absolute-ceiling fallback
+    // (spec 5.4, 5.5) without a second signal for "absent".
+    if req.max_tokens == 0 {
+        return Err(ApiError::invalid_request("max_tokens is required"));
+    }
     let resolved = catalog::resolve(&req.model, has_context_1m_beta(&headers))
         .map_err(|e| ApiError::invalid_request(e.to_string()))?;
     let thinking = req.thinking_enabled() || resolved.thinking;
@@ -181,7 +194,7 @@ pub async fn post_messages(
                 }
             });
         }
-        match pump.prime().await {
+        match pump.prime(req.stream).await {
             Primed::Failed(f) if retry_count == 0 && retryable(&f) => {
                 retry_count += 1;
                 built.payload.conversation_state.conversation_id = None;
