@@ -262,10 +262,12 @@ check. Depends on `kiro-trust-protocol`, `serde_json`, and `rusqlite` only.
 | `--capture-dir <path>` | — | — | only with the `capture` feature (section 8.3) |
 
 Precedence: flag, then env, then default. Startup order: parse and validate
-config, open the database read-only and read credentials (fail fast with a
-clear message), write the token file, bind, print two lines to stderr (the
-listener address and token file path, then a reminder to run `kiro-trust
-env`), serve. A failure at any step before the token file is
+config, read and parse `--extra-ca` when given (a missing, unreadable,
+malformed, or empty PEM file is a configuration error, exit 2, before anything
+is written or bound), open the database read-only and read credentials (fail
+fast with a clear message), write the token file, bind, print two lines to
+stderr (the listener address and token file path, then a reminder to run
+`kiro-trust env`), serve. A failure at any step before the token file is
 written leaves no token file behind; a failure after binding removes it. On
 SIGINT or SIGTERM: delete the token file and stop accepting immediately (no
 new client can read a valid token during the drain that follows), drain
@@ -753,8 +755,14 @@ Build features         none
 ```
 
 `Extra CA` shows the PEM path when `--extra-ca` is set, and the word `none`
-otherwise, so an added anchor is never invisible. Because the flag is additive
-(section 6.2), the `TLS roots` line above it stays true either way.
+otherwise, so an added anchor is never invisible. The path goes through
+`abbreviate_home_path`, like the credential path above it, so a home directory
+never reaches the output; certificate bytes never appear at all. Because the
+flag is additive (section 6.2), the `TLS roots` line above it stays true either
+way. An unreadable or malformed file adds a sanitized problem and makes audit
+exit 1, since a configured anchor that cannot be loaded is a deviation the
+operator has to see. `Connection limits` is fixed text derived from
+`MAX_CONNECTIONS` and `HEADER_READ_TIMEOUT` (section 6.3).
 
 On Windows, `Local authentication` reads
 `required (token file, user profile ACL)`, matching 6.3: Windows sets no
