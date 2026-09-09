@@ -558,6 +558,10 @@ Identity Center keys, first match wins:
 - `state.auth.idc.region`: JSON string, the SSO region
 - `state.api.codewhisperer.profile`: JSON `{"arn":"arn:aws:codewhisperer:<region>:<account>:profile/<id>","profile_name":"..."}` or a bare ARN string
 
+Measured on the owner's database on 2026-09-09: every credential row in
+`auth_kv` and `state` has SQLite storage class TEXT; the reader accepts TEXT
+or UTF-8 BLOB.
+
 Social keys (`kirocli:social:*`) are checked only to produce the unsupported
 error. The legacy `codewhisperer:*` keys are not read in v0.1.
 

@@ -46,6 +46,18 @@ pub struct KiroDb {
     pub(crate) conn: Connection,
 }
 
+/// `auth_kv.value` and `state.value` are measured as TEXT on the owner's
+/// database (spec 7.2), but the schema declares `state.value BLOB`; accept
+/// either storage class so a future kiro-cli version does not silently
+/// break credential reads. Invalid UTF-8 in a BLOB is treated as absent.
+fn text_or_utf8_blob(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<String>> {
+    Ok(match row.get_ref(0)? {
+        rusqlite::types::ValueRef::Text(t) => std::str::from_utf8(t).ok().map(str::to_string),
+        rusqlite::types::ValueRef::Blob(b) => std::str::from_utf8(b).ok().map(str::to_string),
+        _ => None,
+    })
+}
+
 fn authorize(ctx: AuthContext<'_>) -> Authorization {
     match ctx.action {
         AuthAction::Select => Authorization::Allow,
@@ -77,10 +89,13 @@ impl KiroDb {
         for key in keys {
             let value: Option<String> = self
                 .conn
-                .query_row("SELECT value FROM auth_kv WHERE key = ?1", [key], |r| {
-                    r.get(0)
-                })
-                .ok();
+                .query_row(
+                    "SELECT value FROM auth_kv WHERE key = ?1",
+                    [key],
+                    text_or_utf8_blob,
+                )
+                .ok()
+                .flatten();
             if let Some(v) = value {
                 return Ok(Some(v));
             }
@@ -91,10 +106,13 @@ impl KiroDb {
     fn state(&self, key: &str) -> Option<String> {
         let raw: Option<String> = self
             .conn
-            .query_row("SELECT value FROM state WHERE key = ?1", [key], |r| {
-                r.get(0)
-            })
-            .ok();
+            .query_row(
+                "SELECT value FROM state WHERE key = ?1",
+                [key],
+                text_or_utf8_blob,
+            )
+            .ok()
+            .flatten();
         raw.map(|v| match serde_json::from_str::<Value>(&v) {
             Ok(Value::String(s)) => s,
             _ => v,
@@ -197,10 +215,11 @@ fn parse_expires_at(v: Option<&Value>) -> Option<SystemTime> {
         }
         _ => return None,
     };
-    if secs <= 0.0 {
+    if !secs.is_finite() || secs <= 0.0 {
         return None;
     }
-    Some(UNIX_EPOCH + Duration::from_secs_f64(secs))
+    let duration = Duration::try_from_secs_f64(secs).ok()?;
+    UNIX_EPOCH.checked_add(duration)
 }
 
 #[cfg(test)]
@@ -412,5 +431,75 @@ pub(crate) mod tests {
         assert!(db.conn.prepare("SELECT value FROM conversations").is_err());
         assert!(db.conn.prepare("SELECT key FROM auth_kv").is_ok());
         assert!(db.conn.prepare("SELECT key FROM state").is_ok());
+    }
+
+    #[test]
+    fn crafted_expiry_values_do_not_panic() {
+        let raw_values: &[&str] = &[
+            r#""NaN""#,
+            "1e300",
+            r#""inf""#,
+            "9223372036854775807",
+            r#""99999999999999999999""#,
+        ];
+        for raw in raw_values {
+            let token = format!(
+                r#"{{"accessToken":"placeholder-access","refreshToken":"placeholder-refresh","expiresAt":{raw},"region":"us-east-1"}}"#
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let path = make_db(
+                dir.path(),
+                &[
+                    ("kirocli:odic:token", token.as_str()),
+                    ("kirocli:odic:device-registration", REG),
+                ],
+                &[("api.codewhisperer.profile", PROFILE)],
+            );
+            let c = KiroDb::open_read_only(&path)
+                .unwrap()
+                .read_identity_center()
+                .unwrap();
+            assert_eq!(c.expires_at, std::time::UNIX_EPOCH, "expiresAt: {raw}");
+        }
+    }
+
+    #[test]
+    fn blob_stored_state_values_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_db(
+            dir.path(),
+            &[
+                ("kirocli:odic:token", TOKEN_SNAKE),
+                ("kirocli:odic:device-registration", REG),
+            ],
+            &[],
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO state (key, value) VALUES ('auth.idc.region', ?1)",
+                [rusqlite::types::Value::Blob(b"\"ap-southeast-1\"".to_vec())],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO state (key, value) VALUES ('api.codewhisperer.profile', ?1)",
+                [rusqlite::types::Value::Blob(PROFILE.as_bytes().to_vec())],
+            )
+            .unwrap();
+        }
+        let c = KiroDb::open_read_only(&path)
+            .unwrap()
+            .read_identity_center()
+            .unwrap();
+        assert_eq!(c.sso_region.as_str(), "ap-southeast-1");
+        assert_eq!(
+            c.runtime_region.as_str(),
+            "us-east-1",
+            "token region is not served; ARN region wins"
+        );
+        assert_eq!(
+            c.profile_arn,
+            "arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE"
+        );
     }
 }
