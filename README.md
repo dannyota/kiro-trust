@@ -80,8 +80,10 @@ spec for every flag and environment variable.
 - Request and response bodies are never logged, and no flag exists to log
   them.
 - No telemetry, no update checks, no dynamic model discovery.
-- `kiro-trust audit` prints the effective configuration, and checks the
-  three of these guarantees that a running build can check for itself (see
+- No developer-only feature, such as `capture` (which writes real prompts
+  and responses to disk), is compiled into a release build.
+- `kiro-trust audit` prints the effective configuration, and checks three
+  of these guarantees that a running build can check for itself (see
   Audit below).
 
 ## Audit
@@ -93,21 +95,29 @@ kiro-trust audit [--json]
 Prints the effective security configuration: listener address, credential
 database path, outbound hosts, TLS roots, and whether any developer-only
 feature (such as `capture`, which writes real prompts and responses to disk)
-is compiled into this build. It exits 1 when a developer-only feature is
-compiled in, the listener is not loopback, or the credential database could
-not be opened read-only (spec 4.2); it never starts a listener or makes a
-network request itself.
+is compiled into this build. It exits 1 when the listener address cannot be
+parsed or is not loopback, an invalid `--runtime-region` is given, the
+credential database cannot be confirmed read-only, the credential cannot be
+read, or a developer-only feature is compiled in (spec 4.2); it never starts
+a listener or makes a network request itself.
 
 Only some of the lines above are measurements of this running build: the
-listener address, credential database path and mode, outbound hosts, TLS
-roots, HTTP proxy setting, and redirect policy are read back from the code
-that actually enforces them. The `Telemetry`, `Request body logging`,
-`Dynamic model discovery`, and `Automatic updates` lines are fixed text,
-printed the same way regardless of build or configuration, because they each
-assert that a whole category of code does not exist in this binary; no field
-you can print proves an absence better than the source itself does. Read
-those four as a pointer to go verify the claim in the source (or `NOTICE`),
-not as something `audit` checked for you.
+listener address, credential database path and mode, and outbound hosts are
+read back from the code that actually enforces them. TLS roots, HTTP proxy
+setting, and redirect policy are not read back from anything: they are
+`pub const` strings declared next to the `Client` builder calls that set
+that behavior (`crates/kiro-trust-net/src/client.rs`), so a change to the
+builder would not fail any test tied to these three printed lines. The
+behavior itself is pinned by the named tests `oidc_redirect_rejected`,
+`runtime_redirect_rejected`, and `proxy_env_ignored`
+(`crates/kiro-trust-tests/tests/security_net.rs`), not by `audit`. The
+`Telemetry`, `Request body logging`, `Dynamic model discovery`, and
+`Automatic updates` lines are fixed text too, printed the same way
+regardless of build or configuration, because they each assert that a whole
+category of code does not exist in this binary; no field you can print
+proves an absence better than the source itself does. Read those four as a
+pointer to go verify the claim in the source (or `NOTICE`), not as
+something `audit` checked for you.
 
 ## Limitations
 

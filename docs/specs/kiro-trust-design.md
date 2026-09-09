@@ -257,8 +257,9 @@ existing connections for up to 10 s, exit 0.
 ### 4.2 `kiro-trust audit [--json]`
 
 Prints the effective security configuration (section 6.6) and exits 0. Exits 1
-when a guarantee does not hold: a dev feature is compiled in, the listener is
-not loopback, or the database could not be opened read-only. `audit` never
+when the listener address cannot be parsed or is not loopback, an invalid
+`--runtime-region` is given, the database cannot be confirmed read-only, the
+credential cannot be read, or a dev feature is compiled in. `audit` never
 starts a listener and never performs a network request.
 
 ### 4.3 `kiro-trust env [--shell sh|fish]`
