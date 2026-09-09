@@ -1,11 +1,13 @@
 //! Loopback HTTP surface (spec 5.1, 6.3).
 
+pub mod count_tokens;
 pub mod error;
+pub mod messages;
 mod models;
+pub mod pump;
 
 use crate::server::error::ApiError;
 use axum::Router;
-use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, header};
 use axum::middleware::{self, Next};
@@ -83,19 +85,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models::get_models))
-        .route("/v1/messages", post(placeholder_messages))
-        .route("/v1/messages/count_tokens", post(placeholder_messages))
+        .route("/v1/messages", post(messages::post_messages))
+        .route(
+            "/v1/messages/count_tokens",
+            post(count_tokens::post_count_tokens),
+        )
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
-
-/// Replaced in Task 18.
-async fn placeholder_messages() -> Response {
-    ApiError::api_error("not implemented").into_response()
-}
-
-#[allow(dead_code)]
-fn _assert_body_type(_: Body) {}

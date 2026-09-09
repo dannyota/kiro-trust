@@ -1,5 +1,6 @@
 //! The Anthropic error envelope (spec 5.6).
 
+use axum::extract::rejection::BytesRejection;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use kiro_trust_kiro::{UpstreamError, UpstreamErrorKind};
@@ -71,6 +72,22 @@ impl From<UpstreamError> for ApiError {
             | UpstreamErrorKind::Transport
             | UpstreamErrorKind::Protocol
             | UpstreamErrorKind::Client => Self::api_error(format!("upstream error: {detail}")),
+        }
+    }
+}
+
+/// `Bytes` rejects a request whose body is too large (or otherwise
+/// unreadable) before a handler ever runs. Map it to the project's error
+/// envelope instead of axum's plain-text default (spec 5.6).
+impl From<BytesRejection> for ApiError {
+    fn from(e: BytesRejection) -> Self {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            Self::invalid_request(format!(
+                "request body exceeds the {}-byte limit",
+                super::MAX_BODY_BYTES
+            ))
+        } else {
+            Self::invalid_request("failed to read request body")
         }
     }
 }

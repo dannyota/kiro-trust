@@ -309,7 +309,7 @@ for rows with a separate 1M SKU.
 ### 5.3 Request translation
 
 Input: the Anthropic `Request`, the resolved Kiro SKU, the profile ARN, a
-conversation id (UUID v4 per request), and the effort level. Output: `Payload`.
+conversation id (derived per step 8), and the effort level. Output: `Payload`.
 
 1. System prompt: `system` as a string or text blocks joins into one string.
    The `<env>` block, when present, yields `envState.operatingSystem` and
@@ -337,7 +337,11 @@ conversation id (UUID v4 per request), and the effort level. Output: `Payload`.
    and `tool_use` blocks reach `assistantResponseMessage`. (kirocc replays
    redacted blobs for GPT models only, out of scope.)
 7. `profileArn` is set from the credential.
-8. Thinking: when `thinking.type` is `enabled` or `adaptive`, or
+8. `conversationId`: UUID v5 of the `X-Claude-Code-Session-Id` header under a
+   per-process random namespace, or a random UUID v4 when the header is
+   absent, so Kiro sees a stable conversation per Claude Code session
+   without receiving the raw session id.
+9. Thinking: when `thinking.type` is `enabled` or `adaptive`, or
    `output_config.effort` is set, `additionalModelRequestFields.output_config.effort`
    is the requested effort clamped to the model's enum, defaulting to
    `medium`. `thinking.type: disabled` or absent omits the field.
@@ -377,7 +381,14 @@ tracks the current block (`thinking`, `text`, `tool_use`, or none) and emits:
   `end_turn`.
 - An `exception` frame or `invalidStateEvent` before any visible output
   becomes an HTTP error (section 5.6); after output started it becomes an
-  SSE `error` event followed by `message_stop`.
+  SSE `error` event and the stream ends there, with no `message_stop`
+  after it.
+- An `invalidStateEvent` with reason `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,
+  `INVALID_CONVERSATION_STATE`, or `STALE_CONVERSATION` arriving before any
+  output clears the conversation id and retries the request once (kirocc
+  `retryableInvalidStateReasons`); any other reason, or a retry that fails
+  again, is the HTTP error above. The retry never happens after output has
+  started.
 - End of stream: close the open block, `message_delta` with `stop_reason` and
   usage, `message_stop`.
 - Idle keep-alive: an SSE comment line `: keep-alive` every 15 s without an

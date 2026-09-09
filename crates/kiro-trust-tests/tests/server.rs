@@ -262,3 +262,390 @@ async fn an_empty_token_never_authenticates_even_against_an_empty_local_token() 
         .unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
 }
+
+use kiro_trust_protocol::eventstream::{encode_event_frame, encode_exception_frame};
+
+fn frames(events: &[(&str, &str)]) -> Vec<u8> {
+    events
+        .iter()
+        .flat_map(|(t, p)| encode_event_frame(t, p.as_bytes()))
+        .collect()
+}
+fn messages_req(body: serde_json::Value) -> Request<Body> {
+    Request::post("/v1/messages")
+        .header("x-api-key", TOKEN)
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", "session-abc")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn streams_sse_with_the_fixture_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, scripted) = app(
+        dir.path(),
+        vec![Ok(frames(&[
+            ("assistantResponseEvent", r#"{"content":"Hel"}"#),
+            ("assistantResponseEvent", r#"{"content":"lo"}"#),
+            (
+                "metadataEvent",
+                r#"{"tokenUsage":{"uncachedInputTokens":5,"outputTokens":1,"totalTokens":6,"cacheReadInputTokens":0,"cacheWriteInputTokens":0}}"#,
+            ),
+        ]))],
+    );
+    let r = app
+        .oneshot(messages_req(serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "stream": true, "messages": [{"role": "user", "content": "hi"}]})))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()["content-type"], "text/event-stream");
+    let body = body_string(r).await;
+    assert!(body.starts_with("event: message_start\ndata: {\"type\":\"message_start\""));
+    assert!(body.contains("\"text\":\"Hel\""));
+    assert!(body.contains("\"text\":\"lo\""));
+    assert!(body.contains("\"stop_reason\":\"end_turn\""));
+    assert!(body.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+    let payload = &scripted.payloads.lock().unwrap()[0];
+    assert_eq!(
+        payload["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+        "claude-sonnet-4.6"
+    );
+    assert_eq!(
+        payload["profileArn"],
+        "arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE"
+    );
+    let conv = payload["conversationState"]["conversationId"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !conv.contains("session-abc"),
+        "the raw session id never reaches Kiro"
+    );
+    assert_eq!(conv.len(), 36);
+}
+
+#[tokio::test]
+async fn conversation_id_is_stable_per_session_and_random_without_a_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = frames(&[("assistantResponseEvent", r#"{"content":"x"}"#)]);
+    let (app, scripted) = app(
+        dir.path(),
+        vec![Ok(body.clone()), Ok(body.clone()), Ok(body.clone())],
+    );
+    let req = || serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]});
+    app.clone().oneshot(messages_req(req())).await.unwrap();
+    app.clone().oneshot(messages_req(req())).await.unwrap();
+    app.clone()
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("x-api-key", TOKEN)
+                .body(Body::from(req().to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let p = scripted.payloads.lock().unwrap();
+    assert_eq!(
+        p[0]["conversationState"]["conversationId"],
+        p[1]["conversationState"]["conversationId"]
+    );
+    assert_ne!(
+        p[0]["conversationState"]["conversationId"],
+        p[2]["conversationState"]["conversationId"]
+    );
+}
+
+#[tokio::test]
+async fn non_streaming_returns_a_folded_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(
+        dir.path(),
+        vec![Ok(frames(&[
+            ("reasoningContentEvent", r#"{"text":"t","signature":"s"}"#),
+            ("assistantResponseEvent", r#"{"content":"42"}"#),
+            (
+                "toolUseEvent",
+                r#"{"toolUseId":"t1","name":"Read","input":"{\"p\":1}","stop":true}"#,
+            ),
+        ]))],
+    );
+    let r = app
+        .oneshot(messages_req(serde_json::json!({"model": "claude-opus-4-6", "max_tokens": 10, "stream": false, "thinking": {"type": "enabled"}, "messages": [{"role": "user", "content": "hi"}]})))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["type"], "message");
+    assert_eq!(v["model"], "claude-opus-4-6[1m]");
+    assert_eq!(v["content"][0]["type"], "thinking");
+    assert_eq!(v["content"][1]["text"], "42");
+    assert_eq!(v["content"][2]["name"], "Read");
+    assert_eq!(v["stop_reason"], "tool_use");
+}
+
+#[tokio::test]
+async fn request_validation_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(dir.path(), vec![]);
+    let r = app
+        .clone()
+        .oneshot(messages_req(
+            serde_json::json!({"model": "gpt-5.6-sol", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_string(r)
+            .await
+            .contains("gpt-5.6-sol is not in the kiro-trust catalog")
+    );
+    let r = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("x-api-key", TOKEN)
+                .body(Body::from("{not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let r = app
+        .clone()
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "messages": []}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(body_string(r).await.contains("messages must not be empty"));
+}
+
+#[tokio::test]
+async fn oversized_body_returns_the_error_envelope_not_axums_default_rejection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(dir.path(), vec![]);
+    let big = vec![b'a'; kiro_trust::server::MAX_BODY_BYTES + 1];
+    let r = app
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("x-api-key", TOKEN)
+                .body(Body::from(big))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::BAD_REQUEST,
+        "spec 5.6: 400 invalid_request_error, not axum's 413"
+    );
+    assert_eq!(r.headers()["content-type"], "application/json");
+    let body = body_string(r).await;
+    assert!(body.contains("\"invalid_request_error\""));
+    assert!(
+        !body.to_lowercase().contains("failed to buffer"),
+        "not axum's default text"
+    );
+}
+
+#[tokio::test]
+async fn upstream_errors_map_to_the_envelope() {
+    // Each scenario is scoped in its own block: `let (app, _) = app(...)`
+    // shadows the `app()` helper function for the rest of the enclosing
+    // scope, so a bare sequence of `let (app, _) = app(...)` statements
+    // would make the second call try to invoke the `Router` value from the
+    // first as a function.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let throttled = UpstreamError::new(
+            kiro_trust_kiro::UpstreamErrorKind::Throttled,
+            Some(429),
+            Some("ThrottlingException".into()),
+            "slow down",
+        );
+        let (app, _) = app(dir.path(), vec![Err(throttled)]);
+        let r = app
+            .oneshot(messages_req(
+                serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(body_string(r).await.contains("\"rate_limit_error\""));
+    }
+
+    // An exception frame before any output is an HTTP error; a throttling
+    // exception maps to 429.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, _) = app(
+            dir.path(),
+            vec![Ok(encode_exception_frame(
+                "ThrottlingException",
+                br#"{"message":"busy"}"#,
+            ))],
+        );
+        let r = app
+            .oneshot(messages_req(
+                serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // After output started, the failure is an SSE error event.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = frames(&[("assistantResponseEvent", r#"{"content":"part"}"#)]);
+        body.extend(encode_exception_frame(
+            "InternalServerException",
+            br#"{"message":"boom"}"#,
+        ));
+        let (app, _) = app(dir.path(), vec![Ok(body)]);
+        let r = app
+            .oneshot(messages_req(
+                serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let text = body_string(r).await;
+        assert!(text.contains("\"text\":\"part\""));
+        assert!(text.ends_with(
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"InternalServerException: boom\"}}\n\n"
+        ));
+    }
+}
+
+#[tokio::test]
+async fn retryable_invalid_state_clears_the_conversation_id_once() {
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let first = frames(&[(
+            "invalidStateEvent",
+            r#"{"reason":"STALE_CONVERSATION","message":"stale"}"#,
+        )]);
+        let second = frames(&[("assistantResponseEvent", r#"{"content":"ok"}"#)]);
+        let (app, scripted) = app(dir.path(), vec![Ok(first), Ok(second)]);
+        let r = app
+            .oneshot(messages_req(
+                serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(body_string(r).await.contains("\"text\":\"ok\""));
+        let p = scripted.payloads.lock().unwrap();
+        assert_eq!(p.len(), 2);
+        assert!(p[0]["conversationState"]["conversationId"].is_string());
+        assert!(p[1]["conversationState"].get("conversationId").is_none());
+    }
+
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = frames(&[(
+            "invalidStateEvent",
+            r#"{"reason":"SOMETHING_ELSE","message":"no"}"#,
+        )]);
+        let (app, _) = app(dir.path(), vec![Ok(bad)]);
+        let r = app
+            .oneshot(messages_req(
+                serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+    }
+}
+
+#[tokio::test]
+async fn local_stop_drops_the_rest_of_the_upstream() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(
+        dir.path(),
+        vec![Ok(frames(&[
+            ("assistantResponseEvent", r#"{"content":"one END two"}"#),
+            ("assistantResponseEvent", r#"{"content":"three"}"#),
+        ]))],
+    );
+    let r = app
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "stream": true, "stop_sequences": ["END"], "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    let text = body_string(r).await;
+    assert!(text.contains("\"text\":\"one \""));
+    assert!(!text.contains("three"));
+    assert!(text.contains("\"stop_sequence\":\"END\""));
+}
+
+#[tokio::test]
+async fn concurrency_cap_returns_429() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(Client::new(Policy::loopback_plain_http(1)).unwrap());
+    let tokens = Arc::new(TokenSource::new(test_db(dir.path()), net, None));
+    let scripted = Arc::new(Scripted {
+        responses: Mutex::new(vec![]),
+        payloads: Mutex::new(vec![]),
+    });
+    let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+    let state = Arc::new(AppState {
+        tokens,
+        upstream: scripted,
+        local_token: SecretString::from(TOKEN.to_string()),
+        limiter: limiter.clone(),
+        conversation_salt: [1u8; 16],
+    });
+    let app = build_router(state);
+    let _held = limiter.acquire().await.unwrap();
+    let r = app
+        .oneshot(messages_req(
+            serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn count_tokens_is_offline_and_validates_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, scripted) = app(dir.path(), vec![]);
+    let r = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/messages/count_tokens")
+                .header("x-api-key", TOKEN)
+                .body(Body::from(
+                    serde_json::json!({"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hello world"}]})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert!(v["input_tokens"].as_u64().unwrap() >= 3);
+    assert!(
+        scripted.payloads.lock().unwrap().is_empty(),
+        "no upstream call"
+    );
+    let r = app
+        .oneshot(
+            Request::post("/v1/messages/count_tokens")
+                .header("x-api-key", TOKEN)
+                .body(Body::from(
+                    serde_json::json!({"model": "nope", "messages": [{"role": "user", "content": "x"}]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+}
