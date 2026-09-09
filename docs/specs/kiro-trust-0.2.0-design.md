@@ -160,28 +160,49 @@ dropping. The trait's `accept` cannot return an error, so backpressure has to
 work by not accepting; that shape is why the semaphore sits before the accept
 call and not after it.
 
-`Listener::Io` becomes a wrapper holding the `TcpStream`, the permit, and a
-deadline. The permit releases when the wrapper drops. From accept, the wrapper
-fails the connection if no write has been attempted within
-`HEADER_READ_TIMEOUT` (15 s). The server writes only after parsing a complete
-request, so first-write is a sound proxy for "request received", and a client
-trickling header bytes trips the deadline. Once a write happens the deadline is
-disarmed, so a streaming response runs unbounded, as it must.
+`Listener::Io` becomes a `GuardedIo` wrapper holding the `TcpStream`, the
+permit, and a deadline. The permit releases when the wrapper drops. From accept,
+the wrapper fails the connection if the first request has not been parsed within
+`HEADER_READ_TIMEOUT` (15 s): while armed, `poll_read` races the stream against
+the deadline and returns `io::ErrorKind::TimedOut` when the deadline wins. A
+silent client and a client trickling header bytes both trip it.
+
+The first draft of this design disarmed on first response write, reasoning that
+the server writes only after parsing a request. The premise holds, but the
+conclusion does not: `/v1/messages` can legitimately wait on a credential
+refresh, on upstream response headers, and on `Pump::prime` for well over 15 s
+after the request is parsed, and a first-write deadline would cancel exactly
+those requests. The signal is therefore the parsed request itself.
+
+Axum already has that signal. It calls the make-service once per connection
+before hyper serves it, and it invokes middleware only after hyper has parsed a
+complete request. A cloneable `HeaderDeadline` holding an atomic armed flag
+travels from `GuardedIo` into a `ConnectionInfo` that implements
+`Connected<IncomingStream<'_, GuardedListener>>`, and an outer
+`headers_received` middleware disarms it. Nothing scans the byte stream for
+`\r\n\r\n`; hyper owns HTTP syntax, and a local scanner risks classifying an
+input form differently than hyper does. The bound covers the first request on
+each HTTP/1 connection; the connection cap covers the rest.
 
 `ListenerExt::tap_io` cannot do this: it lends `&mut Io` and cannot substitute
 a wrapper type. A hand-written `Listener` impl is required.
 
-`axum::serve` and the shutdown path stay untouched. That is deliberate: the
-drain ordering, the token-file deletion before the drain, and the deadline task
-that exits 0 are load-bearing and commented as such in
+`axum::serve` and the shutdown path change in one respect only: the router is
+served as `into_make_service_with_connect_info::<ConnectionInfo>()` so the
+middleware can reach the deadline handle. Everything else stays. That is
+deliberate: the drain ordering, the token-file deletion before the drain, and
+the deadline task that exits 0 are load-bearing and commented as such in
 `crates/kiro-trust/src/serve.rs`. This deviates from the backlog's suggested
 `hyper_util` accept loop, which would require rebuilding and re-reviewing all
 of it; the backlog entry is replaced by a spec section describing what shipped.
 
-One detail is unverified and gets confirmed before implementation: whether an
-`Io` wrapper returning an error from `poll_write` cleanly terminates the
-connection in axum 0.8.9's hyper integration, or whether the signal has to come
-through `poll_read`. That decides a detail of the wrapper, not the approach.
+The open question about which half of the wrapper carries the failure is
+settled: `poll_read` does. Read against axum 0.8.9, `serve` calls
+`make_service.call(IncomingStream { io: &io, remote_addr })` per accepted
+connection and then hands the same `io` to
+`serve_connection_with_upgrades`, so the connect-info path can capture the
+deadline handle, and a read error ends the connection through hyper's normal
+error path rather than through a write the server may never attempt.
 
 ## 7. Testing and review
 

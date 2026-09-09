@@ -630,7 +630,7 @@ or `security_logging.rs` (section 8.4).
 - No CORS headers. `OPTIONS` returns 405.
 - The listener is a `GuardedListener` implementing axum's `Listener` trait,
   wrapping `TcpListener`. It caps concurrent connections at `MAX_CONNECTIONS`
-  and fails a connection that has not produced a response write within
+  (32) and fails a connection whose first request has not been parsed within
   `HEADER_READ_TIMEOUT` (15 s). Both bounds cover what the `MAX_CONCURRENT`
   semaphore cannot: that semaphore bounds `/v1/messages` handlers, while these
   bound connections that never reach a handler.
@@ -638,15 +638,37 @@ or `security_logging.rs` (section 8.4).
   `accept` takes a semaphore permit before accepting, so at the cap the process
   stops accepting rather than accepting and dropping. The trait's `accept`
   cannot return an error, so backpressure has to work by not accepting; that is
-  why the permit is acquired ahead of the accept call. `Listener::Io` is a
-  wrapper holding the stream, the permit, and the deadline; the permit releases
-  when the wrapper drops.
+  why the permit is acquired ahead of the accept call. Accept errors retry on
+  axum's own policy: return immediately on a per-connection error, and log plus
+  sleep one second otherwise. `Listener::Io` is a `GuardedIo` wrapper holding
+  the stream, the permit, and the deadline; the permit releases when the wrapper
+  drops.
 
-  The deadline runs from accept until the first attempted response write. The
-  server writes only after parsing a complete request, so first write is a
-  sound proxy for "request received", and a client trickling header bytes trips
-  the deadline. Once a write happens the deadline is disarmed, so a streaming
-  response runs unbounded, as it must.
+  The deadline runs from accept until axum invokes the outer `headers_received`
+  middleware for the first parsed request on the connection. While the deadline
+  is armed, `GuardedIo::poll_read` races the stream against the deadline and
+  returns `io::ErrorKind::TimedOut` when the deadline wins, which ends the
+  connection. A silent client and a client trickling header bytes both trip it.
+  Writes never disarm it.
+
+  The signal is a parsed request, not a first response write. A first-write
+  deadline would kill valid slow requests: `/v1/messages` can wait on a
+  credential refresh, on upstream response headers, and on `Pump::prime` for
+  well over 15 s after hyper has parsed the request, and the proxy must not
+  cancel those. Nothing scans the byte stream for `\r\n\r\n`; hyper owns HTTP
+  syntax, and a local scanner could classify an input form differently than
+  hyper does.
+
+  The disarm path is a cloneable `HeaderDeadline` holding an atomic armed flag.
+  `ConnectionInfo { remote_addr, header_deadline }` implements
+  `Connected<IncomingStream<'_, GuardedListener>>` by reading
+  `IncomingStream::io()` and `remote_addr()`, so the router is served through
+  `into_make_service_with_connect_info::<ConnectionInfo>()`, and the outer
+  middleware disarms the deadline before running the inner stack. Axum calls
+  that middleware only after hyper has parsed a complete request, which is what
+  makes it a sound signal. The bound therefore applies to the first request on
+  each HTTP/1 connection; later requests on a kept-alive connection are covered
+  by the connection cap alone.
 
   `ListenerExt::tap_io` cannot express this: it lends `&mut Io` and cannot
   substitute a wrapper type, so the `Listener` impl is hand-written. This
@@ -654,7 +676,8 @@ or `security_logging.rs` (section 8.4).
   `axum::serve` and its graceful shutdown stay in place deliberately: the drain
   ordering, the token-file deletion before the drain, and the deadline task that
   exits 0 (section 4.1) are load-bearing, and rebuilding them to gain a
-  header deadline would trade a small exposure for a large one.
+  header deadline would trade a small exposure for a large one. Serving a
+  make-service with connect info is the only change to that call.
 
 ### 6.4 Logging
 
