@@ -39,6 +39,10 @@ pub fn build_history(msgs: &[Message], names: &mut ToolNameMap) -> Vec<HistoryEn
                     model_id: None,
                     origin: Some(ORIGIN_KIRO_CLI),
                     user_input_message_context: context,
+                    // Populated by the image-translation slice once the
+                    // `history_image_is_accepted` live gate (spec 5.3 step 6)
+                    // has passed; empty until then.
+                    images: vec![],
                     cache_point: None,
                 }));
             }
@@ -78,6 +82,8 @@ pub fn place_system_prompt(system: &str, history: Vec<HistoryEntry>) -> Vec<Hist
         model_id: None,
         origin: Some(ORIGIN_KIRO_CLI),
         user_input_message_context: None,
+        // The system prompt never carries an image (spec 5.3 step 4).
+        images: vec![],
         cache_point: None,
     }));
     out.push(HistoryEntry::AssistantResponseMessage(
