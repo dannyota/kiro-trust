@@ -750,7 +750,7 @@ not mean the forced-refresh path ran.
 
 `tests/fixtures/<case>/` holds:
 
-- `meta.json`: `{"source": "capture kiro-cli 2.21.1 2026-09-10" | "kirocc v0.11.1 <test name>", "features": ["text","stream","tool_use",...]}`
+- `meta.json`: `{"source": "capture kiro-cli 2.21.1 2026-09-10" | "kirocc v0.11.1 <test name>", "features": ["text","stream","tool_use",...], "stream": true|false}`
 - `request.json`: the Anthropic request as the client sent it
 - `expected-payload.json`: the Kiro payload kiro-trust must produce
 - `upstream.eventstream`: raw bytes from the runtime, when the case has a
@@ -788,8 +788,8 @@ symlink at one of these four names is never overwritten or followed:
 and reported by `audit` with exit 1.
 
 `cargo xtask scrub <capture-dir> <fixture-dir> --source "<text>" [--hostname
-<name>] [--home <path>]` replaces the profile ARN and account id with
-`arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE`, conversation
+<name>] [--home <path>] [--allow-truncated]` replaces the profile ARN and
+account id with `arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE`, conversation
 and utterance ids (collected from the request and the Kiro payload, wherever
 either key appears) with a fixed id, the home directory with `/home/user`
 (matched wherever it occurs, since it is specific enough that a mid-string
@@ -805,24 +805,40 @@ occurrence contains the label as a substring.
 The home directory and hostname default to `$HOME` and the `hostname`
 command's output; `--home`/`--hostname` override either explicitly. Detection
 failure aborts the scrub rather than silently scrubbing with an empty rule:
-an unset or empty `$HOME`, or a missing, failing, or non-UTF-8 `hostname`
-command, is a hard error naming the missing flag.
+an unset or empty `$HOME`, a missing, failing, or non-UTF-8 `hostname`
+command, or an explicitly empty `--home`/`--hostname` value, is a hard error
+naming the offending flag.
 
 It writes one case per captured request under `<fixture-dir>/<n>/`:
 `meta.json` (`source`, scrubbed like every other field; `features`; `stream`,
 the request's own streaming flag), `request.json`, `expected-payload.json`,
 `upstream.eventstream` (rewritten frame by frame, so a `messageMetadataEvent`
 payload's `conversationId` and `utteranceId` are scrubbed even if the runtime
-assigned an id that never appeared in the request; a frame whose payload does
-not parse as JSON, or a stream truncated or malformed mid-frame, aborts the
-scrub instead of publishing a partial result), and either `expected-sse.txt`
-(streaming, with `msg_` ids masked) or `expected-message.json` (non-streaming,
-the folded JSON body scrubbed) depending on that same flag, matching which
-file the fixture harness reads for the case (section 8.2). `scripts/check-fixtures.sh`
-fails when any file under `tests/fixtures/` contains a 12-digit account id,
-`arn:aws:` outside the fixture ARN, the owner's home path, an
-`aoa`-prefixed or `eyJ`-prefixed token-shaped string, or a `kiro.dev`
-hostname with a real region other than the fixture's.
+assigned an id that never appeared in the request), and either
+`expected-sse.txt` (streaming, with `msg_` ids masked) or
+`expected-message.json` (non-streaming, the folded JSON body scrubbed, its
+own `id` field overwritten with the fixture harness's fixed message id since
+that harness compares the non-streaming case unmasked) depending on that
+same flag, matching which file the fixture harness reads for the case
+(section 8.2).
+
+A frame whose payload does not parse as JSON, or a frame `next_frame` itself
+fails to decode (a CRC mismatch, for example), aborts the scrub instead of
+publishing the unparsed bytes unscrubbed: the frame boundaries are
+untrustworthy at that point, so every later frame is lost regardless, and
+this is the one case where a partial result would be a leak. A stream
+truncated mid-frame is different: the incomplete tail is never written to
+any output, so there is nothing to leak. By default it still aborts, so an
+operator does not get a silently partial `upstream.eventstream` by accident,
+naming `--allow-truncated` as the remedy; with that flag the scrub instead
+writes the complete frames decoded so far and prints a warning to stderr
+naming the file and the pending byte count. This makes the "cancellation
+mid-stream" and "truncated stream" fixture cases (section 8.2) reachable.
+
+`scripts/check-fixtures.sh` fails when any file under `tests/fixtures/`
+contains a 12-digit account id, `arn:aws:` outside the fixture ARN, the
+owner's home path, an `aoa`-prefixed or `eyJ`-prefixed token-shaped string,
+or a `kiro.dev` hostname with a real region other than the fixture's.
 
 Fixtures are public. Record only marker prompts (`kiro-trust fixture probe:
 ...`) so no real source code enters the repository.

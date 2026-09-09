@@ -45,6 +45,15 @@ fn make_synthetic_db(path: &str) {
 const FIXTURE_ARN: &str = "arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE";
 const FIXTURE_CONVERSATION_ID: &str = "00000000-0000-4000-8000-00000000c0ff";
 
+// A fourth hand-kept copy (task-21-fix-2 Minor 2), of
+// `crates/kiro-trust-tests/src/lib.rs`'s `FIXTURE_MESSAGE_ID`. The fixture
+// harness's non-streaming comparison rebuilds the whole message with this
+// literal id and compares it unmasked (`fixtures.rs`'s `run_case`), unlike
+// the streaming comparison, which masks both sides to a shared placeholder
+// before comparing (`mask_msg_ids` below). So the id `expected-message.json`
+// carries must be this exact string, not a generic mask.
+const FIXTURE_MESSAGE_ID: &str = "msg_fixture000000000000000";
+
 pub struct ScrubRules {
     pub home: String,
     pub hostname: String,
@@ -282,14 +291,29 @@ fn scrub_frame_payload(
 /// `:content-type` carry no identity (spec 7.5), and spec 8.3 only asks
 /// for the payload to be scrubbed.
 ///
-/// A malformed frame or a stream truncated mid-frame aborts the scrub
-/// rather than returning the frames decoded so far behind a printed
-/// warning (task-21-fix-1 Important 3's principle, applied to this whole
-/// function and not only the payload-JSON case it names): writing out a
-/// partial result under a warning that is easy to miss in a long scrub run
-/// is the same silent partial-processing this round of fixes exists to
-/// close.
-fn scrub_eventstream(raw: &[u8], rules: &ScrubRules) -> Vec<u8> {
+/// A malformed frame always aborts the scrub rather than returning the
+/// frames decoded so far behind a printed warning (task-21-fix-1 Important
+/// 3): `next_frame` does not advance past a frame it fails to decode, so
+/// every later frame is lost regardless, and a CRC failure means the frame
+/// boundaries themselves are untrustworthy; the unparsed bytes would
+/// otherwise reach the fixture unscrubbed, which is the leak this function
+/// exists to prevent.
+///
+/// A stream truncated mid-frame is not the same shape (task-21-fix-2
+/// Important, reversing task-21-fix-1's extension of the same principle to
+/// this path): the incomplete tail stays in `decoder`'s buffer and is never
+/// written to `out`, so there is no partial result to leak. Without
+/// `allow_truncated` this still aborts, naming `--allow-truncated` as the
+/// remedy, because leaving it unconditional made spec 8.2's "cancellation
+/// mid-stream" and "truncated stream" fixture cases unreachable. With
+/// `allow_truncated`, the complete frames already in `out` are returned and
+/// a warning goes to stderr. `path` names the source file in both messages.
+fn scrub_eventstream(
+    raw: &[u8],
+    rules: &ScrubRules,
+    path: &Path,
+    allow_truncated: bool,
+) -> Vec<u8> {
     let mut decoder = FrameDecoder::new();
     decoder.push(raw);
     let mut out = Vec::new();
@@ -312,12 +336,21 @@ fn scrub_eventstream(raw: &[u8], rules: &ScrubRules) -> Vec<u8> {
             ),
         }
     }
-    decoder.finish().unwrap_or_else(|e| {
-        panic!(
-            "cannot scrub eventstream: the capture ended with a truncated frame ({e}); a \
-             partially scrubbed stream must not be published"
-        )
-    });
+    if let Err(e) = decoder.finish() {
+        if allow_truncated {
+            eprintln!(
+                "warning: {} ended with a truncated frame ({e}); writing the {index} complete \
+                 frame(s) decoded so far",
+                path.display()
+            );
+        } else {
+            panic!(
+                "cannot scrub eventstream: {} ended with a truncated frame ({e}); pass \
+                 --allow-truncated to write the complete frames and continue",
+                path.display()
+            );
+        }
+    }
     out
 }
 
@@ -344,9 +377,13 @@ fn detect_hostname() -> Option<String> {
 /// `$HOME`. Aborts rather than scrubbing with an empty rule (task-21-fix-1
 /// Important 1): a missing or empty `$HOME` used to become
 /// `unwrap_or_default()`, so a scrub could silently skip the home-path
-/// rule with no output anywhere in the pipeline.
+/// rule with no output anywhere in the pipeline. An explicit `--home ""`
+/// is rejected the same way (task-21-fix-2 Minor 3): the previous round
+/// closed the detection-failure path but let a deliberately empty override
+/// through unchallenged.
 fn resolve_home(override_home: Option<&str>, home_env: Option<String>) -> String {
     if let Some(h) = override_home {
+        assert!(!h.is_empty(), "--home cannot be empty");
         return h.to_string();
     }
     match home_env {
@@ -361,9 +398,12 @@ fn resolve_home(override_home: Option<&str>, home_env: Option<String>) -> String
 /// Resolve the hostname to scrub: an explicit `--hostname` wins, else
 /// `hostname` command detection. Aborts rather than scrubbing with an
 /// empty rule (task-21-fix-1 Important 1): a failed detection used to
-/// become an empty string that the caller then skipped silently.
+/// become an empty string that the caller then skipped silently. An
+/// explicit `--hostname ""` is rejected the same way (task-21-fix-2 Minor
+/// 3).
 fn resolve_hostname(override_hostname: Option<&str>, detected: Option<String>) -> String {
     if let Some(h) = override_hostname {
+        assert!(!h.is_empty(), "--hostname cannot be empty");
         return h.to_string();
     }
     detected.unwrap_or_else(|| {
@@ -380,6 +420,7 @@ fn scrub_capture_dir(
     source: &str,
     home: &str,
     hostname: &str,
+    allow_truncated: bool,
 ) {
     let mut requests: Vec<PathBuf> = std::fs::read_dir(capture_dir)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", capture_dir.display()))
@@ -482,7 +523,7 @@ fn scrub_capture_dir(
                 .unwrap_or_else(|e| panic!("cannot read {}: {e}", upstream_path.display()));
             std::fs::write(
                 case_dir.join("upstream.eventstream"),
-                scrub_eventstream(&raw, &rules),
+                scrub_eventstream(&raw, &rules, &upstream_path, allow_truncated),
             )
             .unwrap();
         }
@@ -494,13 +535,25 @@ fn scrub_capture_dir(
                 let scrubbed = mask_msg_ids(&scrub_string(&text, &rules));
                 std::fs::write(case_dir.join("expected-sse.txt"), scrubbed).unwrap();
             } else {
-                let v: Value = serde_json::from_str(&text).unwrap_or_else(|e| {
+                let mut v: Value = serde_json::from_str(&text).unwrap_or_else(|e| {
                     panic!(
                         "{} is not valid JSON (a non-streaming capture's response is the \
                          folded JSON body): {e}",
                         response_path.display()
                     )
                 });
+                // The harness rebuilds this message with FIXTURE_MESSAGE_ID
+                // and compares unmasked (task-21-fix-2 Minor 2), so the
+                // captured id must be overwritten with that exact literal,
+                // not a placeholder like the streaming branch's mask.
+                if let Value::Object(m) = &mut v
+                    && m.contains_key("id")
+                {
+                    m.insert(
+                        "id".to_string(),
+                        Value::String(FIXTURE_MESSAGE_ID.to_string()),
+                    );
+                }
                 write_json(
                     &case_dir.join("expected-message.json"),
                     &scrub_value(v, &rules),
@@ -526,7 +579,7 @@ fn main() {
         }
         Some("scrub") => {
             let usage = "usage: cargo xtask scrub <capture-dir> <fixture-dir> --source \"<text>\" \
-                          [--hostname <name>] [--home <path>]";
+                          [--hostname <name>] [--home <path>] [--allow-truncated]";
             let capture_dir = args.get(1).unwrap_or_else(|| panic!("{usage}"));
             let fixture_dir = args.get(2).unwrap_or_else(|| panic!("{usage}"));
             let source = args
@@ -545,6 +598,13 @@ fn main() {
                 .iter()
                 .position(|a| a == "--home")
                 .and_then(|i| args.get(i + 1));
+            // Explicit opt-in to writing a truncated capture's complete
+            // frames (task-21-fix-2 Important): spec 8.2 needs "cancellation
+            // mid-stream" and "truncated stream" fixture cases, which an
+            // unconditional abort made unreachable, but the default stays
+            // an abort so an operator never gets a silently partial
+            // eventstream without asking for one.
+            let allow_truncated = args.iter().any(|a| a == "--allow-truncated");
             let home = resolve_home(home_arg.map(String::as_str), std::env::var("HOME").ok());
             let hostname = resolve_hostname(hostname_arg.map(String::as_str), detect_hostname());
             scrub_capture_dir(
@@ -553,11 +613,12 @@ fn main() {
                 source,
                 &home,
                 &hostname,
+                allow_truncated,
             );
         }
         other => {
             eprintln!(
-                "usage: cargo xtask <check-versions|make-db <path>|scrub <capture-dir> <fixture-dir> --source \"<text>\" [--hostname <name>] [--home <path>]>; got {other:?}"
+                "usage: cargo xtask <check-versions|make-db <path>|scrub <capture-dir> <fixture-dir> --source \"<text>\" [--hostname <name>] [--home <path>] [--allow-truncated]>; got {other:?}"
             );
             std::process::exit(2);
         }
@@ -746,6 +807,14 @@ mod tests {
         resolve_home(None, Some(String::new()));
     }
 
+    // Minor 3: an explicit but empty override must not silently disable
+    // the rule either, not only a failed detection.
+    #[test]
+    #[should_panic(expected = "--home")]
+    fn resolve_home_aborts_on_an_explicit_empty_override() {
+        resolve_home(Some(""), Some("/from/env".to_string()));
+    }
+
     #[test]
     fn resolve_hostname_prefers_override_then_detected() {
         assert_eq!(
@@ -762,6 +831,14 @@ mod tests {
     #[should_panic(expected = "--hostname")]
     fn resolve_hostname_aborts_when_neither_is_available() {
         resolve_hostname(None, None);
+    }
+
+    // Minor 3: an explicit but empty override must not silently disable
+    // the rule either, not only a failed detection.
+    #[test]
+    #[should_panic(expected = "--hostname")]
+    fn resolve_hostname_aborts_on_an_explicit_empty_override() {
+        resolve_hostname(Some(""), Some("detected-host".to_string()));
     }
 
     #[test]
@@ -810,7 +887,7 @@ mod tests {
         ]
         .concat();
 
-        let out = scrub_eventstream(&raw, &rules);
+        let out = scrub_eventstream(&raw, &rules, Path::new("0001-upstream.eventstream"), false);
 
         // Assert on the re-encoded bytes, decoding them back, so the test
         // covers push_header/encode_frame (the encode half) too, not only
@@ -844,21 +921,81 @@ mod tests {
             conversation_ids: vec![],
         };
         let raw = encode_event_frame("assistantResponseEvent", b"not json");
-        scrub_eventstream(&raw, &rules);
+        scrub_eventstream(&raw, &rules, Path::new("test.eventstream"), false);
     }
 
+    // Minor 1: the malformed-frame abort (next_frame itself returning Err)
+    // had no test; the test above only exercises scrub_frame_payload's own
+    // JSON-parse abort, and the old truncated-stream test below left a
+    // 12-byte prelude intact so next_frame returned Ok(None) and only
+    // finish() ever errored. Corrupt a byte inside the payload so the
+    // message CRC fails while the prelude CRC (computed over the first 8
+    // bytes only) still matches, which forces next_frame's own Err branch.
+    // Pass allow_truncated: true to show the flag has no effect here: a
+    // malformed frame aborts unconditionally.
     #[test]
-    #[should_panic(expected = "truncated frame")]
-    fn scrub_eventstream_aborts_on_a_truncated_stream() {
+    #[should_panic(expected = "malformed frame")]
+    fn scrub_eventstream_aborts_on_a_corrupted_frame() {
         let rules = ScrubRules {
             home: String::new(),
             hostname: String::new(),
             conversation_ids: vec![],
         };
-        let full = encode_event_frame("assistantResponseEvent", br#"{"content":"hi"}"#);
-        // Cut the frame in half: an incomplete frame at end of input.
-        let truncated = &full[..full.len() / 2];
-        scrub_eventstream(truncated, &rules);
+        let mut corrupted = encode_event_frame("assistantResponseEvent", br#"{"content":"hi"}"#);
+        let last_payload_byte = corrupted.len() - 5; // before the trailing 4-byte message CRC
+        corrupted[last_payload_byte] ^= 0xFF;
+        scrub_eventstream(&corrupted, &rules, Path::new("test.eventstream"), true);
+    }
+
+    // Important (fix round 2): a stream truncated mid-frame still aborts by
+    // default, but the panic now names --allow-truncated as the remedy
+    // (reversing task-21-fix-1's extension of the malformed-frame abort to
+    // this drop-through case: the incomplete tail is never written either
+    // way, so there is no leak an abort prevents here).
+    #[test]
+    #[should_panic(expected = "--allow-truncated")]
+    fn scrub_eventstream_aborts_on_a_truncated_stream_without_the_flag() {
+        let rules = ScrubRules {
+            home: String::new(),
+            hostname: String::new(),
+            conversation_ids: vec![],
+        };
+        let raw = truncated_stream_fixture();
+        scrub_eventstream(&raw, &rules, Path::new("0001-upstream.eventstream"), false);
+    }
+
+    // With --allow-truncated, the complete frame ahead of the truncated tail
+    // is written and the output decodes to exactly that one frame.
+    #[test]
+    fn scrub_eventstream_with_allow_truncated_writes_the_complete_frames() {
+        let rules = ScrubRules {
+            home: String::new(),
+            hostname: String::new(),
+            conversation_ids: vec![],
+        };
+        let raw = truncated_stream_fixture();
+        let out = scrub_eventstream(&raw, &rules, Path::new("0001-upstream.eventstream"), true);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&out);
+        let first = decoder.next_frame().unwrap().unwrap();
+        assert_eq!(first.event_type(), Some("assistantResponseEvent"));
+        let first_json: Value = serde_json::from_slice(&first.payload).unwrap();
+        assert_eq!(first_json["content"], "hi");
+        assert!(decoder.next_frame().unwrap().is_none());
+        decoder.finish().unwrap();
+    }
+
+    /// A complete frame followed by a second frame cut in half: an
+    /// incomplete frame at end of input, used by both truncated-stream
+    /// tests above.
+    fn truncated_stream_fixture() -> Vec<u8> {
+        let complete = encode_event_frame("assistantResponseEvent", br#"{"content":"hi"}"#);
+        let second_full =
+            encode_event_frame("messageMetadataEvent", br#"{"conversationId":"real-conv"}"#);
+        let mut raw = complete;
+        raw.extend_from_slice(&second_full[..second_full.len() / 2]);
+        raw
     }
 
     #[test]
@@ -868,7 +1005,10 @@ mod tests {
             hostname: String::new(),
             conversation_ids: vec![],
         };
-        assert_eq!(scrub_eventstream(&[], &rules), Vec::<u8>::new());
+        assert_eq!(
+            scrub_eventstream(&[], &rules, Path::new("test.eventstream"), false),
+            Vec::<u8>::new()
+        );
     }
 
     // Important 4: an utteranceId is session-linkable like a conversation
@@ -1005,6 +1145,7 @@ mod tests {
             "capture kiro-cli 2.21.1 2026-09-09 from /home/someone",
             "/home/someone",
             "laptop.local",
+            false,
         );
 
         let case_dir = fixtures.path().join("0001");
@@ -1081,6 +1222,7 @@ mod tests {
             "capture test",
             "/home/x",
             "host.example.com",
+            false,
         );
 
         let case_dir = fixtures.path().join("0001");
@@ -1092,5 +1234,12 @@ mod tests {
         let meta: Value =
             serde_json::from_slice(&std::fs::read(case_dir.join("meta.json")).unwrap()).unwrap();
         assert_eq!(meta["stream"], false);
+        // Minor 2: the harness rebuilds this message with FIXTURE_MESSAGE_ID
+        // and compares it unmasked, so the written id must be that exact
+        // literal, not the captured "msg_real".
+        let expected_message: Value =
+            serde_json::from_slice(&std::fs::read(case_dir.join("expected-message.json")).unwrap())
+                .unwrap();
+        assert_eq!(expected_message["id"], FIXTURE_MESSAGE_ID);
     }
 }
