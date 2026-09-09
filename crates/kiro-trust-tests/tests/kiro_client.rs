@@ -217,6 +217,30 @@ async fn retries_throttling_server_errors_and_json_exceptions_but_not_client_err
     assert_eq!(err.kind, UpstreamErrorKind::Auth);
 }
 
+// A 403 on the last of the three attempts must not extend the loop to a
+// fourth request: the general three-attempt bound wins over the 403 retry.
+#[tokio::test]
+async fn mixed_retries_never_exceed_three_requests() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(Sequence(std::sync::Mutex::new(vec![
+            ResponseTemplate::new(500).set_body_string("{\"__type\":\"InternalServerException\"}"),
+            ResponseTemplate::new(500).set_body_string("{\"__type\":\"InternalServerException\"}"),
+            ResponseTemplate::new(403),
+        ])))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let err = client(&server, dir.path(), false)
+        .await
+        .generate(&payload())
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, UpstreamErrorKind::Auth);
+    assert_eq!(err.status, Some(403));
+}
+
 #[tokio::test]
 async fn error_messages_are_capped_at_1_kib() {
     let server = MockServer::start().await;

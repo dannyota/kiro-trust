@@ -188,8 +188,8 @@ impl Upstream for KiroClient {
                     ));
                 }
                 403 => {
-                    if !refreshed {
-                        self.tokens.invalidate().await;
+                    self.tokens.invalidate().await;
+                    if !refreshed && !last {
                         refreshed = true;
                         tracing::info!(
                             attempt,
@@ -201,7 +201,7 @@ impl Upstream for KiroClient {
                         UpstreamErrorKind::Auth,
                         Some(403),
                         None,
-                        "runtime rejected the credential after a refresh",
+                        "runtime rejected the credential",
                     ));
                 }
                 status @ (429 | 500..=599) => {
