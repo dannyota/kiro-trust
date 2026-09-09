@@ -11,7 +11,11 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.13"
 arbitrary = { version = "1.4.2", features = ["derive"] }
 kiro-trust-protocol = { path = "../crates/kiro-trust-protocol" }
-serde_json = "1"
+# preserve_order: relied on through feature unification with the path
+# dependency above (spec 7.6 needs it for wire field order); declared
+# explicitly so that dependence doesn't rest on unification alone (fix-1
+# minor 7).
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [[bin]]
 name = "frame_decode"

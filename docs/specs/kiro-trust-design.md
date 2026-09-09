@@ -884,12 +884,47 @@ connection)
 
 ### 8.5 Fuzz targets
 
-`fuzz/fuzz_targets/`: `frame_decode` (bytes → frames), `event_parse`
-(frame → `Event`), `sse_translate` (event sequence → SSE, asserting no panic
-and block state invariants), `anthropic_request` (bytes → `Request`),
-`tool_input_accumulate` (fragment sequences). Seeds come from the fixtures. A
-weekly CI job runs each for five minutes; a crash file is committed as a
-regression fixture.
+`fuzz/fuzz_targets/`:
+
+- `frame_decode` (bytes → frames). Generates structurally valid, possibly
+  multi-frame streams through the crate's own header/frame encoder, with a
+  fuzzer-chosen `(index, byte)` corruption and a trailing-byte truncation
+  spliced in, plus a raw-bytes fallback mode for shapes the generator can't
+  easily construct on purpose (an inconsistent total/headers length, bytes
+  that never form a valid prelude at all). It is not seeded: a mutated seed
+  dies at the message CRC exactly as a random one dies at the prelude CRC, so
+  a corpus buys nothing the in-process generator doesn't already give.
+- `event_parse` (frame → `Event`). Draws the event type from the six literals
+  `EventParser::parse` dispatches on (`eventstream.rs:368-424`) plus a
+  free-form escape hatch that keeps the unknown-type fallthrough reachable,
+  and builds each payload as a JSON object carrying the exact keys that event
+  type reads.
+- `sse_translate` (event sequence → SSE). Runs every emitted `StreamEvent`
+  through `sse::encode` and asserts no panic, the block-state invariants
+  (open/close ordering, strictly increasing indices, deltas targeting the
+  open block), that the stream starts with `MessageStart`, and that it ends
+  with exactly one `MessageStop` and nothing after it.
+- `anthropic_request` (bytes → `Request`). The one target seeded from
+  fixtures: the CI workflow copies `tests/fixtures/*/request.json` into
+  `fuzz/corpus/anthropic_request/` before each run. `tests/fixtures/` is the
+  only seed source anywhere in this project; a capture directory is never
+  one.
+- `tool_input_accumulate` (fragment sequences), payloads built the same way
+  as `event_parse`'s.
+
+A weekly CI job runs each target for five minutes on the nightly toolchain,
+selected explicitly (`RUSTUP_TOOLCHAIN: nightly`): `dtolnay/rust-toolchain`
+only runs `rustup default`, and `rust-toolchain.toml` outranks that for every
+directory under the repository, `fuzz/` included, so cargo-fuzz's
+nightly-only sanitizer flags need the override or the job silently resolves
+to the pinned stable toolchain and fails outright. On failure the workflow
+uploads `fuzz/artifacts` only, never `fuzz/corpus`: a crash file is a
+regression fixture worth minimizing and committing, but the corpus is
+disposable per-run mutation state, and uploading it to a public artifact
+store risks it accumulating a real captured payload over time. A pull-request
+job (`fuzz-check`) runs `cargo check --manifest-path fuzz/Cargo.toml --locked
+--all-targets` on the stable toolchain, so a `kiro-trust-protocol` signature
+break is caught immediately rather than only on the next Monday.
 
 ### 8.6 Live tier
 
@@ -942,6 +977,10 @@ account.
    comparing, because it changes on every build and so can never match a
    committed fixture; what remains is compared with
    `tests/fixtures/db/idc-audit.json`.
+9. `fuzz-check`: `cargo check --manifest-path fuzz/Cargo.toml --locked
+   --all-targets` (8.5), on the stable toolchain since it only needs to
+   type-check, not build the sanitizer-instrumented binaries the weekly
+   `fuzz.yml` job does.
 
 `tests/fixtures/db/idc.sqlite3` is a synthetic database built by
 `cargo xtask make-db` with placeholder values; it is not a scrubbed copy.

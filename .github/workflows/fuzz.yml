@@ -15,6 +15,14 @@ jobs:
       fail-fast: false
       matrix:
         target: [frame_decode, event_parse, sse_translate, anthropic_request, tool_input_accumulate]
+    env:
+      # dtolnay/rust-toolchain only runs `rustup default`, and
+      # rust-toolchain.toml outranks that for every directory under the
+      # repository (fuzz/ included), so cargo-fuzz's nightly-only sanitizer
+      # flags need an explicit override here (fix-1 Critical 1). Set at the
+      # job level so it covers both `cargo install cargo-fuzz` and
+      # `cargo fuzz run` without repeating `+nightly` on each.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -24,10 +32,26 @@ jobs:
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked
+      # anthropic_request's corpus isn't cached or committed (spec 8.5); it
+      # is rebuilt from the fixtures fresh on every run, matrix leg
+      # included that doesn't use it, since only tests/fixtures/*/
+      # request.json is ever a seed source, never a capture directory.
+      - name: Seed anthropic_request corpus from fixtures
+        if: matrix.target == 'anthropic_request'
+        run: |
+          mkdir -p fuzz/corpus/anthropic_request
+          for f in tests/fixtures/*/request.json; do
+            cp "$f" "fuzz/corpus/anthropic_request/$(basename "$(dirname "$f")").json"
+          done
       - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300
         working-directory: fuzz
       - if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: fuzz-artifacts-${{ matrix.target }}
+          # Artifacts only, never fuzz/corpus (spec 8.5): a crash file is a
+          # regression fixture to commit after minimizing; the corpus is
+          # disposable per-run mutation state, and uploading it to a public
+          # artifact store would risk seeding it with a real captured
+          # payload down the line.
           path: fuzz/artifacts

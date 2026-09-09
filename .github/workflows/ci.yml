@@ -75,3 +75,24 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories bans licenses sources
+
+  fuzz-check:
+    # fuzz/ is excluded from the workspace, so nothing above touches it:
+    # a kiro-trust-protocol signature change would otherwise only be
+    # caught by the weekly fuzz.yml job (task-22-fix-1.md Important 1).
+    # A plain `cargo check` on the stable, already-pinned toolchain is
+    # enough to catch that: cargo-fuzz's nightly-only sanitizer flags
+    # (see fuzz.yml) are a build-time instrumentation concern, not a
+    # type-checking one, so this doesn't need nightly or cargo-fuzz
+    # installed, and stays fast on every pull request. It also gives
+    # fuzz/Cargo.lock a reason to stay accurate, via --locked.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: fuzz
+      - run: cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets
