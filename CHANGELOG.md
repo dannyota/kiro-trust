@@ -2,7 +2,9 @@
 
 All notable changes to kiro-trust. Dates are UTC.
 
-## Unreleased
+## 0.1.0 - 2026-09-09
+
+First release.
 
 - `kiro-trust serve`: a loopback Anthropic Messages API proxy for Claude
   Code. It reads the Kiro CLI's AWS IAM Identity Center credential
