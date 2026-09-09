@@ -475,6 +475,59 @@ mod tests {
         assert!(!json.contains("000000000000"));
     }
 
+    #[test]
+    fn report_abbreviates_the_home_directory_in_both_the_path_and_the_problem() {
+        let home = real_home();
+        if !is_usable_home(&home) {
+            return;
+        }
+        let db_path = Path::new(&home).join("kiro-trust-wiring-check.sqlite3");
+        let args = AuditArgs {
+            json: false,
+            listen: "127.0.0.1:3456".into(),
+            kiro_db: Some(db_path),
+            runtime_region: None,
+            token_file: None,
+            share_content: false,
+        };
+        let r = report(&args).unwrap();
+        assert!(
+            r.credential_source.path.starts_with('~'),
+            "credential_source.path should start with ~, got: {}",
+            r.credential_source.path
+        );
+        assert!(
+            !r.credential_source.path.contains("/home/"),
+            "credential_source.path contains /home/: {}",
+            r.credential_source.path
+        );
+        assert!(
+            !r.credential_source.path.contains("\\Users\\"),
+            "credential_source.path contains \\Users\\: {}",
+            r.credential_source.path
+        );
+        assert!(
+            !r.credential_source.path.contains(&home),
+            "credential_source.path contains the home directory"
+        );
+        let problems_str = r.problems.join("|");
+        assert!(
+            !problems_str.contains(&home),
+            "problems contain the home directory: {}",
+            problems_str
+        );
+        assert!(
+            !problems_str.contains("/home/"),
+            "problems contain /home/: {}",
+            problems_str
+        );
+        assert!(
+            !problems_str.contains("\\Users\\"),
+            "problems contain \\Users\\: {}",
+            problems_str
+        );
+    }
+
     // task-20-fix-1.md minor 1: split from the old `problems_make_audit_fail`,
     // which set both a non-loopback `--listen` and `--share-content` and
     // asserted exit 1, so it never proved which condition caused the
