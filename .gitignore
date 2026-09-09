@@ -36,5 +36,6 @@ scratch/
 .DS_Store
 Thumbs.db
 
-# Track the agent guidance file despite the global ignore default.
+# Track the repo instructions and their import despite the global ignore default.
+!AGENTS.md
 !CLAUDE.md

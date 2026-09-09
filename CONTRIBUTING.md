@@ -61,5 +61,5 @@ Maintainers only: `docs/releasing.md`.
 
 ## Agents
 
-Agent guidance lives in the tracked `CLAUDE.md`. Durable rules belong in this
+Agent guidance lives in the tracked `AGENTS.md`. Durable rules belong in this
 file or the spec.

@@ -25,7 +25,7 @@ it. Change 3's live tests are the first chance to measure; the implementation
 reports a count and does not act on it.
 
 Four backlog items are closed as decided-no rather than deferred: proxy-side
-Tool Search, `models sync`, social login, and Kiro API keys. `CLAUDE.md`
+Tool Search, `models sync`, social login, and Kiro API keys. `AGENTS.md`
 forbids porting each, and each would add a trust boundary (a second credential
 type) or a new outbound host, which spec 6.2 and 6.5 rule out. Removing them
 from the backlog stops that table implying they are scheduled.
@@ -139,7 +139,7 @@ then runs the child with `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` in its
 environment and nothing else changed. The token never reaches a shell, a log,
 or an error path, which is the point: it is `env` without the shell round trip.
 
-This adds a sixth `expose_secret()` site to the enumerated list in `CLAUDE.md`
+This adds a sixth `expose_secret()` site to the enumerated list in `AGENTS.md`
 and spec 6.2, with the same justification `env` carries: handing the token to
 the child process is the command's whole purpose, and there is no way to
 implement it without one. On Unix it `exec`s, so no wrapper process lingers;
@@ -189,7 +189,7 @@ Per change: unit tests in `kiro-trust-protocol` for every validation branch, a
 server test per 400, and a recorded fixture only where a capture is needed
 (change 3 may warrant one, recorded per spec 8.3 with a marker prompt and
 scrubbed). `security_logging.rs` gains a case asserting that no image bytes,
-media type, or count reaches a log line. The full gate list in `CLAUDE.md` runs
+media type, or count reaches a log line. The full gate list in `AGENTS.md` runs
 before each merge.
 
 Changes 4, 5, and 6 touch the local token, the network policy, and the

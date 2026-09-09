@@ -60,7 +60,7 @@ Section 13 lists the backlog with the reason each item was deferred.
 Four of those out-of-scope items are closed decisions rather than schedule
 slips, and 0.2.0 removed them from the backlog so that table stops implying
 they are coming: proxy-side Tool Search, `models sync`, social login, and Kiro
-API keys. `CLAUDE.md` forbids porting each. Social login and API keys would add
+API keys. `AGENTS.md` forbids porting each. Social login and API keys would add
 a second credential type, widening the trust boundary this project exists to
 keep narrow; `models sync` and Tool Search would add an outbound host and
 server-tool emulation, and section 6.5 bans model discovery outright, flag or
@@ -87,7 +87,7 @@ section 8.6).
 | `count_tokens` | deterministic local estimate | tiktoken: a tokenizer dependency plus data files for an approximation either way |
 | Local token transport | `ANTHROPIC_AUTH_TOKEN` (Bearer) or `ANTHROPIC_API_KEY` (`x-api-key`), both accepted | Bearer only: Claude Code picks the header from whichever variable is set |
 | Distribution | GitHub Releases with attestations and SBOM, plus owner-dispatched crates.io publish | GitHub only: the owner wants `cargo install kiro-trust` |
-| Agent guidance | tracked `CLAUDE.md` holding the rules directly | `AGENTS.md` plus import: the owner asked for one file here |
+| Agent guidance | tracked `AGENTS.md` holds the rules; `CLAUDE.md` contains `@AGENTS.md` | duplicated rules in both files can drift |
 
 ## 3. Architecture
 
@@ -1073,7 +1073,7 @@ connection)
   that named no real tests: all three conditions live in this one test)
 - `no_url_in_net_api`: unpinned. No test or CI script currently enforces
   that `Destination` is the only host input in `kiro-trust-net`'s public
-  API; it holds today by code review against CLAUDE.md's architecture rules
+  API; it holds today by code review against AGENTS.md's architecture rules
   and spec 3.2 alone (final-fix-2.md Important 4)
 - `binary_has_no_dev_features`: `cargo tree -e features -p kiro-trust`
   contains neither `capture` nor `test-endpoints` (script in CI). The check
