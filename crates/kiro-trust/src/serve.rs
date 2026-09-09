@@ -28,6 +28,20 @@ pub async fn run(cfg: ServeConfig) -> Result<(), String> {
     ));
     let upstream = Arc::new(KiroClient::new(net, tokens.clone(), cfg.share_content));
 
+    #[cfg(feature = "capture")]
+    let capture = match &cfg.capture_dir {
+        Some(dir) => {
+            let handle = crate::server::capture::Capture::new(dir)
+                .map_err(|e| format!("cannot create capture directory {}: {e}", dir.display()))?;
+            eprintln!(
+                "kiro-trust: capture enabled, writing prompts and responses to {}",
+                dir.display()
+            );
+            Some(Arc::new(handle))
+        }
+        None => None,
+    };
+
     let (local_token, wrote_file) = match cfg.explicit_token.clone() {
         Some(t) => (t, false),
         None => {
@@ -55,6 +69,8 @@ pub async fn run(cfg: ServeConfig) -> Result<(), String> {
         local_token,
         limiter: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)),
         conversation_salt: salt,
+        #[cfg(feature = "capture")]
+        capture,
     });
 
     let listener = match tokio::net::TcpListener::bind(cfg.listen).await {

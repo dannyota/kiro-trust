@@ -45,6 +45,15 @@ pub struct Pump {
     /// instead of reading the stream again. `ResponseTranslator::failure`
     /// plays the same role for an upstream `Failure`.
     broken: Option<UpstreamError>,
+    /// Raw upstream bytes, appended to as they arrive (spec 8.3 capture).
+    /// Absent unless built with the `capture` feature.
+    #[cfg(feature = "capture")]
+    pub raw: Vec<u8>,
+    /// Per-request capture state set by `server::messages`; consumed and
+    /// recorded once the response is complete. Absent unless built with the
+    /// `capture` feature.
+    #[cfg(feature = "capture")]
+    pub capture: Option<crate::server::capture::CaptureState>,
 }
 
 impl Pump {
@@ -60,6 +69,10 @@ impl Pump {
             frames: 0,
             ended: false,
             broken: None,
+            #[cfg(feature = "capture")]
+            raw: Vec::new(),
+            #[cfg(feature = "capture")]
+            capture: None,
         }
     }
 
@@ -110,7 +123,11 @@ impl Pump {
                 self.broken = Some(e.clone());
                 return Chunk::Broken(out, e);
             }
-            Some(Ok(chunk)) => self.decoder.push(&chunk),
+            Some(Ok(chunk)) => {
+                #[cfg(feature = "capture")]
+                self.raw.extend_from_slice(&chunk);
+                self.decoder.push(&chunk);
+            }
         }
         loop {
             let frame = match self.decoder.next_frame() {

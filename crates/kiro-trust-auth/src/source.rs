@@ -26,10 +26,7 @@ pub struct TokenSource {
     runtime_override: Option<RuntimeRegion>,
     cached: Mutex<Option<Credentials>>,
     refresh_gate: tokio::sync::Mutex<()>,
-}
-
-fn valid(c: &Credentials) -> bool {
-    c.expires_at > SystemTime::now() + VALIDITY_BUFFER
+    validity_buffer: Duration,
 }
 
 impl TokenSource {
@@ -44,7 +41,20 @@ impl TokenSource {
             runtime_override,
             cached: Mutex::new(None),
             refresh_gate: tokio::sync::Mutex::new(()),
+            validity_buffer: VALIDITY_BUFFER,
         }
+    }
+
+    /// Override the validity buffer (default 300s). A buffer longer than
+    /// any real token lifetime forces the OIDC refresh path on every call;
+    /// used by the live tier's `forced_refresh_succeeds` test (spec 8.6).
+    pub fn with_validity_buffer(mut self, d: Duration) -> Self {
+        self.validity_buffer = d;
+        self
+    }
+
+    fn valid(&self, c: &Credentials) -> bool {
+        c.expires_at > SystemTime::now() + self.validity_buffer
     }
 
     fn cached_valid(&self) -> Option<Credentials> {
@@ -52,7 +62,7 @@ impl TokenSource {
             .lock()
             .unwrap()
             .as_ref()
-            .filter(|c| valid(c))
+            .filter(|c| self.valid(c))
             .cloned()
     }
 
@@ -68,7 +78,7 @@ impl TokenSource {
         if let Some(r) = &self.runtime_override {
             creds.runtime_region = r.clone();
         }
-        if !valid(&creds) {
+        if !self.valid(&creds) {
             tracing::info!(sso_region = %creds.sso_region, "credential expired, refreshing through AWS OIDC");
             creds = refresh(&self.net, &creds).await?;
             tracing::info!("credential refreshed");

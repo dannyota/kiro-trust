@@ -165,6 +165,22 @@ pub async fn post_messages(
         let upstream = state.upstream.generate(&built.payload).await?;
         upstream_attempts += upstream.attempts.saturating_sub(1);
         let mut pump = Pump::new(upstream.bytes, opts());
+        // Snapshot this attempt's request/payload for capture (spec 8.3):
+        // set once per loop iteration so a retried attempt captures the
+        // payload it actually sent, not an earlier one.
+        #[cfg(feature = "capture")]
+        {
+            pump.capture = state.capture.clone().map(|handle| {
+                let seq = handle.next_seq();
+                crate::server::capture::CaptureState {
+                    handle,
+                    seq,
+                    request: body.clone(),
+                    payload: serde_json::to_vec(&built.payload).unwrap_or_default(),
+                    text: String::new(),
+                }
+            });
+        }
         match pump.prime().await {
             Primed::Failed(f) if retry_count == 0 && retryable(&f) => {
                 retry_count += 1;
@@ -248,6 +264,16 @@ pub async fn post_messages(
                 let msg = pump.translator.into_message();
                 let response_body =
                     serde_json::to_vec(&msg).expect("OutMessage has no fallible field types");
+                #[cfg(feature = "capture")]
+                if let Some(c) = pump.capture.take() {
+                    c.handle.record(
+                        c.seq,
+                        &c.request,
+                        &c.payload,
+                        &pump.raw,
+                        &String::from_utf8_lossy(&response_body),
+                    );
+                }
                 log_usage(
                     &request_id,
                     started,
@@ -267,17 +293,27 @@ pub async fn post_messages(
     }
 }
 
+// `pump` is only mutated here to seed capture state (spec 8.3), so it is
+// unused without that feature.
+#[cfg_attr(not(feature = "capture"), allow(unused_mut))]
 fn stream_response(
     request_id: Uuid,
     started: Instant,
     retry_count: u32,
     first: Vec<StreamEvent>,
-    pump: Pump,
+    mut pump: Pump,
     permit: OwnedSemaphorePermit,
 ) -> Response {
     let mut initial = String::new();
     for ev in &first {
         initial.push_str(&sse::encode(ev));
+    }
+    // The buffered events from `prime()` are the start of the response the
+    // client actually receives, so capture's recorded text (spec 8.3)
+    // begins with them too.
+    #[cfg(feature = "capture")]
+    if let Some(c) = pump.capture.as_mut() {
+        c.text.push_str(&initial);
     }
     let output_bytes = Arc::new(AtomicUsize::new(initial.len()));
     let counter = output_bytes.clone();
@@ -328,6 +364,10 @@ fn stream_response(
                     Chunk::Done => (String::new(), true, None),
                 };
                 counter.fetch_add(text.len(), Ordering::Relaxed);
+                #[cfg(feature = "capture")]
+                if let Some(c) = pump.capture.as_mut() {
+                    c.text.push_str(&text);
+                }
                 if finished {
                     let usage = pump.translator.usage();
                     log_usage(
@@ -341,6 +381,11 @@ fn stream_response(
                         counter.load(Ordering::Relaxed),
                         error_type,
                     );
+                    #[cfg(feature = "capture")]
+                    if let Some(c) = pump.capture.take() {
+                        c.handle
+                            .record(c.seq, &c.request, &c.payload, &pump.raw, &c.text);
+                    }
                 }
                 Some((Ok(Bytes::from(text)), (pump, finished, permit)))
             }

@@ -208,10 +208,10 @@ the `tracing` subscriber; it is installed once, from `logging::init`, before
 
 ### 3.6 xtask
 
-`cargo xtask scrub <capture-dir> <fixture-dir>` (section 8.3),
-`cargo xtask check-versions`, `cargo xtask fixtures-verify` which re-runs the
-leak scan, and `cargo xtask make-db <path>` which builds the synthetic
-placeholder database for the audit gate (section 8.7). Depends on
+`cargo xtask scrub <capture-dir> <fixture-dir> --source "<text>"` (section
+8.3), `cargo xtask check-versions`, `cargo xtask fixtures-verify` which
+re-runs the leak scan, and `cargo xtask make-db <path>` which builds the
+synthetic placeholder database for the audit gate (section 8.7). Depends on
 `kiro-trust-protocol` and `rusqlite` only.
 
 ## 4. Command surface
@@ -776,20 +776,28 @@ malformed frame; truncated stream; 200 with JSON exception.
 ### 8.3 Capture and scrub
 
 The `capture` cargo feature adds `--capture-dir`. For every request it writes
-`<n>-request.json`, `<n>-payload.json`, `<n>-upstream.eventstream`,
-`<n>-upstream-headers.json`, and `<n>-response.sse` with mode 0600. The
-feature is off by default, absent from release builds, and reported by
-`audit` with exit 1.
+`<n>-request.json`, `<n>-payload.json`, `<n>-upstream.eventstream`, and
+`<n>-response.sse` with mode 0600, in a directory with mode 0700. The feature
+is off by default, absent from release builds, and reported by `audit` with
+exit 1.
 
-`cargo xtask scrub <capture-dir> <fixture-dir>` replaces the profile ARN and
-account id with `arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE`,
-conversation and utterance ids with fixed strings, the home directory with
-`/home/user`, hostnames with `host`, and removes upstream headers other than
-`content-type`. `scripts/check-fixtures.sh` fails when any file under
-`tests/fixtures/` contains a 12-digit account id, `arn:aws:` outside the
-fixture ARN, the owner's home path, an `aoa`-prefixed or `eyJ`-prefixed
-token-shaped string, or a `kiro.dev` hostname with a real region other than
-the fixture's.
+`cargo xtask scrub <capture-dir> <fixture-dir> --source "<text>"` replaces the
+profile ARN and account id with
+`arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE`, conversation
+and utterance ids with a fixed id, the home directory with `/home/user`
+(matched wherever it occurs, since it is specific enough that a mid-string
+match is still the owner's identity), and the hostname with `host` (matched
+only as a whole token, so a hostname that is merely a substring of a longer
+word is left alone). It writes one case per captured request under
+`<fixture-dir>/<n>/`: `meta.json`, `request.json`, `expected-payload.json`,
+`upstream.eventstream` (rewritten frame by frame, so a `messageMetadataEvent`
+payload's `conversationId` and `utteranceId` are scrubbed even if the
+runtime assigned an id that never appeared in the request), and
+`expected-sse.txt` (with `msg_` ids masked). `scripts/check-fixtures.sh`
+fails when any file under `tests/fixtures/` contains a 12-digit account id,
+`arn:aws:` outside the fixture ARN, the owner's home path, an
+`aoa`-prefixed or `eyJ`-prefixed token-shaped string, or a `kiro.dev`
+hostname with a real region other than the fixture's.
 
 Fixtures are public. Record only marker prompts (`kiro-trust fixture probe:
 ...`) so no real source code enters the repository.
@@ -844,13 +852,26 @@ regression fixture.
 
 ### 8.6 Live tier
 
-`crates/kiro-trust-tests/tests/live.rs`, ignored by default. Each test reads
-the real database, sends
-a marker prompt with `max_tokens: 64`, and asserts on structure, never on
-model wording: streaming text arrives; a tool call to a `kiro_trust_probe`
-tool produces `tool_use`; a thinking request produces a `thinking` block;
-forcing expiry triggers a refresh; an invalid token yields 403 then a
-successful retry. Live tests print token counts and durations only.
+`crates/kiro-trust-tests/tests/live.rs`, ignored by default, gated on
+`KIRO_TRUST_LIVE=1`. Each test reads the real database, sends a marker
+prompt, and asserts on structure, never on model wording: streaming text
+arrives; a tool call to a `kiro_trust_probe` tool produces `tool_use`; a
+thinking request produces a `thinking` block; a non-streaming call returns a
+`message` with nonzero `usage.input_tokens`. Live tests print token counts,
+byte counts, and durations only, never a prompt, a response body, a
+conversation id, a token, an ARN, or an account id.
+
+`forced_refresh_succeeds` sets a validity buffer
+(`TokenSource::with_validity_buffer`) longer than any real token lifetime, so
+`TokenSource` treats every call as expired and refreshes through AWS OIDC
+regardless of how recently the credential was actually issued. It needs a
+second, explicit opt-in beyond `KIRO_TRUST_LIVE=1`: `KIRO_TRUST_LIVE_REFRESH=1`.
+Both must be `1` for the test to run. This is stricter than the other live
+tests because AWS's `CreateToken` reference does not document whether
+issuing a new refresh token invalidates the one that was exchanged for it;
+see the known limitation in section 12. kiro-trust never persists a refreshed
+token (spec 6.1), so a rotated refresh token lives only in this test's
+process memory and is discarded when it exits.
 
 ### 8.7 CI gates
 
@@ -974,6 +995,20 @@ environment except its own `KIRO_TRUST_*` variables.
   larger prompt, not a failure.
 - **Custom frame decoder.** Mitigated by fuzzing, bounded allocation, CRC
   validation, and transcribed kirocc regression cases.
+- **Refresh token rotation.** kiro-trust reads the Kiro CLI's stored refresh
+  token and, on a refresh, keeps the result in memory only; it never writes
+  back (spec 6.1). AWS's `CreateToken` reference does not document whether
+  issuing a new refresh token invalidates the one that was exchanged for it,
+  so whether Identity Center rotates on use is unknown. If it does, a
+  refresh performed by kiro-trust leaves the Kiro CLI's own stored refresh
+  token stale, and the owner has to log in to Kiro CLI again to restore it.
+  Mitigation: kiro-trust refreshes only when the cached credential is within
+  the validity buffer of expiry (5 minutes by default), so in ordinary use
+  the Kiro CLI itself refreshes first, on its own schedule, and kiro-trust
+  reads the result the CLI already wrote; kiro-trust's own refresh path is
+  reached only when the CLI has not refreshed recently enough, which the
+  live tier's `forced_refresh_succeeds` test exercises deliberately (spec
+  8.6) and ordinary use should rarely hit.
 
 ## 13. Backlog
 

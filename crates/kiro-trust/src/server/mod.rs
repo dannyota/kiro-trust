@@ -1,5 +1,7 @@
 //! Loopback HTTP surface (spec 5.1, 6.3).
 
+#[cfg(feature = "capture")]
+pub mod capture;
 pub mod count_tokens;
 pub mod error;
 pub mod messages;
@@ -30,6 +32,11 @@ pub struct AppState {
     pub limiter: Arc<Semaphore>,
     /// Per-process salt for deriving Kiro conversation ids (Task 18).
     pub conversation_salt: [u8; 16],
+    /// Developer-only payload capture (spec 8.3). `None` when no
+    /// `--capture-dir` was given; the field itself does not exist unless
+    /// built with the `capture` feature.
+    #[cfg(feature = "capture")]
+    pub capture: Option<Arc<capture::Capture>>,
 }
 
 fn presented_token(headers: &HeaderMap) -> Option<&str> {
