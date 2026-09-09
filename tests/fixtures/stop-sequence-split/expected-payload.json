@@ -1,0 +1,15 @@
+{
+  "conversationState": {
+    "conversationId": "00000000-0000-4000-8000-00000000c0ff",
+    "chatTriggerType": "MANUAL",
+    "agentTaskType": "vibe",
+    "currentMessage": {
+      "userInputMessage": {
+        "content": "kiro-trust fixture probe: say alpha END beta.",
+        "modelId": "claude-sonnet-4.6",
+        "origin": "KIRO_CLI"
+      }
+    }
+  },
+  "profileArn": "arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE"
+}

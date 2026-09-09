@@ -1,0 +1,8 @@
+[
+  {"event_type": "messageMetadataEvent", "payload": {"conversationId": "00000000-0000-4000-8000-00000000c0ff", "utteranceId": "u1"}},
+  {"event_type": "assistantResponseEvent", "payload": {"content": "Hello"}},
+  {"event_type": "assistantResponseEvent", "payload": {"content": "."}},
+  {"event_type": "contextUsageEvent", "payload": {"contextUsagePercentage": 0.01}},
+  {"event_type": "metadataEvent", "payload": {"tokenUsage": {"uncachedInputTokens": 24, "outputTokens": 2, "totalTokens": 26, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}}},
+  {"event_type": "meteringEvent", "payload": {"usage": 0.001, "inputTokens": 24, "outputTokens": 2}}
+]

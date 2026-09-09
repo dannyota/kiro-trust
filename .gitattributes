@@ -1,0 +1,13 @@
+# Checkout must be byte-identical on every platform. Fixture files under
+# tests/fixtures/ are recorded wire bytes that crates/kiro-trust-tests
+# compares byte-for-byte (assert_eq! against std::fs::read_to_string), so a
+# platform-dependent CRLF checkout is a test failure, not a formatting
+# choice. Normalize every text file to LF on checkout and on commit; carve
+# out the binary fixtures so no filter ever touches them.
+* text=auto eol=lf
+
+# Never text-convert, diff, or merge these; they are recorded bytes, not
+# source text. `!eol` clears the eol=lf inherited from the rule above so
+# check-attr reports no line-ending attribute at all on these paths.
+*.sqlite3 binary !eol
+*.eventstream binary !eol

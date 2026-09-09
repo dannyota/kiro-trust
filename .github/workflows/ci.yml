@@ -1,0 +1,98 @@
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Weekly, Sunday 03:00 UTC: advisories change without a commit.
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch; rust-toolchain.toml pins the version
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: ./scripts/check-packages.sh
+      - run: ./scripts/check-fixtures.sh
+      - run: ./scripts/check-features.sh
+      - name: Audit gate
+        # tests/fixtures/db/idc-audit.json's "version" field is not stripped
+        # below: a version bump must change it, so regenerate the fixture
+        # (spec 8.7) whenever the workspace version changes, and keep this
+        # comment for the docs/releasing.md checklist that should eventually
+        # own that step (task-20-fix-1.md minor 2).
+        run: |
+          set -o pipefail
+          cargo build --release --locked -p kiro-trust
+          # `audit`'s exit code would otherwise be masked by the `python3`
+          # stage of this pipe (task-20-fix-1.md minor 3): `pipefail` above
+          # makes the pipeline's status the rightmost non-zero status, and
+          # the explicit check below asserts it rather than relying on that
+          # alone.
+          set +e
+          ./target/release/kiro-trust audit --json --kiro-db tests/fixtures/db/idc.sqlite3 --token-file /tmp/kiro-trust-audit/token \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); d.pop("commit"); print(json.dumps(d, indent=2, sort_keys=True))' > /tmp/audit.json
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "expected 'kiro-trust audit' to exit 0 against the clean synthetic fixture, got $status" >&2
+            exit 1
+          fi
+          diff tests/fixtures/db/idc-audit.json /tmp/audit.json
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check advisories bans licenses sources
+
+  fuzz-check:
+    # fuzz/ is excluded from the workspace, so nothing above touches it:
+    # a kiro-trust-protocol signature change would otherwise only be
+    # caught by the weekly fuzz.yml job (task-22-fix-1.md Important 1).
+    # A plain `cargo check` on the stable, already-pinned toolchain is
+    # enough to catch that: cargo-fuzz's nightly-only sanitizer flags
+    # (see fuzz.yml) are a build-time instrumentation concern, not a
+    # type-checking one, so this doesn't need nightly or cargo-fuzz
+    # installed, and stays fast on every pull request. It also gives
+    # fuzz/Cargo.lock a reason to stay accurate, via --locked.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: fuzz
+      - run: cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets

@@ -13,9 +13,20 @@ a test behind it.
 - Loopback listener with a mandatory local token.
 - No request or response body logging, and no option to enable it.
 - No telemetry, crash reporting, update checks, or model discovery.
+- No developer-only feature, such as `capture` (which writes real prompts
+  and responses to disk), compiled into a release build.
 
-Run `kiro-trust audit` to see the effective configuration. It exits non-zero
-when a promise does not hold for the running build.
+Run `kiro-trust audit` to see the effective configuration. It exits 1 when
+the listener address cannot be parsed or is not loopback, an invalid
+`--runtime-region` is given, the credential database cannot be confirmed
+read-only, the credential cannot be read, or a developer-only feature is
+compiled in (spec 4.2). That checks three of the promises above: read-only
+credential access, the loopback listener, and no developer-only feature
+compiled in. The rest of the promises above (no body logging, no telemetry,
+no crash reporting, no update checks, no model discovery) are things
+`audit` states, not things it measures: they hold because the corresponding
+code was never written, and no runtime check can prove that better than
+reading the source (or `NOTICE`) can.
 
 ## Verifying a release
 

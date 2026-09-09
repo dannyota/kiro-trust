@@ -1,0 +1,29 @@
+{
+  "conversationState": {
+    "conversationId": "00000000-0000-4000-8000-00000000c0ff",
+    "chatTriggerType": "MANUAL",
+    "agentTaskType": "vibe",
+    "currentMessage": {
+      "userInputMessage": {
+        "content": "Say hello.",
+        "modelId": "claude-sonnet-4.6",
+        "origin": "KIRO_CLI"
+      }
+    },
+    "history": [
+      {
+        "userInputMessage": {
+          "content": "kiro-trust fixture probe: answer with one word.",
+          "origin": "KIRO_CLI"
+        }
+      },
+      {
+        "assistantResponseMessage": {
+          "messageId": "4abd27ca-8e4e-5a51-bfdf-c2e413bfd2f5",
+          "content": "I will fully incorporate this information when generating my responses, and explicitly acknowledge relevant parts of the summary when answering questions."
+        }
+      }
+    ]
+  },
+  "profileArn": "arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE"
+}

@@ -1,0 +1,1 @@
+{"source": "kirocc v0.11.1 TestSSEWriter_ToolUse, TestBuildPayload_ToolUseFlow, TestParseStream_ToolUseEvent", "features": ["tools", "tool_use", "stream"]}

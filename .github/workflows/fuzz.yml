@@ -1,0 +1,63 @@
+name: Fuzz
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [frame_decode, event_parse, sse_translate, anthropic_request, tool_input_accumulate]
+    env:
+      # dtolnay/rust-toolchain only runs `rustup default`, and
+      # rust-toolchain.toml outranks that for every directory under the
+      # repository (fuzz/ included), so cargo-fuzz's nightly-only sanitizer
+      # flags need an explicit override here (fix-1 Critical 1). Set at the
+      # job level so it covers both `cargo install cargo-fuzz` and
+      # `cargo fuzz run` without repeating `+nightly` on each.
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: fuzz
+      # Pinned (final-fix-2.md Minor 9): unlike cargo-auditable (spec 9.1),
+      # there is no second install site this needs to stay in sync with, so
+      # nothing here argues for tracking latest. Dependabot cannot bump a
+      # version embedded in a `run:` line, so a bump is manual; check
+      # https://crates.io/crates/cargo-fuzz for a newer release periodically.
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # Seed anthropic_request corpus from tests/fixtures/*/request.json (spec 8.5).
+      # tests/fixtures/ is the only seed source anywhere in this project; a
+      # capture directory is never one, even for a quick local corpus boost.
+      # Corpus isn't cached or committed, so it is rebuilt on each run. This step
+      # runs only for the anthropic_request matrix leg (see if guard below).
+      - name: Seed anthropic_request corpus from fixtures
+        if: matrix.target == 'anthropic_request'
+        run: |
+          mkdir -p fuzz/corpus/anthropic_request
+          for f in tests/fixtures/*/request.json; do
+            cp "$f" "fuzz/corpus/anthropic_request/$(basename "$(dirname "$f")").json"
+          done
+      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300
+        working-directory: fuzz
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          # Artifacts only, never fuzz/corpus (spec 8.5): a crash file is a
+          # regression fixture to commit after minimizing; the corpus is
+          # disposable per-run mutation state, and uploading it to a public
+          # artifact store would risk seeding it with a real captured
+          # payload down the line.
+          path: fuzz/artifacts

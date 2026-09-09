@@ -119,6 +119,16 @@ Pure data and pure functions. Everything here is testable from a fixture file.
 Body types implement neither `Display` nor a `Debug` that prints content.
 `Debug` on a request prints counts and lengths only.
 
+Most of the kirocc-derived code in this workspace lives here (NOTICE), so
+`cargo package` for this crate would otherwise ship without attribution:
+`cargo package` only ever includes files inside a crate's own directory, so
+the repository-root `NOTICE` cannot be referenced from outside it. This
+crate, `kiro-trust-kiro`, and `kiro-trust` each carry a byte-identical copy
+of the root `NOTICE` at their own crate root; each crate's `lib.rs` has a
+test (`notice_sync::crate_notice_matches_workspace_notice`) that fails if
+its copy drifts from the original. `kiro-trust-net` and `kiro-trust-auth`
+hold no kirocc-derived code and carry no copy.
+
 ### 3.2 kiro-trust-net
 
 The single outbound policy. Public surface:
@@ -132,13 +142,16 @@ pub struct Region(String);          // validated pattern, section 6.2
 pub struct RuntimeRegion(Region);   // pattern plus allowlist
 pub struct Client { /* reqwest::Client with the fixed policy */ }
 impl Client {
-    pub fn new(policy: Policy) -> Result<Self, Error>;
-    pub async fn post_json(&self, dest: Destination, path: &str,
-        headers: HeaderMap, body: Bytes) -> Result<Response, Error>;
+    pub fn new(policy: Policy) -> Result<Self, NetError>;
+    pub async fn post(&self, dest: &Destination, path: &str,
+        headers: HeaderMap, body: Vec<u8>) -> Result<Response, NetError>;
 }
 ```
 
-`Destination` is the only way to name a host. There is no `Url` in the public
+`Destination` is the only way to name a host. The request path is validated
+too: it must start with `/` and carry no userinfo, query, fragment, or
+backslash, and the built URL is parsed and checked to name exactly the
+destination host before it is sent. There is no `Url` in the public
 API. `Policy::production()` is the only constructor the binary uses. A
 `test-endpoints` cargo feature adds `Policy::loopback_plain_http(port)` for
 this crate's own tests; the binary never enables it and CI proves that.
@@ -187,9 +200,10 @@ per-frame size cap. Error bodies are read to at most 64 KiB.
   (1 s, 2 s) plus jitter. A 200 whose `Content-Type` is not
   `application/vnd.amazon.eventstream` is decoded as an AWS exception
   envelope; `ThrottlingException` and `InternalServerException` retry, others
-  fail. A 403 calls `TokenSource::invalidate()` and retries once with a fresh
-  token. Connection errors before any byte is sent retry; errors after the
-  stream started do not.
+  fail. A 403 calls `TokenSource::invalidate()` and, when attempts remain,
+  retries once with a fresh token; a second 403, or a 403 on the last
+  attempt, fails with an authentication error. Connection errors before any
+  byte is sent retry; errors after the stream started do not.
 - `UpstreamError { status, exception_type, message (≤ 1 KiB) }` maps to the
   Anthropic error envelope in the server.
 
@@ -197,15 +211,23 @@ per-frame size cap. Error bodies are read to at most 64 KiB.
 
 `clap` subcommands: `serve`, `audit`, `env`. Modules: `config` (flags, env,
 validation), `server` (axum routes, middleware, limits), `token` (local token
-file), `audit`, `env`. The binary owns the `tracing` subscriber.
+file), `serve` (the `serve` command: credential read, bind, shutdown), `logging`
+(the `tracing` subscriber and its `EnvFilter`), `audit`, `env`. The binary owns
+the `tracing` subscriber; it is installed once, from `logging::init`, before
+`serve::run` starts.
 
 ### 3.6 xtask
 
-`cargo xtask scrub <capture-dir> <fixture-dir>` (section 8.3),
-`cargo xtask check-versions`, `cargo xtask fixtures-verify` which re-runs the
-leak scan, and `cargo xtask make-db <path>` which builds the synthetic
-placeholder database for the audit gate (section 8.7). Depends on
-`kiro-trust-protocol` and `rusqlite` only.
+`cargo xtask scrub <capture-dir> <fixture-dir> --source "<text>"` (section
+8.3), `cargo xtask fixtures-verify` which shells out to
+`scripts/check-fixtures.sh` rather than reimplementing the leak scan (a
+second implementation is exactly the kind of thing that drifts from the
+first), and `cargo xtask make-db <path>` which builds the synthetic
+placeholder database for the audit gate (section 8.7). There is no
+`check-versions`: an earlier version was `println!("versions ok")`
+regardless of whether versions matched, a gate that failed open with nothing
+in CI to catch it, and `scripts/check-packages.sh` already does the real
+check. Depends on `kiro-trust-protocol`, `serde_json`, and `rusqlite` only.
 
 ## 4. Command surface
 
@@ -224,27 +246,44 @@ placeholder database for the audit gate (section 8.7). Depends on
 
 Precedence: flag, then env, then default. Startup order: parse and validate
 config, open the database read-only and read credentials (fail fast with a
-clear message), write the token file, bind, print one line with the listener
-and token file path, serve. On SIGINT or SIGTERM: stop accepting, drain for up
-to 10 s, delete the token file, exit 0.
+clear message), write the token file, bind, print two lines to stderr (the
+listener address and token file path, then a reminder to run `kiro-trust
+env`), serve. A failure at any step before the token file is
+written leaves no token file behind; a failure after binding removes it. On
+SIGINT or SIGTERM: delete the token file and stop accepting immediately (no
+new client can read a valid token during the drain that follows), drain
+existing connections for up to 10 s, exit 0.
 
 ### 4.2 `kiro-trust audit [--json]`
 
 Prints the effective security configuration (section 6.6) and exits 0. Exits 1
-when a guarantee does not hold: a dev feature is compiled in, the listener is
-not loopback, or the database could not be opened read-only. `audit` never
+when the listener address cannot be parsed or is not loopback, an invalid
+`--runtime-region` is given, the database cannot be confirmed read-only, the
+credential cannot be read, or a dev feature is compiled in. `audit` never
 starts a listener and never performs a network request.
 
 ### 4.3 `kiro-trust env [--shell sh|fish]`
 
-Prints the exports Claude Code needs, reading the token file:
+Prints the exports Claude Code needs, reading the token file. Before
+printing, the token is checked against the shape `token::generate` produces
+(43 characters of base64url without padding, spec 6.3); anything else is
+rejected without being echoed, not even a prefix.
 
 ```sh
-export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
-export ANTHROPIC_AUTH_TOKEN=<local token>
+export ANTHROPIC_BASE_URL='http://127.0.0.1:3456'
+export ANTHROPIC_AUTH_TOKEN='<local token>'
 ```
 
-Usage: `eval "$(kiro-trust env)"`. Exits 1 if no token file exists.
+`--shell fish` prints the fish form instead:
+
+```fish
+set -gx ANTHROPIC_BASE_URL 'http://127.0.0.1:3456'
+set -gx ANTHROPIC_AUTH_TOKEN '<local token>'
+```
+
+Both forms single-quote both values. Usage: `eval "$(kiro-trust env)"`.
+Exits 1 when the token file does not exist, cannot be read, or does not
+contain a well-formed token.
 
 ### 4.4 Exit codes
 
@@ -268,6 +307,12 @@ records the rule here before writing code.
 Any other path returns 404 with the Anthropic error envelope. Methods other
 than those listed return 405.
 
+`POST /v1/messages` requires `max_tokens`; an absent or zero value is 400
+`invalid_request_error` (section 5.6), matching the real Anthropic Messages
+API. The requirement lives in the `/v1/messages` handler, not in
+`anthropic::Request` or its shared parser: `count_tokens` parses the same
+`Request` type and legitimately omits the field (section 5.7).
+
 ### 5.2 Model catalog
 
 Static, shipped in `kiro-trust-protocol::catalog`, copied from kirocc's Claude
@@ -278,16 +323,14 @@ rows with attribution in `NOTICE`.
 | `claude-opus-5` | `claude-opus-5` | same | 1M | low, medium, high, xhigh, max |
 | `claude-opus-4-8` | `claude-opus-4.8` | same | 1M | low, medium, high, xhigh, max |
 | `claude-opus-4-7` | `claude-opus-4.7` | same | 1M | low, medium, high, xhigh, max |
-| `claude-opus-4-6` | `claude-opus-4.6` | same | 1M | low, medium, high, xhigh, max |
+| `claude-opus-4-6` | `claude-opus-4.6` | same | 1M | low, medium, high, max |
 | `claude-sonnet-5` | `claude-sonnet-5` | same | 1M | low, medium, high, xhigh, max |
-| `claude-sonnet-4-6` | `claude-sonnet-4.6` | `claude-sonnet-4.6-1m` | 200k / 1M | low, medium, high, xhigh, max |
-| `claude-sonnet-4.5` | `claude-sonnet-4.5` | `claude-sonnet-4.5-1m` | 200k / 1M | low, medium, high |
-| `claude-opus-4.5` | `claude-opus-4.5` | — | 200k | low, medium, high |
-| `claude-haiku-4.5` | `claude-haiku-4.5` | — | 200k | low, medium, high |
+| `claude-sonnet-4-6` | `claude-sonnet-4.6` | `claude-sonnet-4.6-1m` | 200k / 1M | low, medium, high, max |
+| `claude-sonnet-4.5` | `claude-sonnet-4.5` | `claude-sonnet-4.5-1m` | 200k / 1M | none (effort omitted) |
+| `claude-opus-4.5` | `claude-opus-4.5` | — | 200k | none (effort omitted) |
+| `claude-haiku-4.5` | `claude-haiku-4.5` | — | 200k | none (effort omitted) |
 
-The effort enum per model is transcribed from kirocc `internal/models/effort.go`
-during Phase 1; the values above are the expected shape and the transcription
-corrects them if they differ.
+Transcribed from kirocc v0.11.1 `internal/models/effort.go` on 2026-09-08.
 
 Resolution: strip a trailing `-YYYYMMDD` date, canonicalize a trailing `[1m]`
 or `[1M]` to `[1m]`, accept a dashed or dotted minor version
@@ -307,7 +350,7 @@ for rows with a separate 1M SKU.
 ### 5.3 Request translation
 
 Input: the Anthropic `Request`, the resolved Kiro SKU, the profile ARN, a
-conversation id (UUID v4 per request), and the effort level. Output: `Payload`.
+conversation id (derived per step 8), and the effort level. Output: `Payload`.
 
 1. System prompt: `system` as a string or text blocks joins into one string.
    The `<env>` block, when present, yields `envState.operatingSystem` and
@@ -317,7 +360,10 @@ conversation id (UUID v4 per request), and the effort level. Output: `Payload`.
    is ignored. Remaining tools become `toolSpecification` entries after
    schema sanitization (transcribe from `schema_sanitize.go`) and name mapping
    (transcribe from `tool_name_map.go`). A tool with `cache_control` gets a
-   `cachePoint` entry after it (transcribe from `cache_points.go`).
+   `cachePoint` entry after it (transcribe from `cache_points.go`). The keys
+   of `properties` are parameter names and are never treated as schema
+   keywords; only their values are sanitized. Each combinator branch is
+   sanitized once.
 3. Messages: consecutive same-role messages merge; the last message is the
    current message, everything before is history. A trailing assistant
    message pushes everything to history and synthesizes a `Continue` user
@@ -328,9 +374,15 @@ conversation id (UUID v4 per request), and the effort level. Output: `Payload`.
    results reordered to the preceding assistant turn's `tool_use` order with
    `status` success or error and content blocks, and images
    (transcribe from `tool_results.go`, `images.go`).
-6. Thinking blocks in history replay per `thinking_blocks.go`.
+6. Thinking and `redacted_thinking` blocks in history are dropped; only text
+   and `tool_use` blocks reach `assistantResponseMessage`. (kirocc replays
+   redacted blobs for GPT models only, out of scope.)
 7. `profileArn` is set from the credential.
-8. Thinking: when `thinking.type` is `enabled` or `adaptive`, or
+8. `conversationId`: UUID v5 of the `X-Claude-Code-Session-Id` header under a
+   per-process random namespace, or a random UUID v4 when the header is
+   absent, so Kiro sees a stable conversation per Claude Code session
+   without receiving the raw session id.
+9. Thinking: when `thinking.type` is `enabled` or `adaptive`, or
    `output_config.effort` is set, `additionalModelRequestFields.output_config.effort`
    is the requested effort clamped to the model's enum, defaulting to
    `medium`. `thinking.type: disabled` or absent omits the field.
@@ -343,9 +395,8 @@ Fixed values: `chatTriggerType: MANUAL`, `agentTaskType: vibe`.
 The decoder yields `Event` values (section 7.5). The response state machine
 tracks the current block (`thinking`, `text`, `tool_use`, or none) and emits:
 
-- `message_start` with `id: msg_<24 hex>`, the Anthropic model id the client
-  sent, empty content, and `usage.input_tokens` from the estimate until
-  `metadataEvent` arrives.
+- `message_start` with `id: msg_<24 hex>`, the Anthropic model id, empty
+  content, and zero usage; real usage arrives in `message_delta`.
 - `assistantResponseEvent.content` appends to a text block verbatim. Frames
   are incremental; there is no overlap removal (kirocc #116).
   `<thinking>` tags inside text open and close a thinking block (transcribe
@@ -353,9 +404,12 @@ tracks the current block (`thinking`, `text`, `tool_use`, or none) and emits:
 - `reasoningContentEvent.text` appends to a thinking block; `signature`
   becomes a `signature_delta`; `redactedContent` becomes a
   `redacted_thinking` block.
+- A `signature` on a reasoning event becomes a `signature_delta` on the
+  open thinking block.
 - `toolUseEvent` frames accumulate `input` fragments per `toolUseId` until
   `stop`; the block emits `content_block_start` with the mapped-back name and
-  `input_json_delta` chunks (transcribe from `kiroproto/tooluse.go`).
+  `input_json_delta` chunks (transcribe from `kiroproto/tooluse.go`); the
+  tool block is closed immediately after its single `input_json_delta`.
 - `metadataEvent.tokenUsage` sets `input_tokens = uncachedInputTokens +
   cacheReadInputTokens`, `output_tokens`, `cache_read_input_tokens`,
   `cache_creation_input_tokens = cacheWriteInputTokens`. `meteringEvent`
@@ -363,16 +417,34 @@ tracks the current block (`thinking`, `text`, `tool_use`, or none) and emits:
 - `stop_sequences` are matched across delta boundaries; on a match the text
   is cut, `stop_reason: stop_sequence` and `stop_sequence` are set, and the
   upstream body is dropped. `max_tokens` is enforced on output tokens with
-  `stop_reason: max_tokens`.
+  `stop_reason: max_tokens`. The translator's accumulated text, thinking,
+  tool-call input, and redacted content share one output-token counter that
+  is additionally bounded by a fixed absolute ceiling (section 5.5),
+  independent of the client's `max_tokens`: defense in depth so accumulation
+  stays bounded even if the field is ever made optional again.
 - `stop_reason` is `tool_use` when at least one tool block closed, else
   `end_turn`.
 - An `exception` frame or `invalidStateEvent` before any visible output
   becomes an HTTP error (section 5.6); after output started it becomes an
-  SSE `error` event followed by `message_stop`.
+  SSE `error` event and the stream ends there, with no `message_stop`
+  after it.
+- An `invalidStateEvent` with reason `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,
+  `INVALID_CONVERSATION_STATE`, or `STALE_CONVERSATION` clears the
+  conversation id and retries the request once (kirocc
+  `retryableInvalidStateReasons`); any other reason, or a second retryable
+  failure, is the HTTP error above. What counts as "output has started",
+  which ends retry eligibility, is per path: streaming counts any content
+  already buffered as translated events as started, since those bytes are on
+  the wire once the handler flushes them, so the retry never happens once
+  the first content is buffered. Non-streaming holds everything back until
+  the whole response is folded, so a retryable invalid state still retries
+  even after earlier content (a `reasoningContentEvent`, say) has been
+  translated internally, as long as this is the request's first retry.
 - End of stream: close the open block, `message_delta` with `stop_reason` and
   usage, `message_stop`.
 - Idle keep-alive: an SSE comment line `: keep-alive` every 15 s without an
-  event.
+  event. Keep-alive comments start after the first event; there is none
+  before it.
 
 Non-streaming: the same events folded into one `Message` JSON body.
 
@@ -381,14 +453,15 @@ Non-streaming: the same events folded into one `Message` JSON body.
 | Limit | Value |
 | --- | --- |
 | Request body | 32 MiB |
-| Header read timeout | 10 s |
-| Concurrent requests | 32; excess gets 429 `rate_limit_error` |
+| Concurrent requests | 32; excess gets 429 `rate_limit_error`. An open SSE connection holds its slot for the life of the connection, not just while the upstream call is being primed. |
 | JSON nesting | serde_json default recursion limit (128) |
 | Tools per request | 512 |
 | Messages per request | 4096 |
 | Upstream frame | 4 MiB |
 | Upstream error body | 64 KiB |
 | Tool input accumulation | 16 MiB per tool call |
+| Response accumulator ceiling | 2,000,000 output tokens (about 8,000,000 accumulated characters across text, thinking, tool-call input, and redacted content combined), independent of the client's `max_tokens` (section 5.4). Far above any legitimate response, so it never changes observable behavior for a real request; it exists only so a future change that makes `max_tokens` optional again cannot reopen unbounded accumulation. |
+| Priming deadline | 120 s wall-clock, from the first upstream read until the translator produces its first output (`ResponseTranslator::started`), on both the streaming and non-streaming paths. Generous next to the 10 s connect and 30 s response-header timeouts (section 3.2), and comfortably above a healthy request's time to a first token, including a heavy `max`-effort reasoning load; well under the 180 s per-read idle deadline, so it still meaningfully bounds a stalled connection. Corrects the earlier claim that `Pump::prime` was "bounded by the 180 s read-idle timeout": that timeout resets on every successful read, however small, so an upstream delivering one byte every 179 s never tripped it and could pin a concurrency permit indefinitely. Once output has started this deadline no longer applies for the rest of the response: a long generation is legitimate, and the per-read idle timeout and the SSE keep-alive (above) cover it. Expiry fails the request as an upstream `Transport` error (502 `api_error`, section 5.6) and releases the concurrency permit. |
 
 ### 5.6 Errors
 
@@ -397,16 +470,21 @@ Every failure uses `{"type":"error","error":{"type":"<t>","message":"<m>"}}`.
 | Condition | Status | `error.type` |
 | --- | --- | --- |
 | missing or wrong local token | 401 | `authentication_error` |
-| body too large, bad JSON, unknown model, invalid field | 400 | `invalid_request_error` |
+| bad JSON, unknown model, invalid field (including a missing or zero `max_tokens` on `/v1/messages`, section 5.1) | 400 | `invalid_request_error` |
+| request body over 32 MiB | 413 | `request_too_large` |
 | unknown route | 404 | `not_found_error` |
+| method not allowed | 405 | `invalid_request_error` |
 | Kiro credential unusable (no database, refresh failed) | 401 | `authentication_error` |
 | upstream 429 or `ThrottlingException` after retries | 429 | `rate_limit_error` |
-| upstream 5xx, malformed stream, idle timeout | 502 | `api_error` |
+| upstream 5xx, malformed stream, idle timeout (including the priming deadline, section 5.5) | 502 | `api_error` |
 | upstream 400-class other than 403/429 | 502 | `api_error` |
 | local concurrency cap | 429 | `rate_limit_error` |
 
 The message carries the upstream exception type and message capped at 1 KiB.
-It never carries request content, the local token, or a Kiro token.
+It never carries request content, the local token, or a Kiro token. ARNs and
+12-digit account ids are scrubbed from the message before it reaches a
+client or a log: any `arn:` run up to the next whitespace, quote, or end of
+string becomes `arn:***`, and any bare 12-digit run becomes `***`.
 
 ### 5.7 `count_tokens`
 
@@ -416,7 +494,8 @@ offline, documented as approximate.
 
 ## 6. Security contracts
 
-Each line here maps to a test in `tests/security/` (section 8.4).
+Each line here maps to a test in `crates/kiro-trust-tests/tests/security_net.rs`
+or `security_logging.rs` (section 8.4).
 
 ### 6.1 Credential database
 
@@ -462,14 +541,28 @@ Each line here maps to a test in `tests/security/` (section 8.4).
 
 - `tracing` to stderr only. Allowed fields: `request_id`, `method`, `path`,
   `model`, `kiro_model`, `stream`, `status`, `duration_ms`, `retry_count`,
-  `input_bytes`, `output_bytes`, `input_tokens`, `output_tokens`,
+  `attempt`, `input_bytes`, `output_bytes`, `input_tokens`, `output_tokens`,
   `runtime_region`, `sso_region`, `frames`, `event_counts`, `error_type`.
+  `attempt` is `kiro-trust-kiro`'s per-call retry counter (the natural
+  sibling of `retry_count`, which is the higher-level invalid-state retry
+  gate); `crates/kiro-trust-tests/tests/security_logging.rs` asserts every
+  `field=` name on a captured log line is in this list.
 - Never logged: any header value, request or response body, prompt, tool
   name, tool argument, tool result, thinking text, conversation id, profile
   ARN, account id, token, client secret, refresh token, database path
   beyond its basename.
 - There is no body-logging flag. Payload capture exists only behind the
   `capture` cargo feature and is compiled out of release builds.
+- `--log-level`/`KIRO_TRUST_LOG` accepts exactly `error`, `warn`, `info`,
+  `debug` (section 4.1); either source is validated at the CLI boundary, and
+  an unrecognized value is a usage error (exit 2), never a silent fallback.
+- A validated level only ever raises this project's own crates
+  (`kiro_trust`, `kiro_trust_auth`, `kiro_trust_kiro`, `kiro_trust_net`).
+  Third-party crates, notably `hyper`, `rustls`, and `reqwest`, stay at
+  `warn` at every level the CLI accepts, so they never log request data. The
+  filter is built from the parsed level and a fixed target list, never by
+  interpolating the raw string into a directive list, so a `,` or `=`
+  inside it can never introduce or widen a directive for another target.
 
 ### 6.5 Telemetry
 
@@ -515,6 +608,10 @@ Automatic updates      disabled
 Build features         none
 ```
 
+On Windows, `Local authentication` reads
+`required (token file, user profile ACL)`, matching 6.3: Windows sets no
+explicit file mode, so audit does not claim one.
+
 The profile ARN and account id are never printed. `--json` emits the same
 data as one object. When `Build features` lists `capture` or
 `test-endpoints`, audit exits 1.
@@ -549,6 +646,10 @@ Identity Center keys, first match wins:
   `kirocli:oidc:device-registration`
 - `state.auth.idc.region`: JSON string, the SSO region
 - `state.api.codewhisperer.profile`: JSON `{"arn":"arn:aws:codewhisperer:<region>:<account>:profile/<id>","profile_name":"..."}` or a bare ARN string
+
+Measured on the owner's database on 2026-09-09: every credential row in
+`auth_kv` and `state` has SQLite storage class TEXT; the reader accepts TEXT
+or UTF-8 BLOB.
 
 Social keys (`kirocli:social:*`) are checked only to produce the unsupported
 error. The legacy `codewhisperer:*` keys are not read in v0.1.
@@ -604,6 +705,7 @@ name length u8, name, type u8, value; type 7 is a string with u16 BE length.
 Headers used: `:message-type` (`event` or `exception`), `:event-type`,
 `:content-type`, `:exception-type`. `total_length` below 16 or above 4 MiB is
 a decode error; a truncated prelude with zero bytes read is a clean end.
+A header block over 128 KiB is a decode error.
 
 Events and payload fields:
 
@@ -678,22 +780,41 @@ targets the ARN region for the runtime.
 | smoke | Claude Code through the proxy, by hand | same, recorded in release notes |
 
 The offline suite must pass on `ubuntu-latest`, `macos-latest`, and
-`windows-latest`.
+`windows-latest`. The live command above skips `forced_refresh_succeeds`: that
+test needs a second, explicit `KIRO_TRUST_LIVE_REFRESH=1` alongside
+`KIRO_TRUST_LIVE=1` (section 8.6), so a plain live run reporting success does
+not mean the forced-refresh path ran.
 
 ### 8.2 Fixture format
 
 `tests/fixtures/<case>/` holds:
 
-- `meta.json`: `{"source": "capture kiro-cli 2.21.1 2026-09-10" | "kirocc v0.11.1 <test name>", "features": ["text","stream","tool_use",...]}`
+- `meta.json`: `{"source": "capture kiro-cli 2.21.1 2026-09-10" | "kirocc v0.11.1 <test name>", "features": ["text","stream","tool_use",...]}`.
+  `source` is the only field the fixture harness checks
+  (`crates/kiro-trust-tests/tests/fixtures.rs`); `features` is
+  documentation, not read back by any test. Streaming behavior comes from
+  `request.json`'s own `stream` field, since that is what a real client
+  actually sent; `cargo xtask scrub` additionally writes a `stream` key to
+  `meta.json` as a human-readable summary of the same value, but nothing
+  reads it, so a hand-written fixture may omit it.
 - `request.json`: the Anthropic request as the client sent it
 - `expected-payload.json`: the Kiro payload kiro-trust must produce
 - `upstream.eventstream`: raw bytes from the runtime, when the case has a
-  response
+  response; a transcribed case may instead give `upstream.events.json`, a
+  readable list of `{"event_type": .., "payload": ..}` or
+  `{"exception_type": .., "payload": ..}` objects, one per frame, that the
+  harness re-encodes to the same bytes
 - `expected-sse.txt` or `expected-message.json`: the Anthropic output
 
 Fixture tests compare the produced payload with `expected-payload.json` as
 JSON values (key order independent, `conversationId` masked) and the produced
 SSE with `expected-sse.txt` byte for byte after masking `msg_` ids.
+
+`expected-payload.json`, `expected-sse.txt`, and `expected-message.json` are
+generated, never hand-written: run the fixture test with `UPDATE_FIXTURES=1`
+to (re)write them from the current `request.json` and upstream frames, then
+review the diff by hand before committing. A generated file that contradicts
+this spec is a product bug to fix, not an expectation to edit.
 
 Priority cases, in order: plain text; streaming text; frame boundaries inside
 multi-byte characters and repeated bytes; tool call; tool result; extended
@@ -704,47 +825,131 @@ malformed frame; truncated stream; 200 with JSON exception.
 ### 8.3 Capture and scrub
 
 The `capture` cargo feature adds `--capture-dir`. For every request it writes
-`<n>-request.json`, `<n>-payload.json`, `<n>-upstream.eventstream`,
-`<n>-upstream-headers.json`, and `<n>-response.sse` with mode 0600. The
-feature is off by default, absent from release builds, and reported by
-`audit` with exit 1.
+`<n>-request.json`, `<n>-payload.json`, `<n>-upstream.eventstream`, and
+`<n>-response.sse` with mode 0600, in a directory with mode 0700 (created only
+when missing; an existing directory keeps its mode, and a pre-existing file or
+symlink at one of these four names is never overwritten or followed:
+`Capture::write` uses `create_new`, so a restart needs an empty
+`--capture-dir`). The feature is off by default, absent from release builds,
+and reported by `audit` with exit 1.
 
-`cargo xtask scrub <capture-dir> <fixture-dir>` replaces the profile ARN and
-account id with `arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE`,
-conversation and utterance ids with fixed strings, the home directory with
-`/home/user`, hostnames with `host`, and removes upstream headers other than
-`content-type`. `scripts/check-fixtures.sh` fails when any file under
-`tests/fixtures/` contains a 12-digit account id, `arn:aws:` outside the
-fixture ARN, the owner's home path, an `aoa`-prefixed or `eyJ`-prefixed
-token-shaped string, or a `kiro.dev` hostname with a real region other than
-the fixture's.
+`cargo xtask scrub <capture-dir> <fixture-dir> --source "<text>" [--hostname
+<name>] [--home <path>] [--name <text>] [--allow-truncated]` replaces the
+profile ARN and account id with
+`arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE`, conversation
+and utterance ids (collected from the request and the Kiro payload, wherever
+either key appears) with a fixed id, the home directory with `/home/user`
+(matched wherever it occurs, since it is specific enough that a mid-string
+match is still the owner's identity), and the hostname with `host`. The
+hostname rule matches only as a whole token (so a hostname that is merely a
+substring of a longer word is left alone), and tries two candidates, longest
+first: the full detected or supplied value, and its first label before a `.`.
+`hostname` usually prints only the short label, so if `--hostname` or
+detection instead supplies an FQDN, a capture holding only the short label
+still has to match; the reverse direction already worked, since the FQDN
+occurrence contains the label as a substring.
+
+The home directory and hostname default to `$HOME` and the `hostname`
+command's output; `--home`/`--hostname` override either explicitly. Detection
+failure aborts the scrub rather than silently scrubbing with an empty rule:
+an unset or empty `$HOME`, a missing, failing, or non-UTF-8 `hostname`
+command, or an explicitly empty `--home`/`--hostname` value, is a hard error
+naming the offending flag.
+
+**An operator recording a fixture must also pass `--name "<their name>"`**
+(final-fix-2.md Important 3). Unlike the home directory and hostname, a
+personal name has no detectable shape and no `$NAME`-equivalent environment
+variable to fall back on, so the scrubber cannot infer it: when `--name` is
+omitted, nothing rewrites it. `--name` matches only as a whole token, the
+same as the hostname rule, and rewrites to `operator`. Pass the same value to
+`FIXTURE_SCRUB_NAME` when running `scripts/check-fixtures.sh` locally against
+an unpublished capture, so the scanner checks for the name too.
+
+It writes one case per captured request under `<fixture-dir>/<n>/`:
+`meta.json` (`source`, scrubbed like every other field; `features`; `stream`,
+the request's own streaming flag), `request.json`, `expected-payload.json`,
+`upstream.eventstream` (rewritten frame by frame, so a `messageMetadataEvent`
+payload's `conversationId` and `utteranceId` are scrubbed even if the runtime
+assigned an id that never appeared in the request), and either
+`expected-sse.txt` (streaming, with `msg_` ids masked) or
+`expected-message.json` (non-streaming, the folded JSON body scrubbed, its
+own `id` field overwritten with the fixture harness's fixed message id since
+that harness compares the non-streaming case unmasked) depending on that
+same flag, matching which file the fixture harness reads for the case
+(section 8.2).
+
+A frame whose payload does not parse as JSON, or a frame `next_frame` itself
+fails to decode (a CRC mismatch, for example), aborts the scrub instead of
+publishing the unparsed bytes unscrubbed: the frame boundaries are
+untrustworthy at that point, so every later frame is lost regardless, and
+this is the one case where a partial result would be a leak. A stream
+truncated mid-frame is different: the incomplete tail is never written to
+any output, so there is nothing to leak. By default it still aborts, so an
+operator does not get a silently partial `upstream.eventstream` by accident,
+naming `--allow-truncated` as the remedy; with that flag the scrub instead
+writes the complete frames decoded so far and prints a warning to stderr
+naming the file and the pending byte count. This makes the "cancellation
+mid-stream" and "truncated stream" fixture cases (section 8.2) reachable.
+
+`scripts/check-fixtures.sh` fails when any file under `tests/fixtures/`
+contains a 12-digit account id, `arn:aws:` outside the fixture ARN, the
+owner's home path (with or without a trailing separator), an `aoa`-prefixed
+or `eyJ`-prefixed token-shaped string, an email address, or a `kiro.dev`
+hostname with a real region other than the fixture's. When
+`FIXTURE_SCRUB_NAME` is set it also fails on that exact word, matching
+`scrub --name`'s corresponding rule above; unset, it checks nothing for a
+name, since (unlike the other rules) there is no shape to check for without
+being told what to look for.
 
 Fixtures are public. Record only marker prompts (`kiro-trust fixture probe:
 ...`) so no real source code enters the repository.
 
 ### 8.4 Security tests
 
-One test per line, in `crates/kiro-trust-tests/tests/security.rs` (net and
-auth cases enable the `test-endpoints` feature from that crate only):
+One test per line, split across `crates/kiro-trust-tests/tests/security_net.rs`
+(net and auth cases, which enable the `test-endpoints` feature from that
+crate only) and `crates/kiro-trust-tests/tests/security_logging.rs` (the
+logging case):
 
 - `open_writable_is_impossible`: `UPDATE auth_kv` through the connection
   fails with an authorizer denial
 - `only_auth_tables_are_readable`: `SELECT` from `history` fails
-- `authorization_never_logged`, `refresh_token_never_logged`,
-  `client_secret_never_logged`, `prompt_never_logged`,
-  `tool_args_never_logged`: run the full fixture suite with a capturing
-  subscriber at `debug` and assert none of the markers appear
-- `oidc_redirect_rejected`, `runtime_redirect_rejected`: a 302 from a
-  loopback test server is an error and no second request is made
-- `invalid_region_rejected`: `us-east-1/`, `evil.com`, `US-EAST-1`,
-  `ap-southeast-1` (not allowlisted for runtime) all fail before any hostname
-  exists
-- `proxy_env_ignored`: with `HTTPS_PROXY` set to a listening socket, no
-  connection reaches it
-- `non_loopback_bind_fails`: `0.0.0.0:3456` and `192.168.1.10:3456` are
-  config errors
-- `missing_token_401`, `wrong_token_401`, `health_needs_no_token`
-- `no_url_in_net_api`: compile-time, `Destination` is the only host input
+
+(unit tests in `crates/kiro-trust-auth/src/db.rs`, since they need the
+connection)
+
+- `nothing_sensitive_reaches_the_logs` (`security_logging.rs`): runs real
+  `/v1/messages` flows (streaming, folded, an auth failure, and a malformed
+  body) at `debug` level against a process-wide capturing subscriber, and
+  asserts that none of a marker set covering every spec 6.4 forbidden
+  category (headers, prompt, tool name/argument/result, thinking text,
+  response text, conversation id, session id, token, home path, database
+  path, account id, ARN) appears in any captured log line
+- `oidc_redirect_rejected`, `runtime_redirect_rejected`
+  (`security_net.rs`): a 302 from a loopback test server is an error and no
+  second request is made
+- `region_pattern` (`crates/kiro-trust-net/src/region.rs`): `us-east-1/`,
+  `evil.com`, `US-EAST-1`, and eight more malformed inputs are all pattern
+  errors; `runtime_allowlist` (same file): `ap-southeast-1` is
+  pattern-valid but fails the runtime allowlist, both before any hostname
+  is built (final-fix-2.md Important 4 renamed this from
+  `invalid_region_rejected`, which named no real test)
+- `proxy_env_ignored` (`security_net.rs`): with `HTTPS_PROXY` set to a
+  listening socket, no connection reaches it
+- `only_loopback_addresses_are_accepted`
+  (`crates/kiro-trust/src/config.rs`): `0.0.0.0:3456` and
+  `192.168.1.10:3456` are config errors (final-fix-2.md Important 4 renamed
+  this from `non_loopback_bind_fails`, which named no real test)
+- `health_needs_no_token_but_everything_else_does` (`server.rs`): `/health`
+  needs no token; a missing token and a wrong one (`Bearer wrong`) both 401
+  on every other route; a valid token in either `authorization` or
+  `x-api-key` succeeds (final-fix-2.md Important 4 renamed this from three
+  names, `missing_token_401`, `wrong_token_401`, and `health_needs_no_token`,
+  that named no real tests: all three conditions live in this one test)
+- `no_url_in_net_api`: unpinned. No test or CI script currently enforces
+  that `Destination` is the only host input in `kiro-trust-net`'s public
+  API; it holds today by code review against CLAUDE.md's architecture rules
+  and spec 3.2 alone (final-fix-2.md Important 4)
 - `binary_has_no_dev_features`: `cargo tree -e features -p kiro-trust`
   contains neither `capture` nor `test-endpoints` (script in CI). The check
   and every release build select `-p kiro-trust` alone, because a workspace
@@ -754,22 +959,80 @@ auth cases enable the `test-endpoints` feature from that crate only):
 
 ### 8.5 Fuzz targets
 
-`fuzz/fuzz_targets/`: `frame_decode` (bytes → frames), `event_parse`
-(frame → `Event`), `sse_translate` (event sequence → SSE, asserting no panic
-and block state invariants), `anthropic_request` (bytes → `Request`),
-`tool_input_accumulate` (fragment sequences). Seeds come from the fixtures. A
-weekly CI job runs each for five minutes; a crash file is committed as a
-regression fixture.
+`fuzz/fuzz_targets/`:
+
+- `frame_decode` (bytes → frames). Generates structurally valid, possibly
+  multi-frame streams through the crate's own header/frame encoder, with a
+  fuzzer-chosen `(index, byte)` corruption and a trailing-byte truncation
+  spliced in, plus a raw-bytes fallback mode for shapes the generator can't
+  easily construct on purpose (an inconsistent total/headers length, bytes
+  that never form a valid prelude at all). It is not seeded: a mutated seed
+  dies at the message CRC exactly as a random one dies at the prelude CRC, so
+  a corpus buys nothing the in-process generator doesn't already give.
+- `event_parse` (frame → `Event`). Draws the event type from the six literals
+  `EventParser::parse` dispatches on (`eventstream.rs:368-424`) plus a
+  free-form escape hatch that keeps the unknown-type fallthrough reachable,
+  and builds each payload as a JSON object carrying the exact keys that event
+  type reads.
+- `sse_translate` (event sequence → SSE). Runs every emitted `StreamEvent`
+  through `sse::encode` and asserts no panic, the block-state invariants
+  (open/close ordering, strictly increasing indices, deltas targeting the
+  open block), that the stream starts with `MessageStart`, and that it ends
+  with exactly one `MessageStop` and nothing after it.
+- `anthropic_request` (bytes → `Request`). The one target seeded from
+  fixtures: the CI workflow copies `tests/fixtures/*/request.json` into
+  `fuzz/corpus/anthropic_request/` before each run. `tests/fixtures/` is the
+  only seed source anywhere in this project; a capture directory is never
+  one.
+- `tool_input_accumulate` (fragment sequences), payloads built the same way
+  as `event_parse`'s.
+
+A weekly CI job runs each target for five minutes on the nightly toolchain,
+selected explicitly (`RUSTUP_TOOLCHAIN: nightly`): `dtolnay/rust-toolchain`
+only runs `rustup default`, and `rust-toolchain.toml` outranks that for every
+directory under the repository, `fuzz/` included, so cargo-fuzz's
+nightly-only sanitizer flags need the override or the job silently resolves
+to the pinned stable toolchain and fails outright. On failure the workflow
+uploads `fuzz/artifacts` only, never `fuzz/corpus`: a crash file is a
+regression fixture worth minimizing and committing, but the corpus is
+disposable per-run mutation state, and uploading it to a public artifact
+store risks it accumulating a real captured payload over time. A pull-request
+job (`fuzz-check`) runs `cargo check --manifest-path fuzz/Cargo.toml --locked
+--all-targets` on the stable toolchain, so a `kiro-trust-protocol` signature
+break is caught immediately rather than only on the next Monday.
 
 ### 8.6 Live tier
 
-`crates/kiro-trust-tests/tests/live.rs`, ignored by default. Each test reads
-the real database, sends
-a marker prompt with `max_tokens: 64`, and asserts on structure, never on
-model wording: streaming text arrives; a tool call to a `kiro_trust_probe`
-tool produces `tool_use`; a thinking request produces a `thinking` block;
-forcing expiry triggers a refresh; an invalid token yields 403 then a
-successful retry. Live tests print token counts and durations only.
+`crates/kiro-trust-tests/tests/live.rs`, ignored by default, gated on
+`KIRO_TRUST_LIVE=1`. Each test reads the real database, sends a marker
+prompt, and asserts on structure, never on model wording: streaming text
+arrives; a tool call to a `kiro_trust_probe` tool produces `tool_use`; a
+thinking request produces a `thinking` block; a non-streaming call returns a
+`message` with nonzero `usage.input_tokens`. Live tests print token counts,
+byte counts, and durations only, never a prompt, a response body, a
+conversation id, a token, an ARN, or an account id.
+
+`forced_refresh_succeeds` sets a validity buffer
+(`TokenSource::with_validity_buffer`) longer than any real token lifetime, so
+`TokenSource` treats every call as expired and refreshes through AWS OIDC
+regardless of how recently the credential was actually issued. It needs a
+second, explicit opt-in beyond `KIRO_TRUST_LIVE=1`: `KIRO_TRUST_LIVE_REFRESH=1`.
+Both must be `1` for the test to run. This is stricter than the other live
+tests because AWS's `CreateToken` reference does not document whether
+issuing a new refresh token invalidates the one that was exchanged for it;
+see the known limitation in section 12. kiro-trust never persists a refreshed
+token (spec 6.1), so a rotated refresh token lives only in this test's
+process memory and is discarded when it exits.
+
+This tier has no test for a 403 followed by a successful retry with a fresh
+token. That path is covered offline instead, at
+`crates/kiro-trust-tests/tests/kiro_client.rs:188-203`
+(`retries_throttling_server_errors_and_json_exceptions_but_not_client_errors`),
+against a mock upstream that returns a real 403. Forcing an actual 403 from
+the live tier would need a production seam to inject a known-bad token into
+`TokenSource`, purely for the test; repeatedly presenting invalid credentials
+to AWS Identity Center is not something a test suite should do against a real
+account.
 
 ### 8.7 CI gates
 
@@ -783,8 +1046,16 @@ successful retry. Live tests print token counts and durations only.
 6. `./scripts/check-fixtures.sh`
 7. `./scripts/check-features.sh` (8.4, last two lines)
 8. audit gate: `cargo build --release --locked -p kiro-trust` then
-   `target/release/kiro-trust audit --json --kiro-db tests/fixtures/db/idc.sqlite3`
-   compared with `tests/fixtures/db/idc-audit.json`
+   `target/release/kiro-trust audit --json --kiro-db tests/fixtures/db/idc.sqlite3 --token-file /tmp/kiro-trust-audit/token`.
+   `--token-file` points at a scratch path so the gate never touches a real
+   runtime token file. The `commit` field is stripped from the output before
+   comparing, because it changes on every build and so can never match a
+   committed fixture; what remains is compared with
+   `tests/fixtures/db/idc-audit.json`.
+9. `fuzz-check`: `cargo check --manifest-path fuzz/Cargo.toml --locked
+   --all-targets` (8.5), on the stable toolchain since it only needs to
+   type-check, not build the sanitizer-instrumented binaries the weekly
+   `fuzz.yml` job does.
 
 `tests/fixtures/db/idc.sqlite3` is a synthetic database built by
 `cargo xtask make-db` with placeholder values; it is not a scrubbed copy.
@@ -805,14 +1076,37 @@ cargo-dist 0.32.0, `dist-workspace.toml`:
 - installers: `shell`, `powershell`
 - `profile.dist`: `lto = "thin"`, `codegen-units = 1`, `strip = true`,
   `panic = "abort"`
+- `include = ["NOTICE"]`: every per-target archive's `[misc]` files are
+  `CHANGELOG.md`, `LICENSE`, `NOTICE`, `README.md` (`dist plan` confirms
+  it); Apache-2.0 section 4(d) requires a redistribution to carry it, and
+  before this it reached only `source.tar.gz`, which packages the whole
+  repository regardless of `include`
 
 Every workflow pins actions by commit SHA with the tag in a comment.
 `release.yml` is generated by `dist` then hand-edited to `contents: read`
 with `write` only on the `host` job; `allow-dirty = ["ci"]` keeps the edits.
 
 Verification a user can run: `gh attestation verify <archive> --owner
-dannyota`, and `sha256sum -c`. The SBOM is a `.cdx.json` per package on the
-release.
+dannyota`, and `sha256sum -c`. Attestations cover only the per-target
+archives, built and attested in `build-local-artifacts`. The two installers,
+`source.tar.gz`, `sha256.sum`, and the SBOM are global artifacts from
+`build-global-artifacts`, which does not attest; verify those with
+`sha256sum -c` only. This is a deliberate scope, not an oversight:
+`build-global-artifacts`'s job is to fetch the already-attested per-target
+archive and derive installers and checksums from it, so widening a second
+job to `attestations: write`/`id-token: write` would buy little. The SBOM is
+a `.cdx.xml` per package on the release: `cargo-cyclonedx`'s own default,
+and what `dist`'s generated `release.yml` looks for by name.
+`release-preflight.yml` greps the `cargo-cyclonedx` version `release.yml`
+pins (currently 0.5.5) out of that file rather than restating it, installs
+that exact version, then runs `cargo cyclonedx -v`: the same binary and the
+same invocation `release.yml` performs, so a future `dist` regeneration that
+bumps the pin cannot silently desync the rehearsal from the real run.
+`cargo-auditable` is left unpinned on both sides on purpose: `release.yml`'s
+generated matrix expression resolves to a `releases/latest` installer, so
+`release-preflight.yml` installing it with `--locked` and no version already
+matches; pinning only the preflight side would create the divergence this
+paragraph used to have for `cargo-cyclonedx`.
 
 No Homebrew tap and no quarantine removal.
 
@@ -821,21 +1115,37 @@ No Homebrew tap and no quarantine removal.
 `docs/releasing.md` holds the maintainer steps: bump every version field,
 add the CHANGELOG entry, push `master`, require CI green on the exact commit,
 dispatch `release-preflight.yml` (`cargo publish --workspace --dry-run
---locked`), `git tag -s vX.Y.Z`, push the tag, confirm the asset list
-including attestations and SBOMs. The release ends there.
+--locked --registry crates-io`), `git tag -s vX.Y.Z`, push the tag, confirm
+the asset list including attestations and SBOMs. The release ends there.
 
 ### 9.3 crates.io
 
 Never automatic. `publish-crates.yml` is dispatched by the owner with the
 tag: a `verify` job checks out `refs/tags/<tag>`, requires every version
-field to equal the tag, requires a complete GitHub Release, checks that all
-five crates exist on crates.io with owner `dannyota`, and repeats the dry run;
-a `publish` job then waits for the `crates-io` environment approval and
-publishes through Trusted Publishing. Approval is per version and never
-carries forward. Publish order is `kiro-trust-protocol`, `kiro-trust-net`,
-`kiro-trust-auth`, `kiro-trust-kiro`, `kiro-trust`, submitted as one workspace
-publish. The first publication of each crate needs a separate owner decision
-because Trusted Publishing cannot create a crate.
+field to equal the tag, requires a complete GitHub Release (including the
+SBOM), checks that all five crates exist on crates.io with owner `dannyota`,
+and repeats the dry run; a `publish` job then waits for the `crates-io`
+environment approval and publishes through Trusted Publishing. Approval is
+per version and never carries forward. Publish order is
+`kiro-trust-protocol`, `kiro-trust-net`, `kiro-trust-auth`,
+`kiro-trust-kiro`, `kiro-trust`, submitted as one workspace publish. The
+first publication of each crate needs a separate owner decision because
+Trusted Publishing cannot create a crate.
+
+GitHub auto-creates a referenced environment on first use with zero
+protection rules, which would let the first dispatch publish with no
+approval and from any ref. Both jobs run
+`scripts/check-crates-io-environment.sh`, which fails closed unless
+`crates-io` carries a `required_reviewers` rule with at least one reviewer
+and a deployment branch policy. When `custom_branch_policies` is set, the
+script also verifies deployment branch policies by querying
+`GET /repos/{owner}/{repo}/environments/crates-io/deployment-branch-policies`
+and requires every entry to be a branch policy named `master`. When
+`protected_branches` is set instead, the script delegates the branch-policy
+check to the repository's branch-protection settings. That script is a
+backstop: the environment's own protection rules, set under Settings >
+Environments before the first dispatch, are the actual mechanism that pauses
+the job for approval and restricts which ref can reach it.
 
 ## 10. Versioning
 
@@ -889,6 +1199,20 @@ environment except its own `KIRO_TRUST_*` variables.
   larger prompt, not a failure.
 - **Custom frame decoder.** Mitigated by fuzzing, bounded allocation, CRC
   validation, and transcribed kirocc regression cases.
+- **Refresh token rotation.** kiro-trust reads the Kiro CLI's stored refresh
+  token and, on a refresh, keeps the result in memory only; it never writes
+  back (spec 6.1). AWS's `CreateToken` reference does not document whether
+  issuing a new refresh token invalidates the one that was exchanged for it,
+  so whether Identity Center rotates on use is unknown. If it does, a
+  refresh performed by kiro-trust leaves the Kiro CLI's own stored refresh
+  token stale, and the owner has to log in to Kiro CLI again to restore it.
+  Mitigation: kiro-trust refreshes only when the cached credential is within
+  the validity buffer of expiry (5 minutes by default), so in ordinary use
+  the Kiro CLI itself refreshes first, on its own schedule, and kiro-trust
+  reads the result the CLI already wrote; kiro-trust's own refresh path is
+  reached only when the CLI has not refreshed recently enough, which the
+  live tier's `forced_refresh_succeeds` test exercises deliberately (spec
+  8.6) and ordinary use should rarely hit.
 
 ## 13. Backlog
 
@@ -907,3 +1231,4 @@ Deferred with reasons; each becomes a spec change before code.
 | GPT models | different reasoning schema |
 | cosign step in addition to attestations | attestations already Sigstore-backed |
 | Homebrew tap | must not strip quarantine; needs notarization |
+| header read timeout | `axum::serve` exposes no header-read deadline; a manual `hyper_util` accept loop would add it. Loopback plus the mandatory token keeps the exposure to local processes. `axum::serve` also spawns a task per connection with no cap; the `MAX_CONCURRENT` semaphore (`crates/kiro-trust/src/server/messages.rs`) bounds concurrent `/v1/messages` requests but not idle connections that never reach the handler. |

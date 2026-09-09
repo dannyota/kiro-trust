@@ -1,0 +1,57 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/kiro-trust-protocol",
+    "crates/kiro-trust-net",
+    "crates/kiro-trust-auth",
+    "crates/kiro-trust-kiro",
+    "crates/kiro-trust",
+    "crates/kiro-trust-tests",
+    "xtask",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "Apache-2.0"
+repository = "https://github.com/dannyota/kiro-trust"
+authors = ["Danny"]
+# final-fix-2.md Minor 7: unset in every crate, so each crates.io page
+# rendered with no README. Path is relative to *this* file (workspace-package
+# path fields resolve from the workspace root, then Cargo re-derives each
+# inheriting crate's relative path automatically); `cargo package` copies the
+# out-of-tree file into the published tarball the same way it does for
+# NOTICE (Important 1), so no crate needs its own README.md copy.
+readme = "README.md"
+keywords = ["claude-code", "kiro", "proxy", "aws"]
+categories = ["command-line-utilities", "network-programming"]
+
+[workspace.dependencies]
+kiro-trust-protocol = { path = "crates/kiro-trust-protocol", version = "0.1.0" }
+kiro-trust-net = { path = "crates/kiro-trust-net", version = "0.1.0" }
+kiro-trust-auth = { path = "crates/kiro-trust-auth", version = "0.1.0" }
+kiro-trust-kiro = { path = "crates/kiro-trust-kiro", version = "0.1.0" }
+kiro-trust = { path = "crates/kiro-trust", version = "0.1.0" }
+# Insertion order drives wire field order for Kiro payloads; see spec 7.6.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tokio = { version = "1.53.1", default-features = false }
+bytes = "1.12.1"
+http = "1.5.0"
+uuid = { version = "1.26.0", features = ["v4", "v5"] }
+secrecy = "0.10.3"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+tempfile = "3.27.0"
+wiremock = "0.6.5"
+
+# Profile used by `dist`.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

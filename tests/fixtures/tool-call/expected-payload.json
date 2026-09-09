@@ -1,0 +1,109 @@
+{
+  "conversationState": {
+    "conversationId": "00000000-0000-4000-8000-00000000c0ff",
+    "chatTriggerType": "MANUAL",
+    "agentTaskType": "vibe",
+    "currentMessage": {
+      "userInputMessage": {
+        "content": "",
+        "modelId": "claude-sonnet-4.6",
+        "origin": "KIRO_CLI",
+        "userInputMessageContext": {
+          "envState": {
+            "operatingSystem": "linux",
+            "currentWorkingDirectory": "/home/user/proj"
+          },
+          "tools": [
+            {
+              "toolSpecification": {
+                "name": "Read",
+                "description": "Read a file",
+                "inputSchema": {
+                  "json": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "cachePoint": {
+                "type": "default"
+              }
+            },
+            {
+              "toolSpecification": {
+                "name": "mcp__very_long_server_name__and_an_even_longer_too_1d66f927323af",
+                "description": "Tool: mcp__very_long_server_name__and_an_even_longer_tool_name_that_exceeds_sixty_four",
+                "inputSchema": {
+                  "json": {
+                    "type": "object",
+                    "properties": {}
+                  }
+                }
+              }
+            }
+          ],
+          "toolResults": [
+            {
+              "toolUseId": "toolu_01",
+              "status": "success",
+              "content": [
+                {
+                  "json": {
+                    "exit_status": "0",
+                    "stdout": "fn main() {}",
+                    "stderr": ""
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "history": [
+      {
+        "userInputMessage": {
+          "content": "kiro-trust fixture probe.\n<env>\nWorking directory: /home/user/proj\nPlatform: linux\n</env>",
+          "origin": "KIRO_CLI"
+        }
+      },
+      {
+        "assistantResponseMessage": {
+          "messageId": "4abd27ca-8e4e-5a51-bfdf-c2e413bfd2f5",
+          "content": "I will fully incorporate this information when generating my responses, and explicitly acknowledge relevant parts of the summary when answering questions."
+        }
+      },
+      {
+        "userInputMessage": {
+          "content": "Read a.rs then summarize.",
+          "origin": "KIRO_CLI"
+        }
+      },
+      {
+        "assistantResponseMessage": {
+          "messageId": "49710e99-3d99-54c7-ae02-6d84e1e57c33",
+          "content": "Reading.",
+          "toolUses": [
+            {
+              "toolUseId": "toolu_01",
+              "name": "Read",
+              "input": {
+                "path": "a.rs"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "profileArn": "arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE"
+}

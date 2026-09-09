@@ -1,0 +1,1 @@
+{"model": "claude-opus-4-6", "max_tokens": 512, "stream": true, "thinking": {"type": "enabled", "budget_tokens": 1024}, "messages": [{"role": "user", "content": "kiro-trust fixture probe: think then answer 42."}]}

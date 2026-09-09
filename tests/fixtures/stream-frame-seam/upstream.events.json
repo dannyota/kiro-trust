@@ -1,0 +1,8 @@
+[
+  {"event_type": "assistantResponseEvent", "payload": {"content": "pas"}},
+  {"event_type": "assistantResponseEvent", "payload": {"content": "sword succ"}},
+  {"event_type": "assistantResponseEvent", "payload": {"content": "eeded"}},
+  {"event_type": "assistantResponseEvent", "payload": {"content": " ✓ 日本"}},
+  {"event_type": "assistantResponseEvent", "payload": {"content": "語"}},
+  {"event_type": "metadataEvent", "payload": {"tokenUsage": {"uncachedInputTokens": 30, "outputTokens": 8, "totalTokens": 38, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}}}
+]

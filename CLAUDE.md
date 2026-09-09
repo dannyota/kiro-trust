@@ -63,7 +63,13 @@ kiro-trust (bin)  →  kiro-trust-kiro  →  kiro-trust-net, kiro-trust-protocol
   the fields in spec 6.4. There is no body-logging flag; do not add one. Payload
   capture exists only behind the `capture` feature.
 - Secrets are `secrecy::SecretString`. Call `expose_secret()` only inside
-  `TokenSource::with_token` and the OIDC refresh request builder. Never derive
+  `TokenSource::with_token`, the OIDC refresh request builder,
+  `server::require_token`, `token::write_temp_file`, and `env_cmd::run` (the
+  fifth site: `env`'s whole purpose is printing the token, spec 4.3, so there
+  is no way to implement it without one; the token goes to stdout only, never
+  to a log, stderr, or any error path). Test code is exempt: a `#[cfg(test)]`
+  function may call `expose_secret()` on a value it constructed itself, to
+  assert on it, without becoming a sixth production site. Never derive
   `Serialize`, or a `Debug` that prints content, for a type holding one.
 - The Kiro database is opened only through `open_read_only`. Never add another
   constructor, never write, never copy the file, never read a table other than
@@ -122,6 +128,9 @@ cargo publish --workspace --dry-run --locked             # release preflight, no
 Cap the offline suite with `cargo test -- --test-threads=6` on the dev machine
 (8 cores). Do not commit `RUST_TEST_THREADS` to `.cargo/config.toml`. Live tests
 assert structure, never model wording, and print counts and durations only.
+The live command above still skips `forced_refresh_succeeds`: that test forces
+a real OIDC refresh and needs a second, explicit `KIRO_TRUST_LIVE_REFRESH=1`
+alongside `KIRO_TRUST_LIVE=1` (spec 8.6).
 
 ## Release
 

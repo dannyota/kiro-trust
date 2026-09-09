@@ -1,0 +1,16 @@
+{
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 256,
+  "stream": true,
+  "system": [{"type": "text", "text": "kiro-trust fixture probe.\n<env>\nWorking directory: /home/user/proj\nPlatform: linux\n</env>", "cache_control": {"type": "ephemeral"}}],
+  "tools": [
+    {"name": "Read", "description": "Read a file", "input_schema": {"type": "object", "properties": {"path": {"type": "string", "minLength": 1}}, "required": ["path"], "additionalProperties": false}, "cache_control": {"type": "ephemeral"}},
+    {"name": "mcp__very_long_server_name__and_an_even_longer_tool_name_that_exceeds_sixty_four", "description": "", "input_schema": {"type": "object", "properties": {}}},
+    {"type": "tool_search_tool_regex_20251119", "name": "tool_search"}
+  ],
+  "messages": [
+    {"role": "user", "content": "Read a.rs then summarize."},
+    {"role": "assistant", "content": [{"type": "text", "text": "Reading."}, {"type": "tool_use", "id": "toolu_01", "name": "Read", "input": {"path": "a.rs"}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_01", "content": [{"type": "text", "text": "fn main() {}"}]}]}
+  ]
+}

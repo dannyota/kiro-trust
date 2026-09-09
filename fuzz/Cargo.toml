@@ -1,0 +1,57 @@
+[package]
+name = "kiro-trust-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+arbitrary = { version = "1.4.2", features = ["derive"] }
+kiro-trust-protocol = { path = "../crates/kiro-trust-protocol" }
+# preserve_order: relied on through feature unification with the path
+# dependency above (spec 7.6 needs it for wire field order); declared
+# explicitly so that dependence doesn't rest on unification alone (fix-1
+# minor 7).
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "event_parse"
+path = "fuzz_targets/event_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sse_translate"
+path = "fuzz_targets/sse_translate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "anthropic_request"
+path = "fuzz_targets/anthropic_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tool_input_accumulate"
+path = "fuzz_targets/tool_input_accumulate.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone package: the root workspace lists fuzz/ under exclude.
+[workspace]
+members = ["."]

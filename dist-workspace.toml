@@ -1,0 +1,22 @@
+[workspace]
+members = ["cargo:."]
+
+# NOTE: release.yml is hand-edited after generation: `contents: read` at the
+# workflow level with `write` only on `host`, no `pull_request` trigger, and
+# every action pinned by commit SHA. `allow-dirty = ["ci"]` makes dist keep
+# those edits. To regenerate, remove `allow-dirty`, run `dist init`, reapply.
+[dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+allow-dirty = ["ci"]
+installers = ["shell", "powershell"]
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]
+checksum = "sha256"
+# Apache-2.0 section 4(d) requires a redistribution to carry NOTICE; without
+# this, every archive short of source.tar.gz dropped it (final-fix-2.md
+# Important 1). `dist plan` confirms it lands in each target archive's [misc]
+# file list alongside LICENSE/README.md/CHANGELOG.md.
+include = ["NOTICE"]
+github-attestations = true
+cargo-auditable = true
+cargo-cyclonedx = true
