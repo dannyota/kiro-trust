@@ -20,6 +20,13 @@ fi
 # isolates each match so one allow-listed fixture ARN or id on a line (or,
 # with -a, a whole SQLite page treated as one line) cannot mask a different
 # real match on the same line.
+#
+# The allow-listed values below are two more copies of the same constants
+# (task-21-fix-1 Minor 6): xtask/src/main.rs's FIXTURE_ARN/
+# FIXTURE_CONVERSATION_ID and crates/kiro-trust-tests/src/lib.rs's copies.
+# xtask must not depend on kiro-trust-tests, so all three are kept in sync
+# by hand; a drift here would make the scrubber emit an ARN or id this
+# scanner treats as real.
 if hits=$(grep -rnaoE 'arn:aws:codewhisperer:[a-z0-9-]+:[0-9]{12}:profile/[A-Za-z0-9]+' "$DIR" 2>/dev/null | grep -v ':000000000000:profile/FIXTURE'); then
   report "a profile ARN in a fixture" "$hits"
 fi

@@ -12,6 +12,9 @@ cargo test --workspace -- --test-threads=6
 
 `cargo test` needs no Kiro login. The live tier reads the Kiro CLI database
 and is opt-in: `KIRO_TRUST_LIVE=1 cargo test --workspace -- --ignored --test-threads=1`.
+That command still skips `forced_refresh_succeeds`, which forces a real OIDC
+refresh and needs a second, explicit `KIRO_TRUST_LIVE_REFRESH=1` alongside
+`KIRO_TRUST_LIVE=1` (spec 8.6).
 
 ## Read the spec before changing behavior
 

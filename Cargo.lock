@@ -2452,6 +2452,7 @@ dependencies = [
  "kiro-trust-protocol",
  "rusqlite",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

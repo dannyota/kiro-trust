@@ -11,3 +11,6 @@ repository.workspace = true
 kiro-trust-protocol.workspace = true
 serde_json.workspace = true
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile.workspace = true

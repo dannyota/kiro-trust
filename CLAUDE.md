@@ -126,6 +126,9 @@ cargo publish --workspace --dry-run --locked             # release preflight, no
 Cap the offline suite with `cargo test -- --test-threads=6` on the dev machine
 (8 cores). Do not commit `RUST_TEST_THREADS` to `.cargo/config.toml`. Live tests
 assert structure, never model wording, and print counts and durations only.
+The live command above still skips `forced_refresh_succeeds`: that test forces
+a real OIDC refresh and needs a second, explicit `KIRO_TRUST_LIVE_REFRESH=1`
+alongside `KIRO_TRUST_LIVE=1` (spec 8.6).
 
 ## Release
 

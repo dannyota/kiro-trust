@@ -3,6 +3,11 @@
 use kiro_trust_protocol::eventstream::{encode_event_frame, encode_exception_frame};
 use std::path::{Path, PathBuf};
 
+// Kept in sync by hand with two other copies (task-21-fix-1 Minor 6):
+// `xtask/src/main.rs`'s `FIXTURE_ARN`/`FIXTURE_CONVERSATION_ID` (`xtask`
+// must not depend on this crate) and the grep allowlists in
+// `scripts/check-fixtures.sh`. A drift here would make the scrubber emit
+// an ARN or id the scanner treats as real; change all three together.
 pub const FIXTURE_ARN: &str = "arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE";
 pub const FIXTURE_CONVERSATION_ID: &str = "00000000-0000-4000-8000-00000000c0ff";
 pub const FIXTURE_MESSAGE_ID: &str = "msg_fixture000000000000000";
@@ -48,6 +53,9 @@ pub fn load_upstream_frames(case: &Path) -> Option<Vec<u8>> {
 }
 
 /// Replace `msg_` ids so captured and generated output compare.
+/// Duplicated line for line as `xtask/src/main.rs`'s `mask_msg_ids`
+/// (task-21-fix-1 Minor 6); `xtask` must not depend on this crate, so keep
+/// both in sync by hand.
 pub fn mask_message_ids(sse: &str) -> String {
     let mut out = String::with_capacity(sse.len());
     let mut rest = sse;

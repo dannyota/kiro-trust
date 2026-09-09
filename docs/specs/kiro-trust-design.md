@@ -741,7 +741,10 @@ targets the ARN region for the runtime.
 | smoke | Claude Code through the proxy, by hand | same, recorded in release notes |
 
 The offline suite must pass on `ubuntu-latest`, `macos-latest`, and
-`windows-latest`.
+`windows-latest`. The live command above skips `forced_refresh_succeeds`: that
+test needs a second, explicit `KIRO_TRUST_LIVE_REFRESH=1` alongside
+`KIRO_TRUST_LIVE=1` (section 8.6), so a plain live run reporting success does
+not mean the forced-refresh path ran.
 
 ### 8.2 Fixture format
 
@@ -777,23 +780,45 @@ malformed frame; truncated stream; 200 with JSON exception.
 
 The `capture` cargo feature adds `--capture-dir`. For every request it writes
 `<n>-request.json`, `<n>-payload.json`, `<n>-upstream.eventstream`, and
-`<n>-response.sse` with mode 0600, in a directory with mode 0700. The feature
-is off by default, absent from release builds, and reported by `audit` with
-exit 1.
+`<n>-response.sse` with mode 0600, in a directory with mode 0700 (created only
+when missing; an existing directory keeps its mode, and a pre-existing file or
+symlink at one of these four names is never overwritten or followed:
+`Capture::write` uses `create_new`, so a restart needs an empty
+`--capture-dir`). The feature is off by default, absent from release builds,
+and reported by `audit` with exit 1.
 
-`cargo xtask scrub <capture-dir> <fixture-dir> --source "<text>"` replaces the
-profile ARN and account id with
+`cargo xtask scrub <capture-dir> <fixture-dir> --source "<text>" [--hostname
+<name>] [--home <path>]` replaces the profile ARN and account id with
 `arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE`, conversation
-and utterance ids with a fixed id, the home directory with `/home/user`
+and utterance ids (collected from the request and the Kiro payload, wherever
+either key appears) with a fixed id, the home directory with `/home/user`
 (matched wherever it occurs, since it is specific enough that a mid-string
-match is still the owner's identity), and the hostname with `host` (matched
-only as a whole token, so a hostname that is merely a substring of a longer
-word is left alone). It writes one case per captured request under
-`<fixture-dir>/<n>/`: `meta.json`, `request.json`, `expected-payload.json`,
+match is still the owner's identity), and the hostname with `host`. The
+hostname rule matches only as a whole token (so a hostname that is merely a
+substring of a longer word is left alone), and tries two candidates, longest
+first: the full detected or supplied value, and its first label before a `.`.
+`hostname` usually prints only the short label, so if `--hostname` or
+detection instead supplies an FQDN, a capture holding only the short label
+still has to match; the reverse direction already worked, since the FQDN
+occurrence contains the label as a substring.
+
+The home directory and hostname default to `$HOME` and the `hostname`
+command's output; `--home`/`--hostname` override either explicitly. Detection
+failure aborts the scrub rather than silently scrubbing with an empty rule:
+an unset or empty `$HOME`, or a missing, failing, or non-UTF-8 `hostname`
+command, is a hard error naming the missing flag.
+
+It writes one case per captured request under `<fixture-dir>/<n>/`:
+`meta.json` (`source`, scrubbed like every other field; `features`; `stream`,
+the request's own streaming flag), `request.json`, `expected-payload.json`,
 `upstream.eventstream` (rewritten frame by frame, so a `messageMetadataEvent`
-payload's `conversationId` and `utteranceId` are scrubbed even if the
-runtime assigned an id that never appeared in the request), and
-`expected-sse.txt` (with `msg_` ids masked). `scripts/check-fixtures.sh`
+payload's `conversationId` and `utteranceId` are scrubbed even if the runtime
+assigned an id that never appeared in the request; a frame whose payload does
+not parse as JSON, or a stream truncated or malformed mid-frame, aborts the
+scrub instead of publishing a partial result), and either `expected-sse.txt`
+(streaming, with `msg_` ids masked) or `expected-message.json` (non-streaming,
+the folded JSON body scrubbed) depending on that same flag, matching which
+file the fixture harness reads for the case (section 8.2). `scripts/check-fixtures.sh`
 fails when any file under `tests/fixtures/` contains a 12-digit account id,
 `arn:aws:` outside the fixture ARN, the owner's home path, an
 `aoa`-prefixed or `eyJ`-prefixed token-shaped string, or a `kiro.dev`
@@ -872,6 +897,16 @@ issuing a new refresh token invalidates the one that was exchanged for it;
 see the known limitation in section 12. kiro-trust never persists a refreshed
 token (spec 6.1), so a rotated refresh token lives only in this test's
 process memory and is discarded when it exits.
+
+This tier has no test for a 403 followed by a successful retry with a fresh
+token. That path is covered offline instead, at
+`crates/kiro-trust-tests/tests/kiro_client.rs:188-203`
+(`retries_throttling_server_errors_and_json_exceptions_but_not_client_errors`),
+against a mock upstream that returns a real 403. Forcing an actual 403 from
+the live tier would need a production seam to inject a known-bad token into
+`TokenSource`, purely for the test; repeatedly presenting invalid credentials
+to AWS Identity Center is not something a test suite should do against a real
+account.
 
 ### 8.7 CI gates
 
