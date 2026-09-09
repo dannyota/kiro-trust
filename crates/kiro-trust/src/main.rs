@@ -1,3 +1,3 @@
 fn main() {
-    println!("kiro-trust scaffold");
+    std::process::exit(kiro_trust::run());
 }

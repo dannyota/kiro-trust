@@ -201,7 +201,10 @@ per-frame size cap. Error bodies are read to at most 64 KiB.
 
 `clap` subcommands: `serve`, `audit`, `env`. Modules: `config` (flags, env,
 validation), `server` (axum routes, middleware, limits), `token` (local token
-file), `audit`, `env`. The binary owns the `tracing` subscriber.
+file), `serve` (the `serve` command: credential read, bind, shutdown), `logging`
+(the `tracing` subscriber and its `EnvFilter`), `audit`, `env`. The binary owns
+the `tracing` subscriber; it is installed once, from `logging::init`, before
+`serve::run` starts.
 
 ### 3.6 xtask
 
@@ -229,8 +232,11 @@ placeholder database for the audit gate (section 8.7). Depends on
 Precedence: flag, then env, then default. Startup order: parse and validate
 config, open the database read-only and read credentials (fail fast with a
 clear message), write the token file, bind, print one line with the listener
-and token file path, serve. On SIGINT or SIGTERM: stop accepting, drain for up
-to 10 s, delete the token file, exit 0.
+and token file path, serve. A failure at any step before the token file is
+written leaves no token file behind; a failure after binding removes it. On
+SIGINT or SIGTERM: delete the token file and stop accepting immediately (no
+new client can read a valid token during the drain that follows), drain
+existing connections for up to 10 s, exit 0.
 
 ### 4.2 `kiro-trust audit [--json]`
 
@@ -495,6 +501,11 @@ Each line here maps to a test in `tests/security/` (section 8.4).
   beyond its basename.
 - There is no body-logging flag. Payload capture exists only behind the
   `capture` cargo feature and is compiled out of release builds.
+- `--log-level`/`KIRO_TRUST_LOG` only ever raises this project's own crates
+  (`kiro_trust`, `kiro_trust_auth`, `kiro_trust_kiro`, `kiro_trust_net`).
+  Third-party crates, notably `hyper`, `rustls`, and `reqwest`, stay at
+  `warn` at every level the CLI accepts, including `debug` and `trace`, so
+  they never log request data.
 
 ### 6.5 Telemetry
 
