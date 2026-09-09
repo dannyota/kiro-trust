@@ -748,6 +748,10 @@ auth cases enable the `test-endpoints` feature from that crate only):
 - `open_writable_is_impossible`: `UPDATE auth_kv` through the connection
   fails with an authorizer denial
 - `only_auth_tables_are_readable`: `SELECT` from `history` fails
+
+(unit tests in `crates/kiro-trust-auth/src/db.rs`, since they need the
+connection)
+
 - `authorization_never_logged`, `refresh_token_never_logged`,
   `client_secret_never_logged`, `prompt_never_logged`,
   `tool_args_never_logged`: run the full fixture suite with a capturing
