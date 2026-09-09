@@ -191,8 +191,8 @@ per-frame size cap. Error bodies are read to at most 64 KiB.
   `application/vnd.amazon.eventstream` is decoded as an AWS exception
   envelope; `ThrottlingException` and `InternalServerException` retry, others
   fail. A 403 calls `TokenSource::invalidate()` and retries once with a fresh
-  token. Connection errors before any byte is sent retry; errors after the
-  stream started do not.
+  token; a second 403 fails with an authentication error. Connection errors
+  before any byte is sent retry; errors after the stream started do not.
 - `UpstreamError { status, exception_type, message (≤ 1 KiB) }` maps to the
   Anthropic error envelope in the server.
 
