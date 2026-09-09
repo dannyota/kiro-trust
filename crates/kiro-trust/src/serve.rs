@@ -105,15 +105,11 @@ pub async fn run(cfg: ServeConfig) -> Result<(), String> {
         tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(10)).await;
             tracing::warn!("drain deadline reached, exiting");
-            // Non-zero: reaching this branch means the graceful drain did
-            // not finish within the bound, which is not the same outcome
-            // as the normal path below returning `Ok(())` in time. Using
-            // `0` unconditionally here would report success even when the
-            // still-pending `axum::serve` future was heading toward a real
-            // error, since this call terminates the process before that
-            // future ever gets to resolve and flow through the normal
-            // `Result`-to-exit-code mapping in `lib.rs`.
-            std::process::exit(1);
+            // The deadline is a policy bound, not a failure: a streaming
+            // response can outlive the drain window, so exit 0 per spec 4.1
+            // and 4.4. The warn line above distinguishes this path. Known
+            // and accepted: an axum::serve error inside the window is masked.
+            std::process::exit(0);
         });
     };
     let result = axum::serve(listener, build_router(state))
