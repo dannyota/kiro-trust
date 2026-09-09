@@ -1057,10 +1057,15 @@ protection rules, which would let the first dispatch publish with no
 approval and from any ref. Both jobs run
 `scripts/check-crates-io-environment.sh`, which fails closed unless
 `crates-io` carries a `required_reviewers` rule with at least one reviewer
-and a deployment branch policy. That script is a backstop: the environment's
-own protection rules, set under Settings > Environments before the first
-dispatch, are the actual mechanism that pauses the job for approval and
-restricts which ref can reach it.
+and a deployment branch policy. When `custom_branch_policies` is set, the
+script also verifies deployment branch policies by querying
+`GET /repos/{owner}/{repo}/environments/crates-io/deployment-branch-policies`
+and requires every entry to be a branch policy named `master`. When
+`protected_branches` is set instead, the script delegates the branch-policy
+check to the repository's branch-protection settings. That script is a
+backstop: the environment's own protection rules, set under Settings >
+Environments before the first dispatch, are the actual mechanism that pauses
+the job for approval and restricts which ref can reach it.
 
 ## 10. Versioning
 

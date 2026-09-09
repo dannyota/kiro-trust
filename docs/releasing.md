@@ -157,12 +157,17 @@ workflow from reaching the environment at all.
 GitHub creates a missing environment on first use with no protection rules,
 which would let a dispatch publish without approval and from any ref. Both
 the `verify` and `publish` jobs run `scripts/check-crates-io-environment.sh`
-against `GET /repos/dannyota/kiro-trust/environments/crates-io` and fail the
-job when either rule is absent, a 404, or the response is malformed. Treat
-that script as a backstop, not the mechanism: it can only fail a run after
-the fact, while the environment's own protection rules are what actually
-pause the job for approval and restrict which ref can reach it. Confirm both
-rules before the first dispatch:
+against `GET /repos/{owner}/{repo}/environments/crates-io` (where
+`{owner}/{repo}` is derived from `${GITHUB_REPOSITORY}`, falling back to
+`dannyota/kiro-trust` when not set), and when `custom_branch_policies` is
+configured, also queries `GET /repos/{owner}/{repo}/environments/crates-io/deployment-branch-policies`
+to verify every policy is a branch policy named `master`. The script fails the
+job when either the required reviewers rule or a deployment branch policy is
+absent, a 404 is returned, or the response is malformed. Treat that script as
+a backstop, not the mechanism: it can only fail a run after the fact, while
+the environment's own protection rules are what actually pause the job for
+approval and restrict which ref can reach it. Confirm both rules before the
+first dispatch:
 
 ```bash
 gh api repos/dannyota/kiro-trust/environments/crates-io \
