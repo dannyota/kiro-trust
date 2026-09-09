@@ -12,12 +12,13 @@ permissions:
   contents: read
 
 jobs:
+  # Authoritative gate: fmt and clippy are platform-independent, and the
+  # workspace's non-kiro-trust crates (kiro-trust-protocol, kiro-trust-net,
+  # kiro-trust-auth, kiro-trust-kiro) are pure translation and policy logic
+  # that cannot differ by platform (CLAUDE.md Architecture rules), so this
+  # runs once, here, on Linux.
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -29,6 +30,32 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
+
+  # macOS and Windows run only what is genuinely platform-sensitive: the
+  # kiro-trust binary crate (token file mode and directory creation in
+  # token.rs, directories-crate path resolution in config.rs exercised by
+  # its default-path tests, and audit.rs's platform-conditional
+  # local_authentication text, all `#[cfg(unix)]`-branching or
+  # per-OS-path-resolving; plus the subprocess `env`/`log-level` integration
+  # tests, which round-trip real files through each OS's own filesystem) and
+  # kiro-trust-tests' `fixtures` binary (`every_fixture_case`, which compares
+  # recorded fixture bytes with `assert_eq!` and caught a real CRLF checkout
+  # bug on Windows). Every other crate is pure logic proven once on Linux
+  # above, so it is not repeated here.
+  test-platform:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch; rust-toolchain.toml pins the version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo test --locked -p kiro-trust
+      - run: cargo test --locked -p kiro-trust-tests --test fixtures
 
   gates:
     runs-on: ubuntu-latest
