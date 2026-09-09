@@ -2,7 +2,7 @@
 //! redirects, no proxy, bounded timeouts (spec 3.2, 6.2).
 
 use crate::destination::Destination;
-use crate::policy::Policy;
+use crate::policy::{ExtraCaError, Policy};
 use bytes::Bytes;
 use futures_util::stream::{BoxStream, StreamExt, TryStreamExt};
 use http::HeaderMap;
@@ -25,6 +25,12 @@ pub enum NetError {
         "request path would change the authority for {host}; paths must be absolute and carry no userinfo"
     )]
     BadPath { host: String },
+    /// An `--extra-ca` PEM failed to parse or contained no usable trust
+    /// anchor (spec 6.2). Deliberately carries only the fixed reason class
+    /// from `ExtraCaError`: never a file path (the caller that read the file
+    /// attaches that itself) and never certificate bytes.
+    #[error("extra CA rejected: {0}")]
+    ExtraCa(ExtraCaError),
 }
 
 /// Root store `kiro-trust audit` reports (spec 6.6): kept next to the
@@ -46,8 +52,7 @@ pub struct Client {
 
 impl Client {
     pub fn new(policy: Policy) -> Result<Self, NetError> {
-        let mut roots = rustls::RootCertStore::empty(); // audit reports this root store as TLS_ROOTS
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let roots = Self::build_roots(&policy);
         let tls = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -63,6 +68,28 @@ impl Client {
             .build()
             .map_err(|e| NetError::Build(e.without_url().to_string()))?;
         Ok(Client { inner, policy })
+    }
+
+    /// Builds the root store this client's TLS config trusts: the compiled
+    /// `webpki-roots` set first, then, additively, every certificate from
+    /// `policy`'s `ExtraCa` if one is set (spec 6.2). Never the reverse
+    /// order and never a replacement: an extra CA can only add anchors.
+    fn build_roots(policy: &Policy) -> rustls::RootCertStore {
+        let mut roots = rustls::RootCertStore::empty(); // audit reports this root store as TLS_ROOTS
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let Some(extra_ca) = policy.extra_ca() {
+            extra_ca.add_to(&mut roots);
+        }
+        roots
+    }
+
+    /// Test-only: proves the compiled `webpki-roots` set survives when an
+    /// extra CA is configured, without exposing root contents to any
+    /// consumer (brief: "the compiled webpki-roots must remain present when
+    /// an extra CA is configured").
+    #[cfg(test)]
+    fn root_count(policy: &Policy) -> usize {
+        Self::build_roots(policy).roots.len()
     }
 
     fn url(&self, dest: &Destination, path: &str) -> String {
@@ -135,6 +162,45 @@ impl Client {
             max_error_body: self.policy.max_error_body,
         })
     }
+
+    /// Test-only: completes a TLS handshake against an arbitrary loopback
+    /// address, trusting exactly the root store `policy` would give a real
+    /// `Client` (spec 6.2's `--extra-ca`). `Destination` only ever names the
+    /// two production hosts, so this is the one sanctioned way for this
+    /// crate's own tests to prove root-store behavior against a test TLS
+    /// server. Gated on `cfg(test)` alone, not the `test-endpoints`
+    /// feature: it calls `tokio-rustls`, a dev-dependency, so this must stay
+    /// out of every non-test build, including one that unifies
+    /// `test-endpoints` in from `kiro-trust-tests` (AGENTS.md Architecture
+    /// rules) without also running `cargo test`.
+    #[cfg(test)]
+    async fn test_tls_connect(
+        policy: &Policy,
+        addr: std::net::SocketAddr,
+        server_name: &str,
+    ) -> Result<(), NetError> {
+        let roots = Self::build_roots(policy);
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls));
+        let domain = rustls::pki_types::ServerName::try_from(server_name.to_string())
+            .map_err(|_| NetError::Build("invalid test server name".to_string()))?;
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(|e| NetError::Transport {
+                host: addr.to_string(),
+                detail: e.to_string(),
+            })?;
+        connector
+            .connect(domain, tcp)
+            .await
+            .map_err(|e| NetError::Transport {
+                host: addr.to_string(),
+                detail: e.to_string(),
+            })?;
+        Ok(())
+    }
 }
 
 pub struct Response {
@@ -185,5 +251,120 @@ impl Response {
             .bytes_stream()
             .map_err(|e| NetError::Body(e.without_url().to_string()))
             .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::ExtraCa;
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+    use tokio::net::TcpListener;
+
+    /// A self-signed CA and a "localhost" leaf certificate it signed, for
+    /// proving the default policy rejects a server this CA vouches for while
+    /// a policy carrying the CA connects (brief: prove `ExtraCa` actually
+    /// changes what TLS trusts, not just that it parses).
+    struct TestPki {
+        ca_pem: String,
+        leaf_cert_der: rustls::pki_types::CertificateDer<'static>,
+        leaf_key_der: rustls::pki_types::PrivateKeyDer<'static>,
+    }
+
+    fn build_test_pki() -> TestPki {
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_pem = ca_cert.pem();
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+
+        TestPki {
+            ca_pem,
+            leaf_cert_der: leaf_cert.der().clone(),
+            leaf_key_der: leaf_key.into(),
+        }
+    }
+
+    /// Serves one TLS connection on loopback with the given leaf certificate
+    /// and key, then stops. Returns the bound port.
+    async fn serve_one_tls_connection(
+        cert: rustls::pki_types::CertificateDer<'static>,
+        key: rustls::pki_types::PrivateKeyDer<'static>,
+    ) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                // The handshake is all this test needs; a client that
+                // rejects the certificate never gets this far, and a
+                // client that accepts it completes here. Either way the
+                // server has nothing further to do.
+                let _ = acceptor.accept(tcp).await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_policy_rejects_server_signed_by_unknown_ca() {
+        let pki = build_test_pki();
+        let port = serve_one_tls_connection(pki.leaf_cert_der, pki.leaf_key_der).await;
+        let policy = Policy::production();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let result = Client::test_tls_connect(&policy, addr, "localhost").await;
+        assert!(
+            result.is_err(),
+            "default compiled roots must not trust a test-only CA"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn policy_with_extra_ca_connects_to_server_signed_by_that_ca() {
+        let pki = build_test_pki();
+        let port = serve_one_tls_connection(pki.leaf_cert_der, pki.leaf_key_der).await;
+        let extra_ca = ExtraCa::from_pem(pki.ca_pem.as_bytes()).unwrap();
+        let policy = Policy::production().with_extra_ca(extra_ca);
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let result = Client::test_tls_connect(&policy, addr, "localhost").await;
+        assert!(
+            result.is_ok(),
+            "a policy carrying the signing CA must connect: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn compiled_roots_are_present_with_no_extra_ca() {
+        let policy = Policy::production();
+        let count = Client::root_count(&policy);
+        assert_eq!(count, webpki_roots::TLS_SERVER_ROOTS.len());
+    }
+
+    #[test]
+    fn compiled_roots_survive_when_an_extra_ca_is_configured() {
+        let extra_ca = {
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let pem = params.self_signed(&key).unwrap().pem();
+            ExtraCa::from_pem(pem.as_bytes()).unwrap()
+        };
+        let compiled_count = webpki_roots::TLS_SERVER_ROOTS.len();
+        let policy = Policy::production().with_extra_ca(extra_ca);
+        let count = Client::root_count(&policy);
+        // Additive only (spec 6.2): the compiled set must still be all
+        // present, plus exactly the one extra root, never fewer than the
+        // compiled count and never a replacement of it.
+        assert_eq!(count, compiled_count + 1);
     }
 }

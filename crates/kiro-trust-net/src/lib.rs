@@ -8,7 +8,7 @@ mod region;
 
 pub use client::{Client, HTTP_PROXY, NetError, REDIRECTS, Response, TLS_ROOTS};
 pub use destination::Destination;
-pub use policy::Policy;
+pub use policy::{ExtraCa, Policy};
 pub use region::{RUNTIME_ALLOWLIST, Region, RegionError, RuntimeRegion};
 
 /// Whether this crate itself was built with `test-endpoints` (spec 8.4;
