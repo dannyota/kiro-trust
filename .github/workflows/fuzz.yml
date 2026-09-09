@@ -32,10 +32,9 @@ jobs:
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked
-      # anthropic_request's corpus isn't cached or committed (spec 8.5); it
-      # is rebuilt from the fixtures fresh on every run, matrix leg
-      # included that doesn't use it, since only tests/fixtures/*/
-      # request.json is ever a seed source, never a capture directory.
+      # Seed anthropic_request corpus from tests/fixtures/*/request.json (spec 8.5).
+      # Corpus isn't cached or committed, so it is rebuilt on each run. This step
+      # runs only for the anthropic_request matrix leg (see if guard below).
       - name: Seed anthropic_request corpus from fixtures
         if: matrix.target == 'anthropic_request'
         run: |
