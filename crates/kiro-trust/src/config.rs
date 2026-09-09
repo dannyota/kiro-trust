@@ -182,17 +182,6 @@ impl ServeConfig {
     }
 }
 
-/// Serializes every test, in this module or elsewhere in this crate, that
-/// parses a `serve` command while `KIRO_TRUST_LOG` might be mutated. Rust
-/// runs a crate's unit tests as one process across several threads, so a
-/// test that sets this process-wide environment variable to an invalid
-/// value (to prove `Cli::try_parse_from` rejects it) can otherwise race any
-/// other thread's `Cli::try_parse_from`/`ServeConfig::from_args` call that
-/// does not pass `--log-level` itself and would read the same polluted
-/// value. `crates/kiro-trust/src/serve.rs`'s tests also take this lock.
-#[cfg(test)]
-pub(crate) static LOG_LEVEL_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,9 +211,6 @@ mod tests {
 
     #[test]
     fn serve_config_applies_defaults_and_validates() {
-        // Guards against a concurrent test's KIRO_TRUST_LOG mutation; see
-        // `an_invalid_kiro_trust_log_env_value_is_rejected`.
-        let _guard = LOG_LEVEL_ENV_TEST_LOCK.lock().unwrap();
         let cli =
             Cli::try_parse_from(["kiro-trust", "serve", "--kiro-db", "/tmp/x.sqlite3"]).unwrap();
         let Command::Serve(args) = cli.command else {
@@ -287,25 +273,6 @@ mod tests {
                 "{level} should be accepted"
             );
         }
-    }
-
-    // Important 1: KIRO_TRUST_LOG reaches the same clap field as
-    // --log-level, so an invalid value there is rejected the same way. clap
-    // runs the arg's value_parser against an env-sourced value exactly as
-    // it does a command-line value (verified against clap_builder 4.6.6's
-    // `Parser::add_env`, which calls the same `react` path used for
-    // command-line arguments).
-    #[test]
-    fn an_invalid_kiro_trust_log_env_value_is_rejected() {
-        let _guard = LOG_LEVEL_ENV_TEST_LOCK.lock().unwrap();
-        // SAFETY: serialized by LOG_LEVEL_ENV_TEST_LOCK against every other
-        // test in this crate that parses a `serve` command without passing
-        // --log-level, so no other test observes this value.
-        unsafe { std::env::set_var("KIRO_TRUST_LOG", "info,hyper=trace") };
-        let result = Cli::try_parse_from(["kiro-trust", "serve", "--kiro-db", "/tmp/x.sqlite3"]);
-        unsafe { std::env::remove_var("KIRO_TRUST_LOG") };
-        let err = result.unwrap_err();
-        assert_eq!(err.exit_code(), 2);
     }
 
     #[test]

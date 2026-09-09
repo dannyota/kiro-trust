@@ -140,28 +140,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("no-such-data.sqlite3");
         let token_file = dir.path().join("run").join("token");
-        let cfg = {
-            // Guards against a concurrent test's KIRO_TRUST_LOG mutation
-            // (see `config::LOG_LEVEL_ENV_TEST_LOCK`) only for as long as
-            // parsing actually reads the environment; released before the
-            // `.await` below so it is never held across one.
-            let _guard = crate::config::LOG_LEVEL_ENV_TEST_LOCK.lock().unwrap();
-            let cli = Cli::try_parse_from([
-                "kiro-trust",
-                "serve",
-                "--kiro-db",
-                db_path.to_str().unwrap(),
-                "--token-file",
-                token_file.to_str().unwrap(),
-                "--listen",
-                "127.0.0.1:0",
-            ])
-            .unwrap();
-            let Command::Serve(args) = cli.command else {
-                panic!()
-            };
-            ServeConfig::from_args(args).unwrap()
+        let cli = Cli::try_parse_from([
+            "kiro-trust",
+            "serve",
+            "--kiro-db",
+            db_path.to_str().unwrap(),
+            "--token-file",
+            token_file.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+        ])
+        .unwrap();
+        let Command::Serve(args) = cli.command else {
+            panic!()
         };
+        let cfg = ServeConfig::from_args(args).unwrap();
         let err = run(cfg).await.unwrap_err();
         assert!(!err.is_empty());
         assert!(

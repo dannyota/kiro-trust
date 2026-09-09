@@ -151,13 +151,17 @@ async fn nothing_sensitive_reaches_the_logs() {
     let _ = body_string(r).await;
     // An authenticated but malformed body, so the 400 `invalid_request`
     // path (a plausible leak site for a parse error) is genuinely exercised
-    // too, not just the auth-failure path above.
+    // too, not just the auth-failure path above. The body carries a marker
+    // inside otherwise-malformed JSON (the closing brace is missing) so a
+    // parse error that ever echoed body content into the logs would be
+    // caught by the marker sweep below; a body with no marker at all could
+    // not detect that.
     let r = app
         .clone()
         .oneshot(
             Request::post("/v1/messages")
                 .header("x-api-key", TOKEN)
-                .body(Body::from("{not valid json"))
+                .body(Body::from("{\"model\":\"PROMPT_MARKER_5b6\""))
                 .unwrap(),
         )
         .await
