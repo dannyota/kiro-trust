@@ -11,6 +11,13 @@ name: Publish crates
 # uploads are not atomic, so this readiness check cannot replace the required
 # Trusted Publishing settings review. Actions are pinned by commit because this
 # is the one workflow that holds a live publish token.
+#
+# GitHub auto-creates a referenced environment on first use with zero
+# protection rules, which would let the first dispatch publish with no
+# approval. Both jobs run scripts/check-crates-io-environment.sh, which fails
+# the job unless `crates-io` carries a required-reviewer rule and a
+# deployment branch policy. That script is a backstop; the environment's own
+# rules under Settings > Environments are the actual mechanism.
 
 on:
   workflow_dispatch:
@@ -52,6 +59,12 @@ jobs:
         with:
           ref: refs/tags/${{ inputs.tag }}
           persist-credentials: false
+
+      - name: Require the crates-io environment to be protected
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/check-crates-io-environment.sh
 
       - name: Record the tagged commit
         id: commit
@@ -109,7 +122,7 @@ jobs:
           fi
           mapfile -t assets < <(jq -r '.assets[] | select(.state == "uploaded") | .name' <<<"$release")
           expected=(dist-manifest.json sha256.sum source.tar.gz source.tar.gz.sha256
-            kiro-trust-installer.sh kiro-trust-installer.ps1)
+            kiro-trust-installer.sh kiro-trust-installer.ps1 kiro-trust.cdx.xml)
           targets="$(sed -n 's/^targets = \[\(.*\)\]/\1/p' dist-workspace.toml | tr -d '",')"
           if [ -z "$targets" ]; then
             echo "no targets parsed from dist-workspace.toml; the array must be on one line" >&2
@@ -122,10 +135,6 @@ jobs:
             esac
             expected+=("$archive" "$archive.sha256")
           done
-          if [ "${#expected[@]}" -lt 9 ]; then
-            echo "expected asset list is implausibly short (${#expected[@]})" >&2
-            exit 1
-          fi
           missing=()
           for name in "${expected[@]}"; do
             printf '%s\n' "${assets[@]}" | grep -qxF -- "$name" || missing+=("$name")
@@ -160,6 +169,15 @@ jobs:
         with:
           ref: refs/tags/${{ inputs.tag }}
           persist-credentials: false
+
+      # Backstop for `verify`'s check of the same rules: if the job graph
+      # ever changes so `publish` no longer needs `verify`, this still runs
+      # before the OIDC token exchange below.
+      - name: Require the crates-io environment to be protected
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/check-crates-io-environment.sh
 
       - name: Require the commit the verify job checked
         shell: bash

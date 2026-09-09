@@ -54,27 +54,41 @@ publishing it alone can leave `cargo install kiro-trust` unable to resolve.
    tag triggers `.github/workflows/release.yml`, which builds the binary
    matrix and publishes the GitHub Release with attestations and SBOMs.
 8. Confirm the release carries a complete asset list. **The release ends
-   here.** A user-facing check for any downloaded archive:
+   here.** A user-facing check for any downloaded per-target archive:
 
    ```bash
    gh attestation verify kiro-trust-x86_64-unknown-linux-gnu.tar.xz --owner dannyota
    ```
 
+   Attestations cover only the per-target archives. The two installers,
+   `source.tar.gz`, `sha256.sum`, and the SBOM (`kiro-trust.cdx.xml`) are not
+   attested; verify those with `sha256sum -c` against `sha256.sum` instead.
+   This is a deliberate scope, not a gap: the job that builds those global
+   artifacts only fetches the already-attested per-target archive and
+   derives installers and checksums from it.
+
 9. Only with the owner's explicit approval for this version: dispatch
    `.github/workflows/publish-crates.yml` with the tag and approve the
    `crates-io` environment when the run pauses for review. A `verify` job
    checks out `refs/tags/<tag>`, refuses unless every workspace version field
-   equals the tag and the GitHub Release for it carries every expected asset,
-   checks that all five crate names exist with the expected owner, and repeats
-   the dry run. Only then does the `publish` job wait for environment
-   approval. It repeats the crate ownership check before obtaining a
-   short-lived crates.io Trusted Publishing token and submitting the
-   workspace.
+   equals the tag and the GitHub Release for it carries every expected asset
+   (the per-target archives and checksums, the installers, `source.tar.gz`
+   and its checksum, `dist-manifest.json`, `sha256.sum`, and
+   `kiro-trust.cdx.xml`), checks that all five crate names exist with the
+   expected owner, and repeats the dry run. Both `verify` and `publish` also
+   require the `crates-io` environment to carry a required-reviewer rule and
+   a deployment branch policy, failing closed if either is absent (see
+   below); only then does the `publish` job wait for environment approval.
+   It repeats the crate ownership check before obtaining a short-lived
+   crates.io Trusted Publishing token and submitting the workspace.
 
-CI in step 5 runs formatting, locked Clippy, locked workspace tests,
-package-content and fixture-leak checks. Preflight in step 6 verifies the
-workspace packages without uploading them. Both must pass for the exact
-release commit before tagging.
+CI in step 5 runs, across its `test`, `gates`, `audit`, and `fuzz-check`
+jobs: formatting, locked Clippy, locked workspace tests, package-content,
+fixture-leak, and feature checks, the audit-command regression check,
+`cargo-deny` (advisories, bans, licenses, sources), and a type check of the
+fuzz targets. Preflight in step 6 verifies the workspace packages and the
+SBOM tool without uploading anything. Both must pass for the exact release
+commit before tagging.
 
 For local checks when needed, cap builds at two jobs and tests at four threads.
 The package check requires Python 3.11 or later for TOML parsing.
@@ -86,7 +100,11 @@ cargo clippy --locked --workspace --all-targets --jobs 2 -- -D warnings
 cargo test --locked --workspace --jobs 2 -- --test-threads=4
 ./scripts/check-packages.sh
 ./scripts/check-fixtures.sh
+./scripts/check-features.sh
 ```
+
+This local list is a fast subset for iterating; `cargo-deny` and the fuzz
+matrix are heavier and run in CI, not here.
 
 After step 5 passes CI, dispatch and identify the preflight run:
 
@@ -129,14 +147,34 @@ to be nonempty, then `gh run watch "$publish_run_id" --exit-status`.
 The `publish` job waits in the `crates-io` environment until the owner
 approves it in the Actions UI. That gate is repository configuration, not
 workflow text: the environment must exist under Settings, Environments, with
-the owner as a required reviewer. GitHub creates a missing environment on
-first use with no protection rules, which would let a dispatch publish without
-approval, so confirm the reviewer rule before the first dispatch:
+**both** the owner as a required reviewer **and** a deployment branch policy
+restricting deployments to `master`. Both requirements matter:
+`workflow_dispatch` runs the workflow file from whatever ref is dispatched,
+so without a branch policy a writer could push a branch with the checks
+stripped out and dispatch that; only the branch policy stops a modified
+workflow from reaching the environment at all.
+
+GitHub creates a missing environment on first use with no protection rules,
+which would let a dispatch publish without approval and from any ref. Both
+the `verify` and `publish` jobs run `scripts/check-crates-io-environment.sh`
+against `GET /repos/dannyota/kiro-trust/environments/crates-io` and fail the
+job when either rule is absent, a 404, or the response is malformed. Treat
+that script as a backstop, not the mechanism: it can only fail a run after
+the fact, while the environment's own protection rules are what actually
+pause the job for approval and restrict which ref can reach it. Confirm both
+rules before the first dispatch:
 
 ```bash
 gh api repos/dannyota/kiro-trust/environments/crates-io \
   --jq '.protection_rules[] | select(.type == "required_reviewers")'
+gh api repos/dannyota/kiro-trust/environments/crates-io \
+  --jq '.deployment_branch_policy'
 ```
+
+The second command must show `protected_branches: true` or
+`custom_branch_policies: true`; a `custom_branch_policies` policy also needs
+its named branch pattern checked separately in Settings, Environments to
+confirm it is scoped to `master` and not a wildcard.
 
 Before every dispatch, verify each crate's Trusted Publishing entry on
 crates.io: repository owner `dannyota`, repository `kiro-trust`, workflow

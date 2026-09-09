@@ -1007,11 +1007,19 @@ Every workflow pins actions by commit SHA with the tag in a comment.
 with `write` only on the `host` job; `allow-dirty = ["ci"]` keeps the edits.
 
 Verification a user can run: `gh attestation verify <archive> --owner
-dannyota`, and `sha256sum -c`. The SBOM is a `.cdx.xml` per package on the
-release: `cargo-cyclonedx`'s own default, and what `dist`'s generated
-`release.yml` looks for by name; `release-preflight.yml` exercises the tool
-with `--format json` only to prove it runs, not to match the release's
-output format.
+dannyota`, and `sha256sum -c`. Attestations cover only the per-target
+archives, built and attested in `build-local-artifacts`. The two installers,
+`source.tar.gz`, `sha256.sum`, and the SBOM are global artifacts from
+`build-global-artifacts`, which does not attest; verify those with
+`sha256sum -c` only. This is a deliberate scope, not an oversight:
+`build-global-artifacts`'s job is to fetch the already-attested per-target
+archive and derive installers and checksums from it, so widening a second
+job to `attestations: write`/`id-token: write` would buy little. The SBOM is
+a `.cdx.xml` per package on the release: `cargo-cyclonedx`'s own default,
+and what `dist`'s generated `release.yml` looks for by name;
+`release-preflight.yml` runs `cargo cyclonedx -v`, the exact invocation
+`release.yml` performs, to prove the tool works before the first tag rather
+than a separately-guessed invocation.
 
 No Homebrew tap and no quarantine removal.
 
@@ -1020,21 +1028,32 @@ No Homebrew tap and no quarantine removal.
 `docs/releasing.md` holds the maintainer steps: bump every version field,
 add the CHANGELOG entry, push `master`, require CI green on the exact commit,
 dispatch `release-preflight.yml` (`cargo publish --workspace --dry-run
---locked`), `git tag -s vX.Y.Z`, push the tag, confirm the asset list
-including attestations and SBOMs. The release ends there.
+--locked --registry crates-io`), `git tag -s vX.Y.Z`, push the tag, confirm
+the asset list including attestations and SBOMs. The release ends there.
 
 ### 9.3 crates.io
 
 Never automatic. `publish-crates.yml` is dispatched by the owner with the
 tag: a `verify` job checks out `refs/tags/<tag>`, requires every version
-field to equal the tag, requires a complete GitHub Release, checks that all
-five crates exist on crates.io with owner `dannyota`, and repeats the dry run;
-a `publish` job then waits for the `crates-io` environment approval and
-publishes through Trusted Publishing. Approval is per version and never
-carries forward. Publish order is `kiro-trust-protocol`, `kiro-trust-net`,
-`kiro-trust-auth`, `kiro-trust-kiro`, `kiro-trust`, submitted as one workspace
-publish. The first publication of each crate needs a separate owner decision
-because Trusted Publishing cannot create a crate.
+field to equal the tag, requires a complete GitHub Release (including the
+SBOM), checks that all five crates exist on crates.io with owner `dannyota`,
+and repeats the dry run; a `publish` job then waits for the `crates-io`
+environment approval and publishes through Trusted Publishing. Approval is
+per version and never carries forward. Publish order is
+`kiro-trust-protocol`, `kiro-trust-net`, `kiro-trust-auth`,
+`kiro-trust-kiro`, `kiro-trust`, submitted as one workspace publish. The
+first publication of each crate needs a separate owner decision because
+Trusted Publishing cannot create a crate.
+
+GitHub auto-creates a referenced environment on first use with zero
+protection rules, which would let the first dispatch publish with no
+approval and from any ref. Both jobs run
+`scripts/check-crates-io-environment.sh`, which fails closed unless
+`crates-io` carries a `required_reviewers` rule with at least one reviewer
+and a deployment branch policy. That script is a backstop: the environment's
+own protection rules, set under Settings > Environments before the first
+dispatch, are the actual mechanism that pauses the job for approval and
+restricts which ref can reach it.
 
 ## 10. Versioning
 

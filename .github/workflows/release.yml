@@ -122,6 +122,10 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+    # actions/attest@v4's README also lists `artifact-metadata: write`, but
+    # that permission is only needed for the storage-record path, which
+    # requires `push-to-registry: true`; dist does not set that here, so it
+    # is intentionally not granted. Do not add it to "fix" a missing scope.
     permissions:
       "attestations": "write"
       "contents": "read"
