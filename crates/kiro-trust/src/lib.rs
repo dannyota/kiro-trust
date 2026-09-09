@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod config;
 pub mod env_cmd;
+pub mod exec_cmd;
 pub mod logging;
 pub mod serve;
 pub mod server;
@@ -45,6 +46,7 @@ pub fn run() -> i32 {
         }
         Command::Audit(args) => audit::run(args),
         Command::Env(args) => env_cmd::run(args),
+        Command::Exec(args) => exec_cmd::run(args),
     }
 }
 
