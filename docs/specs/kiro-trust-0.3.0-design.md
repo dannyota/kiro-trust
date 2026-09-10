@@ -417,6 +417,29 @@ a completed attempt. Every return path carries the accumulated count. This makes
 requests account for retries as accurately as successful `UpstreamStream`
 values. Debug and display never print an upstream header value.
 
+### 5.3 Attempt progress during cancellation
+
+A returned `generate()` result cannot report attempts completed before that
+future was cancelled. `kiro-trust-kiro` provides a cloneable `AttemptProgress`
+handle containing one saturating `AtomicU32` counter. `completed()` reads the
+count; `record_completed(count)` adds completed attempts. The handle carries
+no request, credential, model, or error data.
+
+`Upstream::generate_with_progress(&Payload, &AttemptProgress)` defaults to
+calling `generate()` and adding the returned stream or error's `attempts`.
+Existing test doubles remain source-compatible. `KiroClient` overrides the
+method and uses the same retry loop as `generate()`. That loop increments
+progress immediately after each `net.post().await` returns, before another
+await or response inspection. Pending calls and pre-send failures add zero.
+Returned stream and error counts remain per-call; the shared handle is
+cumulative across the one permitted invalid-state replay. No count is added
+twice. `MAX_ATTEMPTS` remains three.
+
+Cancellation during retry sleep or a pending second send retains one completed
+attempt and zero retries. Cancellation after two completed posts retains two
+attempts and one retry. Counting begins only when a post returns, regardless
+of whether a pending call may already have sent bytes.
+
 ## 6. In-memory usage summary
 
 ### 6.1 Boundary and endpoint
@@ -527,7 +550,7 @@ Anthropic `usage()` output.
 `RequestUsageGuard` begins after envelope validation and model resolution but
 before the concurrency permit is attempted. It therefore counts a valid-model
 local-concurrency rejection. It carries `ModelKey`, start time, latest usage
-snapshot, output bytes, and retry count. Exactly one terminal method records
+snapshot, output bytes, and an `AttemptProgress` handle. Exactly one terminal method records
 `completed` or `failed`. `Drop` records `cancelled` only when no terminal
 method ran.
 
@@ -553,6 +576,13 @@ at zero; do not add a separate replay count. Failed `generate` calls use `Upstre
 their retries are not lost. Count tokens from the final observed attempt only;
 discarded invalid-state attempts contribute retries and duration, not token
 estimates. This summary measures proxy activity, not total upstream billing.
+
+The guard exposes a cloned handle through `attempt_progress()` and reads
+`completed().saturating_sub(1)` at completion, failure, and cancellation.
+`server::messages` passes the same handle to every `generate_with_progress()`
+call. `update(&mut self, UsageSnapshot, u64)` replaces the token snapshot and
+output-byte count; it takes no separate retry snapshot. Existing terminal log
+paths read the same progress count. Cancellation adds no log.
 
 The aggregate updates `started` and `in_flight` at begin. It adds the latest
 token snapshot, retries, and elapsed duration only at the terminal transition,
