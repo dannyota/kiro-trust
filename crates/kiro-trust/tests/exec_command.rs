@@ -501,7 +501,7 @@ fn on_unix_exec_replaces_the_process_rather_than_spawning_a_wrapper() {
 
     // Give the child time to start and reach its sleep before inspecting it.
     std::thread::sleep(std::time::Duration::from_millis(150));
-    let exe_link = std::fs::read_link(format!("/proc/{pid}/exe"));
+    let observed = running_image_name(pid);
 
     let status = child.wait().expect("wait for kiro-trust");
     assert!(
@@ -511,15 +511,67 @@ fn on_unix_exec_replaces_the_process_rather_than_spawning_a_wrapper() {
         status.code()
     );
 
-    let exe = exe_link.expect(
-        "/proc/<pid>/exe must resolve while the child is running; if it does \
-         not, `exec` may not have replaced the process image in time",
+    let observed = observed.expect(
+        "the running image name must be readable while the child is running; \
+         if it is not, `exec` may not have replaced the process image in time",
     );
-    assert_eq!(
-        exe.file_name(),
-        helper.file_name(),
+    let want = helper
+        .file_name()
+        .expect("helper path has a file name")
+        .to_string_lossy()
+        .to_string();
+    // A prefix match, not equality: `ps -o comm=` truncates on some systems
+    // (Linux's /proc path never does), and the helper is this test binary,
+    // whose name carries a hash suffix well past that limit. Either way the
+    // observed name must be the helper's, never `kiro-trust`, which is the
+    // wrapper this asserts does not survive.
+    assert!(
+        !observed.is_empty() && want.starts_with(&observed),
         "the pid `kiro-trust exec` was launched under must be running the \
          child's own executable image (exec replaces in place, spawning no \
-         wrapper), got /proc/{pid}/exe -> {exe:?}"
+         wrapper); observed {observed:?}, expected a prefix of {want:?}"
     );
+    assert!(
+        !observed.starts_with("kiro-trust"),
+        "a `kiro-trust` wrapper process must not survive the exec: {observed:?}"
+    );
+}
+
+/// The file name of the executable image pid `pid` is currently running.
+///
+/// Two implementations because the fact being checked is portable but the
+/// mechanism is not: Linux exposes `/proc/<pid>/exe`, which macOS has no
+/// equivalent of, so there `ps -o comm=` reports the same thing. An earlier
+/// version used only `/proc` behind `#[cfg(unix)]` and failed on
+/// macos-latest in CI (v020-exec-review.md flagged exactly this risk).
+///
+/// `ps` truncates `comm` on some systems, so compare only the file name, and
+/// keep the helper binary's name short enough to survive it.
+#[cfg(unix)]
+fn running_image_name(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        Some(link.file_name()?.to_string_lossy().to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if path.is_empty() {
+            return None;
+        }
+        Some(
+            std::path::Path::new(&path)
+                .file_name()?
+                .to_string_lossy()
+                .to_string(),
+        )
+    }
 }
