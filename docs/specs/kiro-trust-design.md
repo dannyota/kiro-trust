@@ -344,12 +344,14 @@ per-frame size cap. Error bodies are read to at most 64 KiB.
 
 ### 3.5 kiro-trust (binary)
 
-`clap` subcommands: `serve`, `audit`, `env`. Modules: `config` (flags, env,
-validation), `server` (axum routes, middleware, limits), `token` (local token
-file), `serve` (the `serve` command: credential read, bind, shutdown), `logging`
-(the `tracing` subscriber and its `EnvFilter`), `audit`, `env`. The binary owns
-the `tracing` subscriber; it is installed once, from `logging::init`, before
-`serve::run` starts.
+`clap` subcommands: `serve`, `audit`, `env`, `exec`, and `models`. Modules:
+`config` (flags, env, validation), `server` (axum routes, middleware, limits),
+`token` (local token file), `serve` (the `serve` command: credential read,
+bind, shutdown), `logging` (the `tracing` subscriber and its `EnvFilter`),
+`audit`, `env`, `exec`, and `models_cmd`. The binary owns the `tracing`
+subscriber; it is installed once, from `logging::init`, before `serve::run`
+starts. `models list` and `models show` return before logging initialization,
+credential access, listener access, or network-client construction.
 
 ### 3.6 xtask
 
@@ -399,6 +401,17 @@ when the listener address cannot be parsed or is not loopback, an invalid
 `--runtime-region` is given, the database cannot be confirmed read-only, the
 credential cannot be read, or a dev feature is compiled in. `audit` never
 starts a listener and never performs a network request.
+
+### 4.2.1 `kiro-trust models list [--json]` and `kiro-trust models show <model> [--json]`
+
+Both commands inspect the compiled catalog only. They do not open the Kiro
+database, read a token, contact a listener, or create a network client.
+
+Text `list` output has `ID`, `KIRO MODEL`, `CONTEXT`, `INPUTS`, and `EFFORT`
+columns. JSON is `{"object":"model_catalog","models":[ModelInfo...]}` in
+catalog order. Text `show` prints each `ModelInfo` field in a stable order.
+JSON is the selected `ModelInfo`. An unknown id exits 1 and prints the existing
+unknown-model message without echoing anything else.
 
 ### 4.3 `kiro-trust env [--shell sh|fish]`
 
@@ -490,7 +503,12 @@ API. The requirement lives in the `/v1/messages` handler, not in
 ### 5.2 Model catalog
 
 Static, shipped in `kiro-trust-protocol::catalog`, copied from kirocc's Claude
-rows with attribution in `NOTICE`.
+rows with attribution in `NOTICE`. The catalog exposes owned metadata through
+`ModelInfo`, keyed by the private `ModelKey`. A key covers one valid catalog
+row and context tier and cannot be constructed from caller text. `models()`
+returns every routable row and tier in catalog order. `model(&str)` resolves a
+catalog id to its metadata. `supports_kiro_model(&str)` recognizes Kiro SKUs
+only. `Resolved` carries the same `ModelKey` as the metadata row.
 
 | Anthropic id | Kiro SKU | 1M SKU | Context | Effort enum |
 | --- | --- | --- | --- | --- |
@@ -509,11 +527,22 @@ Transcribed from kirocc v0.11.1 `internal/models/effort.go` on 2026-09-08.
 Resolution: strip a trailing `-YYYYMMDD` date, canonicalize a trailing `[1m]`
 or `[1M]` to `[1m]`, accept a dashed or dotted minor version
 (`claude-sonnet-4-5` and `claude-sonnet-4.5` are the same row), then exact
-match. `[1m]` or an `anthropic-beta` header
-containing `context-1m` selects the 1M SKU when one exists; on an always-1M
-model the suffix is only an alias. Neither enables thinking. An id that does
-not resolve returns 400 `invalid_request_error` with the message
-`model <id> is not in the kiro-trust catalog`.
+match. `[1m]` or an `anthropic-beta` header containing `context-1m` selects
+the 1M SKU when one exists. On an always-1M model the suffix is only an alias.
+On a separate-1M-SKU row, an explicit `[1m]` enables thinking. The
+`context-1m` beta header and raw 1M SKU select context without independently
+enabling thinking. An id that does not resolve returns 400
+`invalid_request_error` with the message `model <id> is not in the kiro-trust
+catalog`.
+
+Each metadata entry has its routed Anthropic id, display name, Kiro SKU,
+concrete aliases, date-suffix acceptance, context window, effort levels,
+proxy input types, and history-image forwarding state. Metadata aliases stay
+within one `ModelKey`, include canonical ids, Kiro SKUs, and dashed or dotted
+forms, and never contain a placeholder date. `proxy_input_types` is always
+`text,image`: it states what the proxy accepts and forwards, not remote model
+vision support. `history_images_forwarded` is `false` until the live evidence
+test in section 8.6 passes. `ModelKey` is never serialized.
 
 `GET /v1/models` returns the shape Claude Code's gateway discovery accepts,
 transcribed from kirocc `internal/server/handlers.go`:

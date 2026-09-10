@@ -97,8 +97,55 @@ static ROWS: &[Row] = &[
     },
 ];
 
+/// A bounded catalog row and context tier. Only this module can construct it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ModelKey {
+    row: u8,
+    context_1m: bool,
+}
+
+impl ModelKey {
+    fn new(row: usize, context_1m: bool) -> Self {
+        Self {
+            row: row.try_into().expect("catalog has at most 256 rows"),
+            context_1m,
+        }
+    }
+
+    /// The stable, contiguous slot for this routable row and context tier.
+    pub fn catalog_index(self) -> usize {
+        ROWS[..usize::from(self.row)]
+            .iter()
+            .map(|row| {
+                if row.always_1m || row.kiro_1m.is_none() {
+                    1
+                } else {
+                    2
+                }
+            })
+            .sum::<usize>()
+            + usize::from(self.context_1m && !ROWS[usize::from(self.row)].always_1m)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ModelInfo {
+    #[serde(skip)]
+    pub key: ModelKey,
+    pub id: String,
+    pub display_name: String,
+    pub kiro_model: String,
+    pub aliases: Vec<String>,
+    pub accepts_date_suffix: bool,
+    pub context_window: u32,
+    pub effort_levels: Vec<String>,
+    pub proxy_input_types: Vec<String>,
+    pub history_images_forwarded: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolved {
+    pub key: ModelKey,
     /// The SKU sent upstream; never carries `[1m]`.
     pub kiro_model: String,
     /// Echoed in responses; carries `[1m]` when the window is 1M.
@@ -136,12 +183,12 @@ fn canonical_sku(s: &str) -> String {
     s.to_string()
 }
 
-fn find_row(sku: &str) -> Option<(&'static Row, bool)> {
-    ROWS.iter().find_map(|r| {
+fn find_row(sku: &str) -> Option<(usize, &'static Row, bool)> {
+    ROWS.iter().enumerate().find_map(|(index, r)| {
         if r.kiro == sku {
-            Some((r, false))
+            Some((index, r, false))
         } else if r.kiro_1m == Some(sku) {
-            Some((r, true))
+            Some((index, r, true))
         } else {
             None
         }
@@ -157,7 +204,8 @@ pub fn resolve(model: &str, context_1m_beta: bool) -> Result<Resolved, UnknownMo
         (trimmed, false)
     };
     let sku = canonical_sku(strip_date(base));
-    let (row, input_was_1m_sku) = find_row(&sku).ok_or_else(|| UnknownModel(model.to_string()))?;
+    let (row_index, row, input_was_1m_sku) =
+        find_row(&sku).ok_or_else(|| UnknownModel(model.to_string()))?;
 
     let thinking = has_suffix && !row.always_1m && row.kiro_1m.is_some();
     let want_1m = context_1m_beta || has_suffix || input_was_1m_sku;
@@ -173,12 +221,101 @@ pub fn resolve(model: &str, context_1m_beta: bool) -> Result<Resolved, UnknownMo
         anthropic_model.push_str(SUFFIX);
     }
     Ok(Resolved {
+        key: ModelKey::new(row_index, context_window == ONE_M_CONTEXT),
         kiro_model: kiro_model.to_string(),
         anthropic_model,
         context_window,
         thinking,
         effort_levels: row.effort,
     })
+}
+
+fn add_alias(aliases: &mut Vec<String>, alias: String) {
+    if !aliases.contains(&alias) {
+        aliases.push(alias);
+    }
+}
+
+fn model_info(row_index: usize, row: &Row, context_1m: bool) -> ModelInfo {
+    let kiro_model = if context_1m && !row.always_1m {
+        row.kiro_1m.unwrap_or(row.kiro)
+    } else {
+        row.kiro
+    };
+    let mut id = row.anthropic.to_string();
+    if context_1m {
+        id.push_str(SUFFIX);
+    }
+    let mut aliases = Vec::new();
+    let dotted = canonical_sku(row.anthropic);
+    if context_1m {
+        add_alias(&mut aliases, id.clone());
+        add_alias(&mut aliases, format!("{dotted}{SUFFIX}"));
+        add_alias(&mut aliases, kiro_model.to_string());
+        if row.always_1m {
+            add_alias(&mut aliases, row.anthropic.to_string());
+            add_alias(&mut aliases, dotted);
+        }
+    } else {
+        add_alias(&mut aliases, id.clone());
+        add_alias(&mut aliases, dotted);
+        add_alias(&mut aliases, kiro_model.to_string());
+    }
+    ModelInfo {
+        key: ModelKey::new(row_index, context_1m),
+        id,
+        display_name: if context_1m {
+            format!("{} (1M context)", row.display)
+        } else {
+            row.display.to_string()
+        },
+        kiro_model: kiro_model.to_string(),
+        aliases,
+        accepts_date_suffix: true,
+        context_window: if context_1m {
+            ONE_M_CONTEXT
+        } else {
+            DEFAULT_CONTEXT
+        },
+        effort_levels: row
+            .effort
+            .iter()
+            .map(|level| (*level).to_string())
+            .collect(),
+        proxy_input_types: vec!["text".to_string(), "image".to_string()],
+        history_images_forwarded: false,
+    }
+}
+
+/// Metadata for every routable catalog row and context tier, in catalog order.
+pub fn models() -> Vec<ModelInfo> {
+    let mut out = Vec::new();
+    for (index, row) in ROWS.iter().enumerate() {
+        if row.always_1m {
+            out.push(model_info(index, row, true));
+        } else {
+            out.push(model_info(index, row, false));
+            if row.kiro_1m.is_some() {
+                out.push(model_info(index, row, true));
+            }
+        }
+    }
+    out
+}
+
+/// Resolve an accepted catalog alias to the metadata for its routed tier.
+pub fn model(model: &str) -> Result<ModelInfo, UnknownModel> {
+    let resolved = resolve(model, false)?;
+    models()
+        .into_iter()
+        .find(|info| info.key == resolved.key)
+        .ok_or_else(|| UnknownModel(model.to_string()))
+}
+
+/// True only for exact compiled Kiro SKU values.
+pub fn supports_kiro_model(model_id: &str) -> bool {
+    ROWS.iter()
+        .any(|row| row.kiro == model_id || row.kiro_1m == Some(model_id))
 }
 
 /// kirocc `resolveEffort` for Claude models: an explicit recognized level
@@ -365,5 +502,38 @@ mod tests {
             1,
             "no duplicates"
         );
+    }
+
+    #[test]
+    fn model_info_and_resolution_share_a_bounded_key() {
+        let info = model("claude-sonnet-4-6[1m]").unwrap();
+        let resolved = resolve("claude-sonnet-4-6[1m]", false).unwrap();
+        assert_eq!(info.key, resolved.key);
+        assert_eq!(info.context_window, 1_000_000);
+        assert_eq!(info.proxy_input_types, ["text", "image"]);
+        assert!(!info.history_images_forwarded);
+    }
+
+    #[test]
+    fn generated_aliases_resolve_to_the_same_row() {
+        let info = model("claude-sonnet-4-6").unwrap();
+        for alias in &info.aliases {
+            assert_eq!(model(alias).unwrap().key, info.key, "{alias}");
+        }
+    }
+
+    #[test]
+    fn model_keys_index_each_routable_tier_contiguously() {
+        for (index, info) in models().iter().enumerate() {
+            assert_eq!(info.key.catalog_index(), index, "{}", info.id);
+        }
+    }
+
+    #[test]
+    fn only_compiled_kiro_skus_are_supported() {
+        assert!(supports_kiro_model("claude-sonnet-4.6"));
+        assert!(supports_kiro_model("claude-sonnet-4.6-1m"));
+        assert!(!supports_kiro_model("claude-sonnet-4-6"));
+        assert!(!supports_kiro_model("not-a-model"));
     }
 }

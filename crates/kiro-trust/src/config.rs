@@ -30,6 +30,32 @@ pub enum Command {
     Env(EnvArgs),
     /// Run a command with the exports set in its environment (spec 4.4).
     Exec(ExecArgs),
+    /// Inspect the compiled model catalog without credentials or network access.
+    Models(ModelsArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ModelsArgs {
+    #[command(subcommand)]
+    pub command: ModelsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ModelsCommand {
+    /// List every compiled model and context tier.
+    List {
+        /// Print the catalog as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one compiled model and context tier.
+    Show {
+        /// A compiled Anthropic or Kiro model id.
+        model: String,
+        /// Print the model as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug, Clone)]

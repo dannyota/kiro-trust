@@ -6,6 +6,7 @@ pub mod env_cmd;
 pub mod exec_cmd;
 pub mod listener;
 pub mod logging;
+pub mod models_cmd;
 pub mod serve;
 pub mod server;
 pub mod token;
@@ -48,6 +49,7 @@ pub fn run() -> i32 {
         Command::Audit(args) => audit::run(args),
         Command::Env(args) => env_cmd::run(args),
         Command::Exec(args) => exec_cmd::run(args),
+        Command::Models(args) => models_cmd::run(args),
     }
 }
 
