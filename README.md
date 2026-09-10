@@ -3,9 +3,6 @@
 **Security-first local trust proxy for using Claude Code with Kiro and AWS IAM
 Identity Center credentials.**
 
-See [`docs/specs/kiro-trust-design.md`](docs/specs/kiro-trust-design.md) for
-scope, architecture, and the security contracts this proxy holds itself to.
-
 `kiro-trust` sits between Claude Code and the Kiro runtime:
 
 ```text
@@ -33,9 +30,10 @@ gh attestation verify kiro-trust-x86_64-unknown-linux-gnu.tar.xz --owner dannyot
 sha256sum -c kiro-trust-x86_64-unknown-linux-gnu.tar.xz.sha256
 ```
 
-Each release also carries a CycloneDX SBOM per crate and binaries built with
-`cargo auditable`, so `cargo audit bin` can inspect what actually shipped. Put
-the verified binary on your `PATH`.
+Put the verified binary on your `PATH`. Each release also carries a CycloneDX
+SBOM per crate and binaries built with `cargo auditable`; see
+[`docs/security.md`](docs/security.md#verifying-a-release) for what else you can
+check.
 
 `cargo install kiro-trust --locked` works once a given version has also been
 published to crates.io; that publish needs the owner's explicit approval per
@@ -93,9 +91,11 @@ spec for every flag and environment variable.
 - No telemetry, no update checks, no dynamic model discovery.
 - No developer-only feature, such as `capture` (which writes real prompts
   and responses to disk), is compiled into a release build.
-- `kiro-trust audit` prints the effective configuration, and checks three
-  of these guarantees that a running build can check for itself (see
-  Audit below).
+
+[`docs/security.md`](docs/security.md) says how each of these is checked, and
+which of them `kiro-trust audit` measures rather than states.
+[`docs/threat-model.md`](docs/threat-model.md) names the threat each one
+answers.
 
 ## Audit
 
@@ -105,63 +105,63 @@ kiro-trust audit [--json]
 
 Prints the effective security configuration: listener address, connection
 limits, credential database path, outbound hosts, TLS roots, any extra trust
-anchor configured with `--extra-ca`, and whether any developer-only
-feature (such as `capture`, which writes real prompts and responses to disk)
-is compiled into this build. It exits 1 when the listener address cannot be
-parsed or is not loopback, an invalid `--runtime-region` is given, the
-credential database cannot be confirmed read-only, the credential cannot be
-read, or a developer-only feature is compiled in (spec 4.2); it never starts
-a listener or makes a network request itself.
+anchor configured with `--extra-ca`, and whether any developer-only feature is
+compiled into this build. It never starts a listener and never makes a network
+request.
 
-Only some of the lines above are measurements of this running build: the
-listener address, credential database path and mode, and outbound hosts are
-read back from the code that actually enforces them. TLS roots, HTTP proxy
-setting, and redirect policy are not read back from anything: they are
-`pub const` strings declared next to the `Client` builder calls that set
-that behavior (`crates/kiro-trust-net/src/client.rs`), so a change to the
-builder would not fail any test tied to these three printed lines. The
-behavior itself is pinned by the named tests `oidc_redirect_rejected`,
-`runtime_redirect_rejected`, and `proxy_env_ignored`
-(`crates/kiro-trust-tests/tests/security_net.rs`), not by `audit`. The
-`Telemetry`, `Request body logging`, `Dynamic model discovery`, and
-`Automatic updates` lines are fixed text too, printed the same way
-regardless of build or configuration, because they each assert that a whole
-category of code does not exist in this binary; no field you can print
-proves an absence better than the source itself does. Read those four as a
-pointer to go verify the claim in the source (or `NOTICE`), not as
-something `audit` checked for you.
+It exits 1 when the listener address cannot be parsed or is not loopback, an
+invalid `--runtime-region` is given, the credential database cannot be
+confirmed read-only, the credential cannot be read, or a developer-only feature
+is compiled in (spec 4.2).
+
+Some printed lines are measurements of the running build and others are fixed
+text asserting that a category of code does not exist. The difference matters
+when you are relying on `audit` as evidence:
+[`docs/security.md`](docs/security.md#what-audit-measures) draws that line
+for each printed field.
 
 ## Limitations
 
-Out of scope for v0.1, each a deliberate decision rather than an omission
-(section 1 of the design spec has the full reasoning):
+Each item below is a deliberate decision rather than an omission;
+[section 1](docs/specs/kiro-trust-design.md#1-scope) of the design spec has the
+reasoning, and section 13 has the backlog.
 
-- social login, Kiro API keys (`ksk_…`)
-- GPT models on Kiro
-- proxy-side Tool Search, Advisor, truncation notice injection, retry of
-  thinking-only responses
-- dynamic model discovery, `models sync`
-- web UI, remote listener, multi-user, account pooling
-- telemetry, OpenTelemetry, crash reporting, update checks
-- plugin system, arbitrary upstream URLs, generic OpenAI gateway
-- config file, log file rotation, CORS
-- Homebrew tap, background service installation
-- enterprise CA or HTTP proxy support
+- Identity Center credentials only: no social login, no Kiro API keys
+  (`ksk_…`).
+- Claude models only, from a static catalog: no GPT models on Kiro, no
+  dynamic model discovery.
+- Nothing emulated proxy-side: no Tool Search, Advisor, truncation notice
+  injection, or retry of thinking-only responses.
+- One local user: no web UI, remote listener, multi-user, or account pooling.
+- No telemetry, crash reporting, or update checks, by contract rather than by
+  default.
+- No plugin system, arbitrary upstream URL, or generic OpenAI gateway.
+- No config file, log rotation, CORS, Homebrew tap, background service, or
+  HTTP proxy support.
 
 **Refresh token rotation is not fully in kiro-trust's control.** AWS's
 `CreateToken` reference does not document whether Identity Center invalidates
 a refresh token when it issues a new one. If it does, a refresh performed by
 kiro-trust leaves the Kiro CLI's own stored refresh token stale, and you would
-have to log in to Kiro CLI again to restore it. kiro-trust cannot fix this by
-persisting the rotated token itself: the Kiro CLI credential database is
-opened read-only by design (see Guarantees above), so a refreshed token never
-leaves kiro-trust's memory and is discarded when it exits. In ordinary use
-this is unlikely to matter: kiro-trust only refreshes when the cached
-credential is within its validity buffer of expiry (5 minutes by default), so
-the Kiro CLI itself usually refreshes first, on its own schedule, and
-kiro-trust just reads the result it already wrote. See
+have to log in to Kiro CLI again to restore it. kiro-trust cannot persist the
+rotated token itself, because the credential database is opened read-only by
+design. In ordinary use this is unlikely to matter: kiro-trust refreshes only
+when the cached credential is within its validity buffer of expiry (5 minutes
+by default), so the Kiro CLI usually refreshes first on its own schedule and
+kiro-trust reads the result it already wrote. See
 [section 12](docs/specs/kiro-trust-design.md#12-risks) of the design spec for
 the full risk register.
+
+## Docs
+
+| Document | What it covers |
+| --- | --- |
+| [`docs/specs/kiro-trust-design.md`](docs/specs/kiro-trust-design.md) | Scope, architecture, security contracts, verified protocol facts. The source of truth: when code and spec disagree, the spec wins. |
+| [`docs/security.md`](docs/security.md) | The guarantees, what `audit` measures, how to verify a release, how to report a vulnerability. |
+| [`docs/threat-model.md`](docs/threat-model.md) | Assets, threats, and the test or contract behind each mitigation. |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed in each release. |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Setup, the CI gates, and what review will hold you to. |
+| [`docs/releasing.md`](docs/releasing.md) | Maintainer release procedure. |
 
 ## Reference implementation
 
