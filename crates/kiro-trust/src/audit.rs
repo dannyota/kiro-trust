@@ -83,7 +83,19 @@ fn abbreviate_home_in_message_with(s: &str, home: &str) -> String {
         let (before, at_match) = remaining.split_at(idx);
         out.push_str(before);
         let after = &at_match[home.len()..];
-        let boundary_ok = after.is_empty() || after.starts_with('/') || after.starts_with('\\');
+        // A path separator, the end of the string, or any character that
+        // cannot continue a path component. The last case is what keeps
+        // `--extra-ca "$HOME"` from printing the real home: its message is
+        // `--extra-ca <path>: Is a directory`, where the home is followed by
+        // `:`, not by a separator (v020-ca-wiring-review.md, finding 1). A
+        // sibling directory sharing the home as a string prefix
+        // (`/home/x-backup` under `HOME=/home/x`) is still left alone,
+        // because `-` continues a component and so fails this test.
+        let boundary_ok = match after.chars().next() {
+            None => true,
+            Some('/') | Some('\\') => true,
+            Some(c) => !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~'),
+        };
         out.push_str(if boundary_ok { "~" } else { home });
         remaining = after;
     }
@@ -787,6 +799,37 @@ mod tests {
             ),
             "credential: unable to open database file: /home/x-backup/data.sqlite3"
         );
+        // The home exactly at the end of a path, followed by a character
+        // that cannot continue a path component. This is `--extra-ca "$HOME"`
+        // (v020-ca-wiring-review.md, finding 1): the message puts a `:`
+        // straight after the path, so requiring a `/` here printed the real
+        // home directory into audit output, in both text and --json.
+        assert_eq!(
+            abbreviate_home_in_message_with(
+                "--extra-ca /home/someone: Is a directory (os error 21)",
+                "/home/someone"
+            ),
+            "--extra-ca ~: Is a directory (os error 21)"
+        );
+        // Other non-component characters that can follow a path in a
+        // message: a space, a comma, a closing parenthesis, a quote.
+        for (msg, want) in [
+            ("read /home/someone failed", "read ~ failed"),
+            ("paths: /home/someone, other", "paths: ~, other"),
+            ("at (/home/someone)", "at (~)"),
+            ("named \"/home/someone\" here", "named \"~\" here"),
+        ] {
+            assert_eq!(abbreviate_home_in_message_with(msg, "/home/someone"), want);
+        }
+        // Still literal: every character that can continue a component.
+        for suffix in ["-backup/x", "2/x", "_old/x", ".bak/x", "~1/x"] {
+            let msg = format!("path /home/someone{suffix} here");
+            assert_eq!(
+                abbreviate_home_in_message_with(&msg, "/home/someone"),
+                msg,
+                "{suffix} continues the component and must not abbreviate"
+            );
+        }
         // `HOME=/` is degenerate: a no-op, same as the path-typed version.
         assert_eq!(
             abbreviate_home_in_message_with(

@@ -15,11 +15,22 @@ use std::process::Command;
 
 /// The shared test CA fixture: one self-signed P-256 CA certificate, public
 /// part only, no private key (spec 6.2 validates `--extra-ca` against real CA
-/// material, not just PEM framing). `include_str!` rather than a copied
-/// literal so the four call sites across three crates cannot drift apart, and
-/// so a rename breaks the build instead of one test at a time. See
-/// `tests/fixtures/ca/README.md`.
-const TEST_CA_PEM: &str = include_str!("../../../tests/fixtures/ca/test-ca.crt");
+/// material, not just PEM framing). See `tests/fixtures/ca/README.md`.
+///
+/// Read at run time from `CARGO_MANIFEST_DIR`, the way `kiro_test_db_path`
+/// below already resolves the database fixture, rather than baked in with
+/// `include_str!`. This file ships inside the published `kiro-trust` package
+/// (`cargo package --list` includes it) while the workspace-level fixture
+/// correctly does not, so an `include_str!` reaching outside the crate root
+/// would compile here but fail during `cargo publish`'s verify step
+/// (v020-ca-wiring-review.md, Low finding). These tests only run from a
+/// checkout, where the path resolves.
+fn test_ca_pem() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/ca/test-ca.crt");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read test CA fixture {}: {e}", path.display()))
+}
 
 // spec 4.1: a missing/malformed --extra-ca file (whether from the flag or
 // KIRO_TRUST_EXTRA_CA) is a configuration error that exits 2, before the
@@ -123,7 +134,7 @@ fn serve_extra_ca_absent_by_default_does_not_produce_a_config_error() {
 fn audit_extra_ca_env_is_shown_in_text_output() {
     let dir = tempfile::tempdir().unwrap();
     let ca_path = dir.path().join("valid-ca.pem");
-    std::fs::write(&ca_path, TEST_CA_PEM).unwrap();
+    std::fs::write(&ca_path, test_ca_pem()).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_kiro-trust"))
         .arg("audit")
@@ -148,8 +159,8 @@ fn audit_extra_ca_flag_wins_over_env() {
     let dir = tempfile::tempdir().unwrap();
     let env_ca = dir.path().join("env-ca.pem");
     let flag_ca = dir.path().join("flag-ca.pem");
-    std::fs::write(&env_ca, TEST_CA_PEM).unwrap();
-    std::fs::write(&flag_ca, TEST_CA_PEM).unwrap();
+    std::fs::write(&env_ca, test_ca_pem()).unwrap();
+    std::fs::write(&flag_ca, test_ca_pem()).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_kiro-trust"))
         .arg("audit")

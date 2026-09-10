@@ -791,7 +791,13 @@ anyway, so a stricter check would reject files that would in fact work.
 `Extra CA` shows the PEM path when `--extra-ca` is set, and the word `none`
 otherwise, so an added anchor is never invisible. The path goes through
 `abbreviate_home_path`, like the credential path above it, so a home directory
-never reaches the output; certificate bytes never appear at all. Because the
+never reaches the output; certificate bytes never appear at all. A problem
+string carrying the same path goes through `abbreviate_home_in_message`, which
+abbreviates a match followed by a path separator, the end of the string, or any
+character that cannot continue a path component. That last case is load-bearing:
+`--extra-ca "$HOME"` produces `--extra-ca <path>: Is a directory`, where the
+path is followed by `:`, and requiring a separator printed the real home
+directory in both the text and `--json` forms. Because the
 flag is additive (section 6.2), the `TLS roots` line above it stays true either
 way. An unreadable or malformed file adds a sanitized problem and makes audit
 exit 1, since a configured anchor that cannot be loaded is a deviation the

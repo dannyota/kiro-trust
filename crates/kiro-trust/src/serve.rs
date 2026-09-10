@@ -10,7 +10,22 @@ use kiro_trust_net::{Client, Policy};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub async fn run(cfg: ServeConfig) -> Result<(), String> {
+/// The outbound policy this command serves with: the production policy, plus
+/// the parsed `--extra-ca` anchors when one was configured (spec 4.1, 6.2).
+///
+/// A free function rather than two lines inline so a test can assert on the
+/// policy itself. Mutating the inline version to parse the CA and discard it
+/// left the entire workspace suite green while the shipped proxy silently
+/// stopped honoring `--extra-ca` (v020-ca-wiring-review.md, finding 2), the
+/// same defect class already found one layer down in `Client::new`.
+fn build_policy(extra_ca: Option<kiro_trust_net::ExtraCa>) -> Policy {
+    match extra_ca {
+        Some(ca) => Policy::production().with_extra_ca(ca),
+        None => Policy::production(),
+    }
+}
+
+pub async fn run(mut cfg: ServeConfig) -> Result<(), String> {
     // Fail fast on the credential before binding anything.
     let creds = KiroDb::open_read_only(&cfg.db_path)
         .and_then(|db| db.read_identity_center())
@@ -21,11 +36,7 @@ pub async fn run(cfg: ServeConfig) -> Result<(), String> {
         .unwrap_or_else(|| creds.runtime_region.clone());
     drop(creds);
 
-    let policy = match cfg.extra_ca {
-        Some(ca) => Policy::production().with_extra_ca(ca),
-        None => Policy::production(),
-    };
-    let net = Arc::new(Client::new(policy).map_err(|e| e.to_string())?);
+    let net = Arc::new(Client::new(build_policy(cfg.extra_ca.take())).map_err(|e| e.to_string())?);
     let tokens = Arc::new(TokenSource::new(
         cfg.db_path.clone(),
         net.clone(),
@@ -152,8 +163,40 @@ pub async fn run(cfg: ServeConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Cli, Command, ServeConfig};
+    use crate::config::{Cli, Command, ServeConfig, read_extra_ca};
     use clap::Parser;
+
+    /// The regression test for v020-ca-wiring-review.md finding 2: mutating
+    /// `run` to parse the CA and discard it left every other test green while
+    /// the shipped proxy stopped honoring `--extra-ca`. `Policy`'s `Debug`
+    /// renders `ExtraCa`'s certificate count and never its bytes, which is
+    /// exactly enough to tell an installed anchor from a dropped one.
+    #[test]
+    fn build_policy_installs_a_configured_extra_ca_and_omits_it_otherwise() {
+        let rendered = format!("{:?}", build_policy(None));
+        assert!(
+            rendered.contains("extra_ca: None"),
+            "no configured CA must leave the policy without one: {rendered}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.crt");
+        std::fs::write(
+            &path,
+            include_str!("../../../tests/fixtures/ca/test-ca.crt"),
+        )
+        .unwrap();
+        let ca = read_extra_ca(Some(&path)).unwrap().expect("valid test CA");
+        let rendered = format!("{:?}", build_policy(Some(ca)));
+        assert!(
+            rendered.contains("certificate_count: 1"),
+            "a configured CA must reach the policy: {rendered}"
+        );
+        assert!(
+            !rendered.contains("BEGIN CERTIFICATE"),
+            "the policy must never render certificate bytes: {rendered}"
+        );
+    }
 
     // spec 4.1: fail fast on the credential before binding anything, and
     // never leave a token file behind when that happens. A nonexistent
