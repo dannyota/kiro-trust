@@ -188,8 +188,8 @@ impl Upstream for KiroClient {
                     ));
                 }
                 403 => {
-                    self.tokens.invalidate().await;
                     if !refreshed && !last {
+                        self.tokens.invalidate().await;
                         refreshed = true;
                         tracing::info!(
                             attempt,

@@ -124,11 +124,23 @@ fn ok() -> ResponseTemplate {
         .set_body_bytes(stream_body())
 }
 
+/// A refresh response `db()`'s "r" refresh token can be exchanged for
+/// without needing a fresh `TokenSource`: `db()`'s stored credential is
+/// valid until 2099 and unrefreshed, so it is never `minted_by_refresh`
+/// (spec 3.3), and a forced cycle after a 403 is therefore free to refresh
+/// it rather than being bound to re-serving it (FIX 2).
+fn oidc_refresh_ok() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "accessToken": "tok2", "refreshToken": "r2", "expiresIn": 3600
+    }))
+}
+
 // kirocc TestHTTPClient_Retry429, TestHTTPClient_NonEventStreamThrottlingRetries, TestHTTPClient_Retry403_WithRefresh, _400_NoRetry
 #[tokio::test]
 async fn retries_throttling_server_errors_and_json_exceptions_but_not_client_errors() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
+        .and(path("/"))
         .respond_with(Sequence(std::sync::Mutex::new(vec![
             ResponseTemplate::new(429).set_body_string("{\"__type\":\"ThrottlingException\"}"),
             ResponseTemplate::new(200)
@@ -151,6 +163,7 @@ async fn retries_throttling_server_errors_and_json_exceptions_but_not_client_err
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
+        .and(path("/"))
         .respond_with(
             ResponseTemplate::new(429).set_body_string("{\"__type\":\"ThrottlingException\"}"),
         )
@@ -168,6 +181,7 @@ async fn retries_throttling_server_errors_and_json_exceptions_but_not_client_err
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
+        .and(path("/"))
         .respond_with(
             ResponseTemplate::new(400)
                 .set_body_string("{\"__type\":\"ValidationException\",\"message\":\"bad\"}"),
@@ -185,13 +199,25 @@ async fn retries_throttling_server_errors_and_json_exceptions_but_not_client_err
     assert_eq!(err.status, Some(400));
     assert_eq!(err.message, "bad");
 
+    // A 403 forces a cycle (spec 3.3). `db()`'s credential was never
+    // refreshed, so the forced-cycle bound (FIX 2) does not apply: the
+    // cycle refreshes it, and attempt 2's runtime POST carries whatever
+    // that refresh returns. Both endpoints get their own mock and their
+    // own count, so a stray call to either fails the test.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
+        .and(path("/"))
         .respond_with(Sequence(std::sync::Mutex::new(vec![
             ResponseTemplate::new(403),
             ok(),
         ])))
         .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(oidc_refresh_ok())
+        .expect(1)
         .mount(&server)
         .await;
     let dir = tempfile::tempdir().unwrap();
@@ -202,10 +228,24 @@ async fn retries_throttling_server_errors_and_json_exceptions_but_not_client_err
         .unwrap();
     assert_eq!(s.attempts, 2, "403 invalidates the token and retries once");
 
+    // A 403 on every runtime attempt. The forced cycle after attempt 1
+    // refreshes exactly once (same reasoning as above) and succeeds, so
+    // attempt 2's runtime POST actually happens and is also rejected,
+    // reaching client.rs's own terminal-403 branch: `status` is asserted
+    // to be `Some(403)` specifically so a coincidental Auth-kind error from
+    // the auth layer (as would happen if the refresh above failed instead)
+    // cannot pass this test for the wrong reason.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
+        .and(path("/"))
         .respond_with(ResponseTemplate::new(403))
         .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(oidc_refresh_ok())
+        .expect(1)
         .mount(&server)
         .await;
     let dir = tempfile::tempdir().unwrap();
@@ -215,6 +255,7 @@ async fn retries_throttling_server_errors_and_json_exceptions_but_not_client_err
         .await
         .unwrap_err();
     assert_eq!(err.kind, UpstreamErrorKind::Auth);
+    assert_eq!(err.status, Some(403));
 }
 
 // A 403 on the last of the three attempts must not extend the loop to a

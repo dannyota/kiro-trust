@@ -193,9 +193,126 @@ per-frame size cap. Error bodies are read to at most 64 KiB.
   missing device registration is an error naming the unsupported case.
 - `TokenSource`: caches `Credentials` in memory, refreshes when fewer than
   five minutes remain, coalesces concurrent refreshes with a single in-flight
-  future, re-reads the database at the start of every refresh cycle, and
-  exposes `with_token(|&str| ...)` and `invalidate()`. Nothing is written to
-  the database, ever.
+  future, and exposes `with_token(|&str| ...)` and `invalidate()`. Nothing is
+  written to the database, ever.
+
+  A refresh cycle re-reads the database first; a read that fails ends the
+  cycle with that error, forced or not, since every rule below is a decision
+  about what the database currently holds. It then follows three rules. They
+  exist because a refresh token that has been exchanged must never be sent
+  again (RFC 6749 section 6; RFC 9700 section 4.14 has the authorization
+  server read a replayed token as a stolen-token signal). Section 12,
+  "Refresh token rotation", carries the reasoning.
+
+  1. **The database wins when it is strictly newer.** If the credential just
+     read is valid, and its `expires_at` is later than the cached one's (or
+     nothing is cached), serve it and drop the cached one. The Kiro CLI owns
+     the credential, and one it refreshed after our last read supersedes
+     anything held here. "Later than", never "different from": once this
+     process has refreshed, the cached credential's expiry differs from the
+     database row as a matter of course, so "different" would hand the cycle
+     back to a credential whose refresh token we already exchanged.
+  2. **Chain from the newest token held.** Otherwise refresh, sending the
+     refresh token of whichever credential has the later `expires_at`: the
+     cached one once this process has refreshed at least once, the database's
+     otherwise. The result is cached, so the next cycle chains from the token
+     this one received rather than re-sending the database's.
+  3. **Never re-send an exchanged token.** When a refresh fails, re-read the
+     database and retry once only if its `expires_at` differs from the value
+     the database held at the top of this cycle, which means the Kiro CLI has
+     written a new credential since. Otherwise the error names the failure and
+     says to log in to Kiro CLI again. Retrying with the older copy would be
+     exactly the replay rule 3 exists to prevent.
+
+     A refresh can also fail after the OIDC endpoint accepted it: a 200 whose
+     body does not parse, an empty `accessToken`, an `expiresIn` outside the
+     guard, a body that fails to read, or the 30-second cap firing after the
+     response status arrived. The token is spent in every one of those, so
+     such a seed is never chained from again in this process; a later cycle
+     that finds only a burned seed fails with the same error and makes no
+     network call.
+
+     A seed that was successfully exchanged is burned too, and for the same
+     reason: it is the one seed we know for certain is spent. The decision is
+     made once, when the refresh ends by any route, and turns on a single
+     question: had a 200 already arrived? Burned: a successful exchange, and
+     any failure after a 200. Left usable: a failure before any response
+     status arrived, and any non-200 status. It is deliberately not a mark
+     placed before the request and lifted afterwards on the way out; a lift
+     that some exit path skips is how a seed gets burned that was never
+     spent.
+
+     Those two lifted classes are a deliberate trade, not a proof. A request
+     that reached Identity Center and was answered slowly, or a 502 from an
+     intermediary in front of a token service that had already committed the
+     rotation, spends the token while looking exactly like a transient
+     failure. kiro-trust treats both as not-exchanged anyway, because the
+     alternative strands a long-lived local proxy on an ordinary network blip:
+     every later cycle would refuse to refresh a token that is still good,
+     until a restart or a Kiro CLI write. The replay risk in those two narrow
+     cases is accepted; section 12 records it.
+
+     A refresh that is cancelled mid-flight, which happens whenever the Claude
+     Code client disconnects while a request is in the handler, is not a
+     separate case: it ends the refresh like any other route, so the same
+     question decides it. Cancelled after a 200 burns; cancelled before one
+     does not. Deciding at the end rather than at the start is what makes
+     cancellation ordinary instead of a path someone has to remember.
+
+     `refresh()` must therefore report which side of the response status it
+     failed on, and must make that fact observable to the cancellation path as
+     well as the error path; collapsing both into one network-error variant is
+     what makes the safe classification impossible. The soundness of the burn
+     signal rests on the network policy in section 6.2: a non-AWS 200 cannot
+     reach it while the compiled roots pin `oidc.<region>.amazonaws.com`.
+     `--extra-ca` widens that, as it widens everything else it touches.
+
+  These rules compare `expires_at`, a non-secret field the CLI rewrites
+  together with the refresh token, so deciding which credential is newer never
+  compares secret values and adds no `expose_secret()` site (section 6.5). An
+  `expiresAt` the parser cannot use reads as `UNIX_EPOCH` (section 7.2), which
+  is a sentinel and not a time: it is never "later than" anything and never
+  proves two reads are the same credential, so a cycle holding one refreshes
+  rather than serving it, and rule 3 treats it as no change. It still burns:
+  because the sentinel cannot identify one credential, rule 3 records it as a
+  single flag rather than as a value in the burned set, which stops an
+  unparsable row from being replayed without limit. That flag is one way and
+  process-wide, so once any unparsable seed is spent, a later and genuinely
+  different unparsable row is refused too, and a restart is the only recovery.
+  Nothing about the sentinel could tell the two apart, so there is no signal
+  that could safely clear it. The same collision has a cost on the parsable
+  side: a Kiro CLI credential written with the same `expires_at` as a row this
+  process already exchanged is refused until a restart, rather than merely
+  missing a retry. The digest in section 13 is what would remove both. Distinguishing
+  two CLI writes that share an expiry would need a digest of the stored row;
+  section 13 carries that as backlog, since `expires_at` covers every write
+  the CLI actually performs.
+
+  `invalidate()` (used after an upstream 403, which retries at most once)
+  marks the next cycle as forced rather than dropping the cached credential,
+  so the chain's newest refresh token survives a 403 and rule 3 still holds.
+  Dropping the cache instead, as versions before 0.3.0 did, would send the
+  database's already-exchanged token on the next cycle. A forced cycle skips
+  the cached-credential shortcut, re-reads the database, and serves what it
+  finds only under rule 1's strict comparison; otherwise it refreshes under
+  rule 2, with one bound.
+
+  **A forced cycle never refreshes a credential this process itself minted by
+  refresh, while that credential is still valid.** It serves that credential
+  again and lets the 403 reach the client; once it is past its expiry the
+  bound no longer applies and the cycle refreshes under rule 2. A token issued minutes ago and still rejected is not what the
+  runtime is objecting to, and another exchange from the same grant would be
+  rejected the same way; without this bound a runtime returning 403 for a
+  reason unrelated to the credential (entitlement, profile, a middlebox) costs
+  one refresh per request, and every refresh may rotate the owner's token.
+  That is the harm section 12 exists to bound, so the honest 403 is worth
+  more than the retry.
+
+  The 403 handler calls `invalidate()` only when an attempt remains, so a
+  request that gives up leaves no forced cycle behind. The flag is
+  process-wide and the swap is first-come, so a concurrent request may consume
+  a cycle another request forced; that costs one wasted round trip and never
+  puts an exchanged token on the wire.
 - `refresh(net, creds)`: `POST https://oidc.<sso_region>.amazonaws.com/token`
   with `{"grantType":"refresh_token","clientId","clientSecret","refreshToken"}`
   as JSON; reads `accessToken`, `refreshToken` (optional, falls back to the
@@ -216,9 +333,11 @@ per-frame size cap. Error bodies are read to at most 64 KiB.
   (1 s, 2 s) plus jitter. A 200 whose `Content-Type` is not
   `application/vnd.amazon.eventstream` is decoded as an AWS exception
   envelope; `ThrottlingException` and `InternalServerException` retry, others
-  fail. A 403 calls `TokenSource::invalidate()` and, when attempts remain,
-  retries once with a fresh token; a second 403, or a 403 on the last
-  attempt, fails with an authentication error. Connection errors before any
+  fail. A 403 calls `TokenSource::invalidate()` when an attempt remains, and
+  retries once with whatever that forced cycle yields: a newer credential the
+  Kiro CLI wrote, a freshly refreshed one, or, when this process minted the
+  rejected credential itself, the same one again (section 3.3). A second 403,
+  or a 403 on the last attempt, fails with an authentication error. Connection errors before any
   byte is sent retry; errors after the stream started do not.
 - `UpstreamError { status, exception_type, message (≤ 1 KiB) }` maps to the
   Anthropic error envelope in the server.
@@ -1410,16 +1529,59 @@ environment except its own `KIRO_TRUST_*` variables.
   token and, on a refresh, keeps the result in memory only; it never writes
   back (spec 6.1). AWS's `CreateToken` reference does not document whether
   issuing a new refresh token invalidates the one that was exchanged for it,
-  so whether Identity Center rotates on use is unknown. If it does, a
-  refresh performed by kiro-trust leaves the Kiro CLI's own stored refresh
-  token stale, and the owner has to log in to Kiro CLI again to restore it.
-  Mitigation: kiro-trust refreshes only when the cached credential is within
-  the validity buffer of expiry (5 minutes by default), so in ordinary use
-  the Kiro CLI itself refreshes first, on its own schedule, and kiro-trust
-  reads the result the CLI already wrote; kiro-trust's own refresh path is
-  reached only when the CLI has not refreshed recently enough, which the
-  live tier's `forced_refresh_succeeds` test exercises deliberately (spec
+  so whether Identity Center rotates on use is unknown, and the OIDC guide's
+  "Considerations for using this guide" is silent too (both checked
+  2026-09-10). Two consequences follow, and they need different answers.
+
+  The first is the owner's: if Identity Center does rotate, a refresh
+  performed by kiro-trust leaves the Kiro CLI's own stored refresh token
+  stale, and the owner has to log in to Kiro CLI again to restore it. This
+  one is accepted, not fixed. Mitigation: kiro-trust refreshes only when the
+  credential is within the validity buffer of expiry (5 minutes by default),
+  so in ordinary use the Kiro CLI refreshes first, on its own schedule, and
+  kiro-trust reads the result the CLI already wrote; kiro-trust's own refresh
+  path is reached only when the CLI has not refreshed recently enough, which
+  the live tier's `forced_refresh_succeeds` test exercises deliberately (spec
   8.6) and ordinary use should rarely hit.
+
+  The second is kiro-trust's own: a process that refreshes twice must not
+  send the same refresh token twice. RFC 6749 section 6 requires a client to
+  replace the old refresh token with the one it received, and RFC 9700
+  section 4.14 has the authorization server treat a replayed rotated token as
+  a stolen-token signal, with revocation of the whole grant as the expected
+  response. Re-reading the database at the start of every cycle and
+  refreshing from it, which is what kiro-trust and kirocc both did before
+  0.3.0, is that replay: it re-sends a token this process already exchanged.
+  Should Identity Center ever enforce reuse detection, the cost would be the
+  owner's entire Kiro CLI session, which is the outcome this project exists
+  to prevent. Section 3.3's three rules are the fix: prefer the database when
+  it is fresher, otherwise chain in memory from the newest token held, and
+  never fall back to one already exchanged.
+
+  Writing the rotated token back to the database, which is what the Kiro CLI
+  itself does (`crates/chat-cli/src/auth/builder_id.rs`, `set_secret` into
+  `auth_kv`), is rejected. It would break the read-only contract (6.1) and
+  the threat-model row it backs; the CLI owns that schema and migrates it, so
+  a writer would be writing into a shape it does not version; two
+  uncoordinated writers can clobber each other; and a bug in that writer
+  costs the owner their login. It would not even settle the question, since a
+  running Kiro CLI holds its own copy in memory and would refresh from that
+  regardless of what kiro-trust wrote, leaving two chains on one grant.
+
+  Residual risk, unavoidable without writing: the chain lives only as long as
+  the process. After a restart, kiro-trust reads whatever the database holds,
+  which may be a token a previous kiro-trust process already exchanged. That
+  window is the one replay the design cannot close, and it is bounded by how
+  often the proxy restarts without the CLI having refreshed in between. The
+  in-process windows are closed rather than accepted: rule 1's strict
+  comparison stops a forced cycle from regressing onto an exchanged token, and
+  rule 3's burned-seed marker stops a spent seed from being sent again, whether
+  it was spent by a successful exchange or by a failure past a 200. Two narrow
+  windows stay open by choice, both recorded in rule 3: a refresh that reached
+  Identity Center but failed before any response status arrived, and one
+  rejected with a non-200 status by an intermediary that had already relayed
+  the exchange. Treating either as spent would strand the proxy on ordinary
+  transient failures, which is the more likely harm by a wide margin.
 
 ## 13. Backlog
 
@@ -1433,3 +1595,4 @@ Deferred with reasons; each becomes a spec change before code.
 | GPT models | different reasoning schema |
 | cosign step in addition to attestations | attestations already Sigstore-backed |
 | Homebrew tap | must not strip quarantine; needs notarization |
+| digest of the stored credential row as the freshness discriminator (3.3) | `expires_at` covers every write the Kiro CLI actually performs; a digest would also catch two writes sharing an expiry, and must never be logged or serialized |
