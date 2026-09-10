@@ -2,7 +2,7 @@
 //! internal/reqconv/build_payload.go.
 
 use super::content::{
-    extract_text, extract_tool_use_ids, reorder_tool_results, scan_current_message,
+    ImageError, extract_text, extract_tool_use_ids, reorder_tool_results, scan_current_message,
 };
 use super::env_state::parse_env_state;
 use super::history::{build_history, place_system_prompt};
@@ -29,7 +29,7 @@ pub struct Built {
     pub tool_names: ToolNameMap,
 }
 
-pub fn build_payload(req: &Request, opts: &BuildOptions) -> Built {
+pub fn build_payload(req: &Request, opts: &BuildOptions) -> Result<Built, ImageError> {
     let mut names = ToolNameMap::default();
     let system = req.system_text();
     let callable = callable_tools(&req.tools);
@@ -41,8 +41,15 @@ pub fn build_payload(req: &Request, opts: &BuildOptions) -> Built {
     let env_state = parse_env_state(&system);
     let msgs = normalize_messages(&req.messages, !tool_entries.is_empty());
     let (history_msgs, last) = split_messages(&msgs);
-    let scanned = scan_current_message(&last.content);
-    let history = place_system_prompt(&system, build_history(&history_msgs, &mut names));
+    // One request-scoped counter spans history and the current message,
+    // including images promoted out of a tool result in either (spec 5.5,
+    // 0.2.0 design section 3). History is scanned first: it precedes the
+    // current message in the conversation, so an over-limit request always
+    // names the same count regardless of which half the caller changes.
+    let mut image_count = 0usize;
+    let history = build_history(&history_msgs, &mut names, &mut image_count)?;
+    let history = place_system_prompt(&system, history);
+    let scanned = scan_current_message(&last.content, &mut image_count)?;
     let preceding_ids = history_msgs
         .last()
         .filter(|m| m.role == Role::Assistant)
@@ -86,10 +93,10 @@ pub fn build_payload(req: &Request, opts: &BuildOptions) -> Built {
             }
         }),
     };
-    Built {
+    Ok(Built {
         payload,
         tool_names: names,
-    }
+    })
 }
 
 fn split_messages(msgs: &[Message]) -> (Vec<Message>, Message) {
@@ -131,7 +138,7 @@ mod tests {
         }
     }
     fn payload_json(req: &Request, o: &BuildOptions) -> Value {
-        serde_json::to_value(&build_payload(req, o).payload).unwrap()
+        serde_json::to_value(&build_payload(req, o).unwrap().payload).unwrap()
     }
 
     // kirocc TestBuildPayload_SimpleMessage, _NoContextWhenNoToolsOrResults, _EmptyProfileARN
@@ -318,7 +325,7 @@ mod tests {
             "tools": [{"name": "Read", "input_schema": {"type": "object"}, "cache_control": {"type": "ephemeral"}},
                       {"type": "tool_search_tool_regex_20251119", "name": "tool_search"}],
             "messages": [{"role": "user", "content": "x"}]}));
-        let built = build_payload(&r, &o);
+        let built = build_payload(&r, &o).unwrap();
         let p = serde_json::to_value(&built.payload).unwrap();
         assert_eq!(
             p["additionalModelRequestFields"],

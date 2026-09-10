@@ -164,7 +164,10 @@ async fn nothing_sensitive_reaches_the_logs() {
         ),
     ]
     .concat();
-    let (app, _) = app(dir.path(), vec![Ok(frames.clone()), Ok(frames)]);
+    let (app, _) = app(
+        dir.path(),
+        vec![Ok(frames.clone()), Ok(frames.clone()), Ok(frames)],
+    );
     // The real home directory is a marker too: it must never appear in a log line.
     let home = std::env::var("HOME").unwrap_or_else(|_| "/nonexistent-home".to_string());
     for stream in [true, false] {
@@ -207,6 +210,117 @@ async fn nothing_sensitive_reaches_the_logs() {
             );
         }
     }
+    // Image markers (Task 2, v0.2.0): one accepted image (spec 5.3) and
+    // one request per rejected class (spec 5.5), so an accepted OR a
+    // rejected image leaking into a log line is caught either way. The
+    // data marker is a run of base64-alphabet characters embedded directly
+    // in the `data` field: `IMGDATAMARKERb7e` followed by padding zero
+    // bytes is itself valid base64 (no separate encoding step needed), so
+    // it appears verbatim in the request whether the image is accepted or
+    // rejected.
+    const IMAGE_DATA_MARKER: &str = "IMGDATAMARKERb7e";
+    let image_data = format!("{IMAGE_DATA_MARKER}{}", "AAAA".repeat(3));
+    const MEDIA_TYPE_MARKER: &str = "image/MEDIATYPEMARKERe2a";
+    // A count over the limit. The leak-sweep below checks for
+    // "images: {COUNT_MARKER_IMAGES}" (the `ImageError::TooMany` message's
+    // own shape) rather than the bare digits: this binary's other tests
+    // share one process-wide log-capture buffer (see `capture()` above)
+    // and run concurrently, so a short, undecorated number like "11" would
+    // incidentally match unrelated log content (byte counts, timestamps,
+    // frame counts) from those tests and make this assertion flaky. The
+    // longer, message-shaped substring keeps the same intent, since spec
+    // 6.4's allowlist has no field for this count and nothing should log
+    // it, while no longer colliding with ordinary log output.
+    const COUNT_MARKER_IMAGES: usize =
+        kiro_trust_protocol::translate::content::MAX_IMAGES_PER_REQUEST + 1;
+
+    let accepted_image_req = serde_json::json!({
+        "model": "claude-sonnet-4-6", "max_tokens": 50, "stream": false,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_data}}
+        ]}]
+    });
+    let r = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("x-api-key", TOKEN)
+                .body(Body::from(accepted_image_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "accepted image request");
+    let _ = body_string(r).await;
+
+    // Rejected: unsupported media type, naming the marker in the 400 body
+    // (never in a log).
+    let rejected_media_type_req = serde_json::json!({
+        "model": "claude-sonnet-4-6", "max_tokens": 50,
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": MEDIA_TYPE_MARKER, "data": "AAAA"}}
+        ]}]
+    });
+    let r = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("x-api-key", TOKEN)
+                .body(Body::from(rejected_media_type_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::BAD_REQUEST,
+        "unsupported media type"
+    );
+    let _ = body_string(r).await;
+
+    // Rejected: invalid base64, still carrying the data marker (mangled,
+    // but the marker text itself survives as a substring).
+    let rejected_base64_req = serde_json::json!({
+        "model": "claude-sonnet-4-6", "max_tokens": 50,
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": format!("{IMAGE_DATA_MARKER}!!!not-valid")}}
+        ]}]
+    });
+    let r = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("x-api-key", TOKEN)
+                .body(Body::from(rejected_base64_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "invalid base64");
+    let _ = body_string(r).await;
+
+    // Rejected: over the per-request image count.
+    let content: Vec<_> = (0..COUNT_MARKER_IMAGES)
+        .map(|_| serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}))
+        .collect();
+    let rejected_count_req = serde_json::json!({
+        "model": "claude-sonnet-4-6", "max_tokens": 50,
+        "messages": [{"role": "user", "content": content}]
+    });
+    let r = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("x-api-key", TOKEN)
+                .body(Body::from(rejected_count_req.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "too many images");
+    let _ = body_string(r).await;
+
     // An auth failure (fails in require_token, before any body parsing).
     let r = app
         .clone()
@@ -279,6 +393,9 @@ async fn nothing_sensitive_reaches_the_logs() {
         "TOOL_RESULT_MARKER",
         "THINKING_MARKER",
         dir.path().to_str().unwrap(),
+        IMAGE_DATA_MARKER,
+        MEDIA_TYPE_MARKER,
+        &format!("images: {COUNT_MARKER_IMAGES}"),
     ] {
         assert!(!logs.contains(marker), "{marker} leaked into logs:\n{logs}");
     }
