@@ -386,6 +386,13 @@ message and usage category distinguish:
 | `allowance_exhausted` | The bounded upstream error body contains the exact marker `MONTHLY_REQUEST_COUNT` | Never; return 429 immediately |
 | `transient_throttle` | 429, `ThrottlingException`, or `TooManyRequestsException` without the monthly marker | Transient; use the retry schedule |
 
+The retry schedule belongs to `KiroClient::generate()` and applies to retryable
+HTTP errors and decoded non-eventstream JSON exceptions. The server adds no
+transient retry loop for exception frames. Its only replay remains the one
+permitted for the three invalid-state reasons in the main spec. A capacity
+exception frame before output becomes a normalized HTTP error; after output
+it becomes the corresponding SSE error.
+
 HTTP 429 applies before response headers are sent. After streaming starts, emit
 the normalized SSE error and keep the existing HTTP status; neither a new
 status nor `Retry-After` can be sent after headers.
