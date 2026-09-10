@@ -8,11 +8,12 @@ Every item is a contract in `docs/specs/kiro-trust-design.md` section 6 with
 a test behind it.
 
 - Read-only Kiro credential access; only the Identity Center rows are read.
-- Two outbound hosts, constructed internally from validated regions. No
-  redirects, no proxy, compiled-in TLS roots.
+- OIDC, runtime, and explicit fixed catalog hosts are constructed internally
+  from validated regions. No redirects, proxy, or native roots.
 - Loopback listener with a mandatory local token.
 - No request or response body logging, and no option to enable it.
-- No telemetry, crash reporting, update checks, or model discovery.
+- No telemetry, crash reporting, or update checks. Explicit `models discover`
+  uses only the fixed, bounded catalog operation and never changes routing.
 - No developer-only feature, such as `capture` (which writes real prompts
   and responses to disk), compiled into a release build.
 
@@ -38,6 +39,9 @@ printed lines fall into three kinds, and only the first is a measurement.
 **Read back from the enforcing code.** The listener address, the credential
 database path and mode, and the outbound hosts come from the same code that
 enforces them, so these lines change when the behavior changes.
+`Serve outbound` lists the configured OIDC and runtime hosts. `Manual
+discovery outbound` lists the catalog hosts enabled by the same compiled
+region policy that discovery uses.
 
 **Constants declared beside the behavior.** TLS roots, the HTTP proxy setting,
 and the redirect policy are `pub const` strings declared next to the `Client`
@@ -48,13 +52,15 @@ by the named tests `oidc_redirect_rejected`, `runtime_redirect_rejected`, and
 `proxy_env_ignored` (`crates/kiro-trust-tests/tests/security_net.rs`), not by
 `audit`.
 
-**Fixed text asserting an absence.** The `Telemetry`, `Request body logging`,
-`Dynamic model discovery`, and `Automatic updates` lines print the same way
-regardless of build or configuration, because each asserts that a whole
-category of code does not exist in this binary. No field a program can print
-proves an absence better than the source does. Read those four as a pointer to
-verify the claim in the source (or `NOTICE`), not as something `audit` checked
-for you. The same holds for the no-body-logging promise above.
+**Fixed policy text.** `Telemetry`, `Request body logging`, and `Automatic
+updates` describe excluded behavior. `Dynamic model discovery` states
+`automatic disabled; manual command only`. Those strings describe the source
+contract; printing them does not test that every call path obeys it.
+
+Manual discovery can refresh an expired access token through the ordinary
+OIDC path. It shares one token source across all pages and never forces a
+refresh after a catalog 401 or 403. Each command still owns a separate
+in-memory refresh chain, with the cross-process risk described in spec 12.
 
 ## Verifying a release
 

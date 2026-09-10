@@ -99,5 +99,6 @@ pub(crate) async fn refresh(
         sso_region: creds.sso_region.clone(),
         runtime_region: creds.runtime_region.clone(),
         profile_arn: creds.profile_arn.clone(),
+        profile_region: creds.profile_region.clone(),
     })
 }

@@ -30,7 +30,7 @@ pub enum Command {
     Env(EnvArgs),
     /// Run a command with the exports set in its environment (spec 4.4).
     Exec(ExecArgs),
-    /// Inspect the compiled model catalog without credentials or network access.
+    /// Inspect compiled models or explicitly discover bounded availability.
     Models(ModelsArgs),
 }
 
@@ -55,6 +55,16 @@ pub enum ModelsCommand {
         /// Print the model as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Query bounded upstream availability metadata once.
+    Discover {
+        /// Print discovered metadata as JSON.
+        #[arg(long)]
+        json: bool,
+        #[arg(long, env = "KIRO_TRUST_DB")]
+        kiro_db: Option<PathBuf>,
+        #[arg(long, env = "KIRO_TRUST_EXTRA_CA")]
+        extra_ca: Option<PathBuf>,
     },
 }
 

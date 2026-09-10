@@ -37,13 +37,13 @@ check_package() {
   done
 }
 
-# NOTICE is required only on the crates that hold kirocc-derived code
+# NOTICE is required on crates that transcribe upstream protocol behavior.
 # (final-fix-2.md Important 1; see each crate's own NOTICE header and the
 # crate_notice_matches_workspace_notice test): kiro-trust-net and
 # kiro-trust-auth carry none, so they get README.md only, like every other
 # published crate.
 check_package kiro-trust-protocol src/lib.rs NOTICE
-check_package kiro-trust-net src/lib.rs
+check_package kiro-trust-net src/lib.rs NOTICE
 check_package kiro-trust-auth src/lib.rs
 check_package kiro-trust-kiro src/lib.rs NOTICE
 check_package kiro-trust src/main.rs NOTICE

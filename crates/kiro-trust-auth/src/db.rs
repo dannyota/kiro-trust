@@ -30,6 +30,7 @@ pub struct Credentials {
     pub sso_region: Region,
     pub runtime_region: RuntimeRegion,
     pub profile_arn: String,
+    pub profile_region: Option<Region>,
 }
 
 impl fmt::Debug for Credentials {
@@ -192,6 +193,9 @@ impl KiroDb {
             .nth(3)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let profile_region = arn_region
+            .as_deref()
+            .and_then(|region| Region::parse(region).ok());
         let runtime_region = [
             token_region.as_deref(),
             arn_region.as_deref(),
@@ -211,6 +215,7 @@ impl KiroDb {
             sso_region,
             runtime_region,
             profile_arn,
+            profile_region,
         })
     }
 }

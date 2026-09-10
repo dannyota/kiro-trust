@@ -3,6 +3,10 @@
     "oidc.us-east-1.amazonaws.com",
     "runtime.us-east-1.kiro.dev"
   ],
+  "manual_discovery_outbound": [
+    "q.us-east-1.amazonaws.com",
+    "q.eu-central-1.amazonaws.com"
+  ],
   "authentication": {
     "sso_region": "us-east-1",
     "token_expires": "2099-01-01T00:00:00Z (refresh on demand)",
@@ -16,7 +20,7 @@
     "mode": "read-only, authorizer enforced",
     "path": "tests/fixtures/db/idc.sqlite3"
   },
-  "dynamic_model_discovery": "disabled",
+  "dynamic_model_discovery": "automatic disabled; manual command only",
   "extra_ca": "none",
   "http_proxy": "disabled (environment ignored)",
   "local_authentication": "required (token file 0600)",

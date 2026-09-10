@@ -80,6 +80,35 @@ impl fmt::Display for RuntimeRegion {
     }
 }
 
+/// Regions whose model-catalog endpoint shape is source-verified. A release
+/// enables a subset only after its live evidence gate passes (spec 3.3).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DiscoveryRegion(Region);
+
+impl DiscoveryRegion {
+    pub fn enabled_regions() -> &'static [&'static str] {
+        &["us-east-1", "eu-central-1"]
+    }
+
+    pub fn parse(s: &str) -> Result<Self, RegionError> {
+        let region = Region::parse(s)?;
+        if !Self::enabled_regions().contains(&region.as_str()) {
+            return Err(RegionError::NotServed(region.0));
+        }
+        Ok(Self(region))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Display for DiscoveryRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

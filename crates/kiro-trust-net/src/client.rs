@@ -5,7 +5,7 @@ use crate::destination::Destination;
 use crate::policy::{ExtraCaError, Policy};
 use bytes::Bytes;
 use futures_util::stream::{BoxStream, StreamExt, TryStreamExt};
-use http::HeaderMap;
+use http::{HeaderMap, HeaderValue, header};
 use std::fmt;
 use std::time::Duration;
 
@@ -31,6 +31,34 @@ pub enum NetError {
     /// attaches that itself) and never certificate bytes.
     #[error("extra CA rejected: {0}")]
     ExtraCa(ExtraCaError),
+    #[error("the fixed model-catalog operation requires the model-catalog destination")]
+    ModelCatalogDestination,
+    #[error("the generic POST operation cannot send model-catalog requests")]
+    ModelCatalogOperation,
+    #[error("invalid bearer token header")]
+    InvalidBearer,
+    #[error("model-catalog response exceeds the fixed limit")]
+    ModelCatalogBodyLimit,
+}
+
+/// Typed fields for the one supported model-catalog operation. This type has
+/// no `Debug` implementation because `profile_arn` is sensitive metadata.
+pub struct ModelDiscoveryQuery<'a> {
+    pub profile_arn: &'a str,
+    pub next_token: Option<&'a str>,
+}
+
+/// A bearer header constructed only by the caller holding a token. Its value
+/// remains private and it implements no formatting or serialization traits.
+pub struct SensitiveBearer(HeaderValue);
+
+impl SensitiveBearer {
+    pub fn new(token: &str) -> Result<Self, NetError> {
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| NetError::InvalidBearer)?;
+        value.set_sensitive(true);
+        Ok(Self(value))
+    }
 }
 
 /// Root store `kiro-trust audit` reports (spec 6.6): kept next to the
@@ -167,8 +195,70 @@ impl Client {
         headers: HeaderMap,
         body: Vec<u8>,
     ) -> Result<Response, NetError> {
+        if matches!(dest, Destination::ModelCatalog { .. }) {
+            return Err(NetError::ModelCatalogOperation);
+        }
+        self.send(dest, self.checked_url(dest, path)?, headers, body)
+            .await
+    }
+
+    pub async fn post_model_discovery(
+        &self,
+        dest: &Destination,
+        query: ModelDiscoveryQuery<'_>,
+        bearer: SensitiveBearer,
+    ) -> Result<Response, NetError> {
+        if !matches!(dest, Destination::ModelCatalog { .. }) {
+            return Err(NetError::ModelCatalogDestination);
+        }
+        let mut url = self.checked_url(dest, "/")?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("origin", "CLI");
+            pairs.append_pair("profileArn", query.profile_arn);
+            if let Some(next_token) = query.next_token {
+                pairs.append_pair("nextToken", next_token);
+            }
+        }
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "origin".to_string(),
+            serde_json::Value::String("CLI".to_string()),
+        );
+        body.insert(
+            "profileArn".to_string(),
+            serde_json::Value::String(query.profile_arn.to_string()),
+        );
+        if let Some(next_token) = query.next_token {
+            body.insert(
+                "nextToken".to_string(),
+                serde_json::Value::String(next_token.to_string()),
+            );
+        }
+        let body = serde_json::to_vec(&body).map_err(|_| {
+            NetError::Body("failed to encode fixed model-catalog request".to_string())
+        })?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-amz-json-1.0"),
+        );
+        headers.insert(
+            "x-amz-target",
+            HeaderValue::from_static("AmazonCodeWhispererService.ListAvailableModels"),
+        );
+        headers.insert(header::AUTHORIZATION, bearer.0);
+        self.send(dest, url, headers, body).await
+    }
+
+    async fn send(
+        &self,
+        dest: &Destination,
+        url: reqwest::Url,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    ) -> Result<Response, NetError> {
         let host = dest.host();
-        let url = self.checked_url(dest, path)?;
         let send = self.inner.post(url).headers(headers).body(body).send();
         let resp = match tokio::time::timeout(self.policy.header_timeout, send).await {
             Err(_) => return Err(NetError::HeaderTimeout(self.policy.header_timeout)),
@@ -271,6 +361,22 @@ impl Response {
             if chunk.len() >= room {
                 out.extend_from_slice(&chunk[..room]);
                 break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
+    /// Read one model-catalog page. Unlike error handling, this preserves an
+    /// exact one MiB limit and detects a one-byte overflow.
+    pub async fn model_catalog_bytes(self) -> Result<Vec<u8>, NetError> {
+        const MAX: usize = 1024 * 1024;
+        let mut out = Vec::new();
+        let mut stream = self.inner.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| NetError::Body(e.without_url().to_string()))?;
+            if out.len().saturating_add(chunk.len()) > MAX {
+                return Err(NetError::ModelCatalogBodyLimit);
             }
             out.extend_from_slice(&chunk);
         }

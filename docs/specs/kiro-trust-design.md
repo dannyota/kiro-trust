@@ -47,7 +47,7 @@ Out of scope for v0.1, each a deliberate decision rather than an omission:
 - GPT models on Kiro
 - proxy-side Tool Search, Advisor, truncation notice injection, retry of
   thinking-only responses
-- dynamic model discovery, `models sync`
+- automatic model discovery, `models sync`
 - web UI, remote listener, multi-user, account pooling
 - telemetry, OpenTelemetry, crash reporting, update checks
 - plugin system, arbitrary upstream URLs, generic OpenAI gateway
@@ -62,9 +62,9 @@ slips, and 0.2.0 removed them from the backlog so that table stops implying
 they are coming: proxy-side Tool Search, `models sync`, social login, and Kiro
 API keys. `AGENTS.md` forbids porting each. Social login and API keys would add
 a second credential type, widening the trust boundary this project exists to
-keep narrow; `models sync` and Tool Search would add an outbound host and
-server-tool emulation, and section 6.5 bans model discovery outright, flag or
-no flag.
+keep narrow. `models sync` and Tool Search remain excluded. Version 0.3.0
+permits only the explicit availability inspection in section 3.7; discovered
+models never change the compiled routing catalog.
 
 0.2.0 moves three former backlog items into scope: `kiro-trust exec`
 (section 4.5), an additive enterprise CA flag (section 4.1), and a header read
@@ -139,11 +139,12 @@ Most of the kirocc-derived code in this workspace lives here (NOTICE), so
 `cargo package` for this crate would otherwise ship without attribution:
 `cargo package` only ever includes files inside a crate's own directory, so
 the repository-root `NOTICE` cannot be referenced from outside it. This
-crate, `kiro-trust-kiro`, and `kiro-trust` each carry a byte-identical copy
+crate, `kiro-trust-net`, `kiro-trust-kiro`, and `kiro-trust` each carry a byte-identical copy
 of the root `NOTICE` at their own crate root; each crate's `lib.rs` has a
 test (`notice_sync::crate_notice_matches_workspace_notice`) that fails if
-its copy drifts from the original. `kiro-trust-net` and `kiro-trust-auth`
-hold no kirocc-derived code and carry no copy.
+its copy drifts from the original. The net crate carries the fixed discovery
+wire rules transcribed from the Kiro CLI. `kiro-trust-auth` carries no
+transcribed implementation and no NOTICE copy.
 
 ### 3.2 kiro-trust-net
 
@@ -153,14 +154,19 @@ The single outbound policy. Public surface:
 pub enum Destination {
     Oidc { sso_region: Region },
     Runtime { region: RuntimeRegion },
+    ModelCatalog { region: DiscoveryRegion },
 }
 pub struct Region(String);          // validated pattern, section 6.2
 pub struct RuntimeRegion(Region);   // pattern plus allowlist
+pub struct DiscoveryRegion(Region); // compiled catalog-region allowlist
 pub struct Client { /* reqwest::Client with the fixed policy */ }
 impl Client {
     pub fn new(policy: Policy) -> Result<Self, NetError>;
     pub async fn post(&self, dest: &Destination, path: &str,
         headers: HeaderMap, body: Vec<u8>) -> Result<Response, NetError>;
+    pub async fn post_model_discovery(&self, dest: &Destination,
+        query: ModelDiscoveryQuery<'_>, bearer: SensitiveBearer)
+        -> Result<Response, NetError>;
 }
 ```
 
@@ -171,11 +177,19 @@ destination host before it is sent. There is no `Url` in the public
 API. `Policy::production()` is the only constructor the binary uses. A
 `test-endpoints` cargo feature adds `Policy::loopback_plain_http(port)` for
 this crate's own tests; the binary never enables it and CI proves that.
+The fixed catalog operation alone appends its percent-encoded query after
+path validation. Callers cannot provide a raw query, header map, or body to
+that operation. Generic `post` rejects `ModelCatalog` destinations.
 
 The client is built with redirects disabled, `no_proxy()`, `rustls` with
 `webpki-roots`, HTTPS only, connect timeout 10 s, response header timeout 30 s.
 The streaming body wrapper enforces an idle-read deadline of 180 s and a
 per-frame size cap. Error bodies are read to at most 64 KiB.
+
+`models discover` alone may send the fixed `ListAvailableModels` operation to
+source-verified catalog destinations selected from the profile ARN. The typed
+request uses `POST /` and duplicates `origin=CLI`, `profileArn`, and optional
+`nextToken` in the query and JSON body. It reads success bodies at most 1 MiB.
 
 ### 3.3 kiro-trust-auth
 
@@ -189,12 +203,17 @@ per-frame size cap. Error bodies are read to at most 64 KiB.
 - `read_identity_center(conn)`: reads the keys in section 7.2 and returns
   `Credentials { access_token: SecretString, refresh_token: SecretString,
   client_id: String, client_secret: SecretString, expires_at: SystemTime,
-  sso_region: Region, runtime_region: RuntimeRegion }`. A social token or a
+  sso_region: Region, runtime_region: RuntimeRegion,
+  profile_region: Option<Region>, profile_arn: String }`. A social token or a
   missing device registration is an error naming the unsupported case.
 - `TokenSource`: caches `Credentials` in memory, refreshes when fewer than
   five minutes remain, coalesces concurrent refreshes with a single in-flight
   future, and exposes `with_token(|&str| ...)` and `invalidate()`. Nothing is
   written to the database, ever.
+
+  A foreground discovery invocation uses the ordinary `TokenSource` across
+  identity lookup and all catalog pages. It may refresh an expired credential,
+  but catalog 401 and 403 responses never invalidate or retry authentication.
 
   A refresh cycle re-reads the database first; a read that fails ends the
   cycle with that error, forced or not, since every rule below is a decision
@@ -366,6 +385,70 @@ regardless of whether versions matched, a gate that failed open with nothing
 in CI to catch it, and `scripts/check-packages.sh` already does the real
 check. Depends on `kiro-trust-protocol`, `serde_json`, and `rusqlite` only.
 
+### 3.7 Manual model discovery
+
+`kiro-trust models discover [--json] [--kiro-db <path>] [--extra-ca <pem>]`
+is a foreground one-shot inspection command. It never runs during `serve`,
+`audit`, `doctor`, request resolution, startup, or `GET /v1/models`. It never
+caches, persists, enables, or routes remote models.
+
+The fixed operation is transcribed from aws/amazon-q-developer-cli commit
+`15cc8f3cd18c4272925ce1c7053268eedff1ea0a`. The source files are
+`crates/chat-cli/src/api_client/endpoints.rs`,
+`crates/chat-cli/src/api_client/mod.rs`, and, under
+`crates/amzn-codewhisperer-client/src/`,
+`operation/list_available_models.rs`,
+`protocol_serde/shape_list_available_models.rs`,
+`protocol_serde/shape_list_available_models_input.rs`, and
+`types/{_model.rs,_token_limits.rs,_input_type.rs}`. The pinned CLI's
+`crates/chat-cli/src/auth/builder_id.rs` and kirocc v0.11.1
+`internal/auth/refresh.go` also verify expiry refresh before API use; discovery
+reuses the existing TokenSource implementation.
+
+It sends `POST /`, content type `application/x-amz-json-1.0`, and target
+`AmazonCodeWhispererService.ListAvailableModels`. It duplicates
+`origin=CLI`, profile ARN, and optional next token in query and JSON, and sends
+neither `maxResults` nor `modelProvider`.
+
+The profile ARN region is `Option<Region>`. Discovery rejects missing,
+government, and unverified regions before a catalog request. Ordinary identity
+lookup can refresh before that region check. Runtime credential parsing keeps
+its existing fallback when the profile region is absent. `us-east-1` and
+`eu-central-1` are source-verified candidates only until their ignored live
+evidence tests pass. The bearer is sensitive and appears only in the catalog
+authorization header. Generic POST rejects catalog destinations and the fixed
+operation rejects all other destinations.
+
+One ordinary `Arc<TokenSource>` with no runtime override covers identity and
+every page. Expiry refresh uses the existing five-minute buffer. Catalog 401
+returns `Authentication`; catalog 403 returns `AccessDenied`; neither retries
+or invalidates authentication. The 30-second deadline begins before identity,
+covers refresh and all pages, and returns `LimitExceeded`. Each standalone
+command remains an independent in-memory refresh chain with section 12's
+accepted cross-process rotation risk.
+
+Discovery accepts at most 16 pages, 512 distinct models, 1 MiB per success
+body, 256-byte IDs, and 4 KiB next tokens. Bounds return `LimitExceeded`.
+Repeated tokens, conflicting duplicates/defaults, malformed limits, and bad
+IDs return `Protocol`. IDs reject all control characters, `arn:`, bare
+12-digit runs, and `aoa` or `eyJ` prefixes. Output contains only validated IDs,
+region, default ID, catalog status, normalized input types, limits,
+prompt-cache support, and finite nonnegative rate multiplier. It excludes free
+form upstream fields, tokens, ARN, raw bodies, and remote errors.
+The default ID passes the same validator and must match a collected model.
+Identical rows collapse by ID; conflicting metadata or page defaults fail.
+Present token limits are positive `u32` values; absent limits remain null.
+Wire input types `TEXT` and `IMAGE` become `text` and `image`; every other
+value becomes `unknown`. Types are deduplicated in that order.
+
+Text columns and the JSON schema follow the
+[0.3.0 design, section 3.5](kiro-trust-0.3.0-design.md#35-discovery-bounds-and-output).
+`catalog_status` is `supported` only for an exact compiled Kiro ID. Remote
+defaults never select an inference model. The report's `page_count` is skipped
+by serialization and serves only the live test's counts. Fixed errors are
+`Authentication`, `AccessDenied`, `RegionUnverified`, `Transport`, `Protocol`,
+and `LimitExceeded`; they never include remote error text.
+
 ## 4. Command surface
 
 ### 4.1 `kiro-trust serve`
@@ -413,6 +496,14 @@ catalog order. Text `show` prints each `ModelInfo` field in a stable order.
 JSON is the selected `ModelInfo`. An unknown id exits 1 and writes exactly
 `kiro-trust: unknown model; run 'kiro-trust models list' for supported models`
 to stderr. The error never includes caller input.
+
+### 4.2.2 `kiro-trust models discover`
+
+The explicit command, flags, response bounds, and evidence gate are defined in
+section 3.7. It exits 0 on success and 1 for a fixed discovery error.
+Configuration and Clap usage errors exit 2. Configuration failures use fixed
+local messages without caller paths or CA contents. The command does not read
+the local listener token.
 
 ### 4.3 `kiro-trust env [--shell sh|fish]`
 
@@ -766,8 +857,9 @@ or `security_logging.rs` (section 8.4).
 
 ### 6.2 Outbound network
 
-- Hosts: `oidc.<sso_region>.amazonaws.com` and `runtime.<region>.kiro.dev`.
-  No other host can be constructed in a production build.
+- Hosts: `oidc.<sso_region>.amazonaws.com`, `runtime.<region>.kiro.dev`, and
+  foreground discovery only, `q.us-east-1.amazonaws.com` or
+  `q.eu-central-1.amazonaws.com`. No caller can construct another host.
 - Region pattern: `^[a-z]{2}(-gov)?-[a-z]+-[0-9]$`, at most 32 bytes. Runtime
   regions must also be one of `us-east-1`, `eu-central-1`, `us-gov-east-1`,
   `us-gov-west-1`. New runtime regions ship in a release.
@@ -781,8 +873,8 @@ or `security_logging.rs` (section 8.4).
   that does not parse, or holds no certificate, is a configuration error at
   startup, never a silent fallback to the default roots. `audit` prints the
   path so the deviation is visible.
-- Timeouts per 3.2. The Kiro bearer token appears in exactly one place: the
-  `Authorization` header of a runtime request.
+- Timeouts per 3.2. The Kiro bearer token appears only in the `Authorization`
+  header of a runtime request or the fixed foreground catalog request.
 
 ### 6.3 Local listener
 
@@ -876,8 +968,8 @@ or `security_logging.rs` (section 8.4).
 
 ### 6.5 Telemetry
 
-None. No exporter, no crash reporter, no update check, no remote
-configuration. The only outbound traffic is the two hosts in 6.2.
+None. No exporter, crash reporter, update check, or remote configuration.
+Foreground discovery is the bounded exception in sections 3.2 and 6.2.
 
 ### 6.6 Audit output
 
@@ -898,9 +990,12 @@ Authentication
 Runtime
   region               us-east-1 (from profile)
 
-Allowed outbound
+Serve outbound
   oidc.ap-southeast-1.amazonaws.com
   runtime.us-east-1.kiro.dev
+Manual discovery outbound
+  q.us-east-1.amazonaws.com
+  q.eu-central-1.amazonaws.com
 
 TLS roots              webpki-roots (compiled in)
 Extra CA               none
@@ -914,11 +1009,17 @@ Connection limits      32 connections, 15s header read timeout
 Telemetry              none
 Kiro content sharing   opted out (x-amzn-codewhisperer-optout: true)
 Request body logging   disabled (no flag exists)
-Dynamic model discovery disabled
+Dynamic model discovery automatic disabled; manual command only
 Automatic updates      disabled
 
 Build features         none
 ```
+
+`allowed_outbound` describes the configured serve hosts.
+`manual_discovery_outbound` comes from the same compiled region list used by
+discovery. The two catalog hosts above describe the candidate build; release
+output includes only regions that pass the live evidence gate. Audit does not
+make a catalog request or refresh credentials.
 
 One PEM file may hold at most `MAX_EXTRA_CA_CERTIFICATES` (16) certificates.
 The bound is not tidiness: rustls-webpki spends a global budget of 100
@@ -1598,11 +1699,16 @@ environment except its own `KIRO_TRUST_*` variables.
   running Kiro CLI holds its own copy in memory and would refresh from that
   regardless of what kiro-trust wrote, leaving two chains on one grant.
 
-  Residual risk, unavoidable without writing: the chain lives only as long as
+  Residual risk under the read-only, process-local design: the chain lives only as long as
   the process. After a restart, kiro-trust reads whatever the database holds,
   which may be a token a previous kiro-trust process already exchanged. That
   window is the one replay the design cannot close, and it is bounded by how
-  often the proxy restarts without the CLI having refreshed in between. The
+  often an independent proxy or discovery process starts without the CLI
+  having refreshed in between. Each standalone `models discover` command
+  starts an empty in-memory chain. It cannot see a newer token held by another
+  process, and its refreshed token is discarded on exit. Discovery increases
+  how often this window occurs; AWS's rotation and reuse behavior remains
+  unknown. The
   in-process windows are closed rather than accepted: rule 1's strict
   comparison stops a forced cycle from regressing onto an exchanged token, and
   rule 3's burned-seed marker stops a spent seed from being sent again, whether

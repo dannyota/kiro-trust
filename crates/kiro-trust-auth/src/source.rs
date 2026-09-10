@@ -17,6 +17,7 @@ const VALIDITY_BUFFER: Duration = Duration::from_secs(300);
 #[derive(Clone, Debug)]
 pub struct Identity {
     pub profile_arn: String,
+    pub profile_region: Option<Region>,
     pub runtime_region: RuntimeRegion,
     pub sso_region: Region,
     pub expires_at: SystemTime,
@@ -295,6 +296,7 @@ impl TokenSource {
         let c = self.current().await?;
         Ok(Identity {
             profile_arn: c.profile_arn,
+            profile_region: c.profile_region,
             runtime_region: c.runtime_region,
             sso_region: c.sso_region,
             expires_at: c.expires_at,
@@ -329,6 +331,7 @@ mod tests {
             sso_region: Region::parse("ap-southeast-1").unwrap(),
             runtime_region: RuntimeRegion::parse("us-east-1").unwrap(),
             profile_arn: "arn:aws:codewhisperer:us-east-1:000000000000:profile/FIXTURE".to_string(),
+            profile_region: Some(Region::parse("us-east-1").unwrap()),
         }
     }
 

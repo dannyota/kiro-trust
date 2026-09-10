@@ -77,8 +77,9 @@ kiro-trust (bin)  →  kiro-trust-kiro  →  kiro-trust-net, kiro-trust-protocol
   constructor, never write, never copy the file, never read a table other than
   `auth_kv` and `state`.
 - Loopback only. Never add a non-loopback bind override.
-- No telemetry, exporter, crash reporter, update check, or model discovery,
-  even behind a flag.
+- No telemetry, exporter, crash reporter, or update check. `models discover`
+  is the sole model-discovery exception: an explicit foreground command may
+  use the fixed bounded catalog operation and never changes routing.
 - Unknown model returns 400. Never fall back to a default model.
 - `x-amzn-codewhisperer-optout` defaults to `true`; `--share-content` is the
   only way to send `false`, and audit shows it.
@@ -120,8 +121,8 @@ scratchpad when needed; never vendor it into this repository.
 
 - Transcribe a rule only from the files the spec names ("transcribe from
   kirocc ..."), record the rule in the spec, and list the file in `NOTICE`.
-- Never port the advisor, tool search, OpenTelemetry, model discovery, social
-  login, or API-key paths.
+- Never port the advisor, tool search, OpenTelemetry, social login, or API-key
+  paths. The approved fixed catalog operation is the sole discovery exception.
 - Transcribed regression cases name the source test in the fixture's
   `meta.json`.
 

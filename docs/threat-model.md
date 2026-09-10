@@ -14,6 +14,9 @@ and the test or contract that proves it. Section numbers refer to
 | Supply-chain compromise of a dependency, action, or release | committed lockfile, pinned toolchain, `cargo deny`, actions pinned by SHA, attestations, SBOM, `cargo auditable`, owner-approved crates.io publish | spec 9, CI |
 | Malformed upstream data crashes or exploits the parser | Rust memory safety, frame size and accumulation caps, CRC checks, fuzz targets | spec 5.5, 8.5 |
 | A stale allowlist or pinned user-agent blocks service | release-driven updates, clear error naming the allowlist | spec 12 |
+| Catalog authorization is rejected | discovery returns a fixed local class and does not invalidate or retry a bearer after a catalog response | spec 3.7 |
+| Catalog metadata reaches output as secrets or terminal controls | bounded IDs, control and identifier rejection, fixed input-type values, omitted free-form fields and fixed error classes | spec 3.7, discovery tests |
+| An independent discovery process reuses a token exchanged by another process | accepted process-local risk; one source shares the newest token across pages, while the database remains read-only | spec 3.3 and 12 |
 
 Out of scope: a compromised user account on the same machine (it can read the
 Kiro database directly), a compromised Kiro CLI, and a malicious Claude Code

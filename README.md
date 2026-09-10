@@ -19,6 +19,9 @@ runtime.<region>.kiro.dev
 It is the only process that holds the Kiro bearer token. Claude Code receives a
 separate local token that is useless outside this machine.
 
+`kiro-trust models discover` is an explicit, bounded availability inspection.
+It does not enable or route remote models.
+
 ## Install
 
 Download the archive for your platform from
@@ -88,7 +91,8 @@ spec for every flag and environment variable.
   token.
 - Request and response bodies are never logged, and no flag exists to log
   them.
-- No telemetry, no update checks, no dynamic model discovery.
+- No telemetry or update checks. Model discovery runs only through the
+  explicit `models discover` command and never changes routing.
 - No developer-only feature, such as `capture` (which writes real prompts
   and responses to disk), is compiled into a release build.
 
@@ -128,8 +132,8 @@ reasoning, and section 13 has the backlog.
 
 - Identity Center credentials only: no social login, no Kiro API keys
   (`ksk_…`).
-- Claude models only, from a static catalog: no GPT models on Kiro, no
-  dynamic model discovery.
+- Inference uses Claude models from a static catalog. Discovery can report
+  other available models, but the proxy cannot route them.
 - Nothing emulated proxy-side: no Tool Search, Advisor, truncation notice
   injection, or retry of thinking-only responses.
 - One local user: no web UI, remote listener, multi-user, or account pooling.

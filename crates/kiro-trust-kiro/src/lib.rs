@@ -1,10 +1,15 @@
 //! Kiro runtime protocol client (spec 3.4).
 
 mod client;
+mod discovery;
 mod error;
 pub mod headers;
 
 pub use client::{KiroClient, Upstream, UpstreamStream};
+pub use discovery::{
+    CatalogStatus, DiscoveredModel, DiscoveryClient, DiscoveryError, DiscoveryInputType,
+    DiscoveryReport,
+};
 pub use error::{UpstreamError, UpstreamErrorKind};
 
 // NOTICE distribution (final-fix-2.md Important 1; Apache-2.0 section 4(d)):

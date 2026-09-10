@@ -1,0 +1,82 @@
+kiro-trust
+Copyright 2026 Danny
+
+Licensed under the Apache License, Version 2.0.
+
+This project uses d-kuro/kirocc (https://github.com/d-kuro/kirocc),
+Apache License 2.0, Copyright d-kuro, as a behavioral reference. The
+following pieces are transcribed from kirocc v0.11.1 and carry that
+license and attribution:
+
+- the static Claude model table (internal/models/models.go)
+- effort-level resolution for extended thinking (internal/models/effort.go)
+- the `GET /v1/models` response envelope (internal/server/handlers.go)
+- the AWS EventStream test frame builder (internal/testutil/testutil.go)
+- JSON Schema sanitization rules (internal/reqconv/schema_sanitize.go)
+- tool name mapping rules (internal/reqconv/tool_name_map.go)
+- tool definition conversion and cache-point placement
+  (internal/reqconv/tool_convert.go, internal/reqconv/cache_points.go)
+- `<env>` block parsing for the current message
+  (internal/reqconv/env_state.go)
+- message normalization before history is built
+  (internal/reqconv/message_normalizer.go)
+- history-entry construction and request payload assembly, including
+  system-prompt placement (internal/reqconv/history.go,
+  internal/reqconv/build_payload.go)
+- content extraction: message text, current-message image promotion, and
+  tool-result/image conversion (internal/reqconv/content_text.go,
+  internal/reqconv/content_scan.go, internal/reqconv/tool_results.go,
+  internal/reqconv/images.go)
+- the response translation state machine: max-tokens budgeting,
+  stop-sequence filtering, thinking-tag parsing, and tool-call
+  deduplication (internal/respconv/token_budget.go,
+  internal/respconv/stop_sequence.go, internal/respconv/thinking_tags.go,
+  internal/respconv/tool_calls.go), excluding the advisor, tool-search,
+  and GPT drain paths
+- tool-use fragment accumulation across stream frames
+  (internal/kiroproto/tooluse.go)
+- the Kiro runtime HTTP client and its retry backoff
+  (internal/kiroclient/client.go, internal/kiroclient/backoff.go)
+- upstream error classification (internal/kiroclient/aws_error.go)
+- regression cases transcribed from kirocc tests: most are fixture cases
+  under tests/fixtures/, named in each case's meta.json; a few are inline
+  unit tests next to the code they exercise, named in a comment directly
+  above the test (for example kiro.rs's minimal_payload_wire_shape and
+  catalog.rs's resolves_aliases_dates_and_suffixes and
+  effort_resolution_follows_model_enum)
+
+This project also uses aws/amazon-q-developer-cli
+(https://github.com/aws/amazon-q-developer-cli), Apache License 2.0,
+Copyright Amazon.com, Inc. or its affiliates, as a behavioral reference. It
+vendors the Smithy-generated SDK for the same runtime this project calls, so
+for wire shape it is the primary reference. The following pieces are
+transcribed from it and carry that license and attribution:
+
+- the `ImageFormat` enum and the `images` wire shape
+  (in crates/amzn-codewhisperer-streaming-client/src: types/_image_format.rs,
+  types/_image_block.rs, types/_image_source.rs,
+  protocol_serde/shape_image_block.rs, protocol_serde/shape_image_source.rs,
+  protocol_serde/shape_user_input_message.rs)
+- the presence of `images` on history entries
+  (crates/amzn-codewhisperer-streaming-client/src/types/_chat_message.rs,
+  _user_input_message.rs, crates/chat-cli/src/cli/chat/message.rs,
+  crates/chat-cli/src/api_client/model.rs)
+- per-image and per-request image limits
+  (crates/chat-cli/src/cli/chat/consts.rs, crates/agent/src/agent/consts.rs)
+- ListAvailableModels request, endpoint selection, and response metadata
+  (crates/chat-cli/src/api_client/endpoints.rs,
+  crates/chat-cli/src/api_client/mod.rs, and, under
+  crates/amzn-codewhisperer-client/src/:
+  operation/list_available_models.rs,
+  protocol_serde/shape_list_available_models.rs,
+  protocol_serde/shape_list_available_models_input.rs,
+  types/_model.rs, types/_token_limits.rs, types/_input_type.rs)
+
+Everything else is an independent implementation.
+
+This exact file is duplicated, byte for byte, at
+crates/kiro-trust-protocol/NOTICE, crates/kiro-trust-net/NOTICE,
+crates/kiro-trust-kiro/NOTICE, and crates/kiro-trust/NOTICE so each
+published crate with transcribed rules carries it (Apache-2.0
+section 4(d)); a test in each of those crates asserts the copy matches this
+one.

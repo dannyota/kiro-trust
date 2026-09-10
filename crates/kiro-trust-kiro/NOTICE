@@ -63,11 +63,20 @@ transcribed from it and carry that license and attribution:
   crates/chat-cli/src/api_client/model.rs)
 - per-image and per-request image limits
   (crates/chat-cli/src/cli/chat/consts.rs, crates/agent/src/agent/consts.rs)
+- ListAvailableModels request, endpoint selection, and response metadata
+  (crates/chat-cli/src/api_client/endpoints.rs,
+  crates/chat-cli/src/api_client/mod.rs, and, under
+  crates/amzn-codewhisperer-client/src/:
+  operation/list_available_models.rs,
+  protocol_serde/shape_list_available_models.rs,
+  protocol_serde/shape_list_available_models_input.rs,
+  types/_model.rs, types/_token_limits.rs, types/_input_type.rs)
 
 Everything else is an independent implementation.
 
 This exact file is duplicated, byte for byte, at
-crates/kiro-trust-protocol/NOTICE and crates/kiro-trust-kiro/NOTICE and
-crates/kiro-trust/NOTICE so each published crate carries it (Apache-2.0
+crates/kiro-trust-protocol/NOTICE, crates/kiro-trust-net/NOTICE,
+crates/kiro-trust-kiro/NOTICE, and crates/kiro-trust/NOTICE so each
+published crate with transcribed rules carries it (Apache-2.0
 section 4(d)); a test in each of those crates asserts the copy matches this
 one.

@@ -10,7 +10,7 @@
 use crate::config::{AuditArgs, parse_listen, read_extra_ca, resolve_db_path, resolve_token_file};
 use crate::listener::{HEADER_READ_TIMEOUT, MAX_CONNECTIONS};
 use kiro_trust_auth::KiroDb;
-use kiro_trust_net::{Destination, RuntimeRegion};
+use kiro_trust_net::{Destination, DiscoveryRegion, RuntimeRegion};
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 
@@ -131,6 +131,7 @@ pub struct AuditReport {
     pub authentication: Authentication,
     pub runtime: Runtime,
     pub allowed_outbound: Vec<String>,
+    pub manual_discovery_outbound: Vec<String>,
     pub tls_roots: String,
     pub extra_ca: String,
     pub http_proxy: String,
@@ -271,6 +272,16 @@ pub fn report(args: &AuditArgs) -> Result<AuditReport, String> {
             )
         }
     };
+    let manual_discovery_outbound = DiscoveryRegion::enabled_regions()
+        .iter()
+        .copied()
+        .map(|region| {
+            Destination::ModelCatalog {
+                region: DiscoveryRegion::parse(region).expect("compiled discovery region"),
+            }
+            .host()
+        })
+        .collect();
     let mut build_features = Vec::new();
     // `capture` is a feature of this binary crate, so `cfg!` here reports
     // this crate's own compiled features directly (task-20-rulings.md
@@ -302,6 +313,7 @@ pub fn report(args: &AuditArgs) -> Result<AuditReport, String> {
         authentication: auth,
         runtime,
         allowed_outbound: outbound,
+        manual_discovery_outbound,
         tls_roots: kiro_trust_net::TLS_ROOTS.to_string(),
         extra_ca,
         http_proxy: kiro_trust_net::HTTP_PROXY.to_string(),
@@ -339,7 +351,7 @@ pub fn report(args: &AuditArgs) -> Result<AuditReport, String> {
             "opted out (x-amzn-codewhisperer-optout: true)".into()
         },
         request_body_logging: "disabled (no flag exists)".into(),
-        dynamic_model_discovery: "disabled".into(),
+        dynamic_model_discovery: "automatic disabled; manual command only".into(),
         automatic_updates: "disabled".into(),
         build_features,
         problems,
@@ -361,9 +373,17 @@ pub fn render_text(r: &AuditReport) -> String {
         "Runtime\n  region               {} ({})\n\n",
         r.runtime.region, r.runtime.source
     ));
-    s.push_str("Allowed outbound\n");
+    s.push_str("Serve outbound\n");
     for h in &r.allowed_outbound {
         s.push_str(&format!("  {h}\n"));
+    }
+    s.push_str("Manual discovery outbound\n");
+    if r.manual_discovery_outbound.is_empty() {
+        s.push_str("  none\n");
+    } else {
+        for h in &r.manual_discovery_outbound {
+            s.push_str(&format!("  {h}\n"));
+        }
     }
     s.push_str(&format!(
         "\nTLS roots              {}\nExtra CA               {}\nHTTP proxy             {}\nRedirects              {}\n\n",
@@ -544,6 +564,23 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains("placeholder") && !json.contains("arn:aws"));
         assert!(!json.contains("000000000000"));
+    }
+
+    #[test]
+    fn empty_manual_discovery_outbound_renders_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = AuditArgs {
+            json: false,
+            listen: "127.0.0.1:3456".into(),
+            kiro_db: Some(synthetic_db(dir.path())),
+            runtime_region: None,
+            token_file: None,
+            share_content: false,
+            extra_ca: None,
+        };
+        let mut report = report(&args).unwrap();
+        report.manual_discovery_outbound.clear();
+        assert!(render_text(&report).contains("Manual discovery outbound\n  none\n"));
     }
 
     #[test]

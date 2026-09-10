@@ -6,10 +6,13 @@ mod destination;
 mod policy;
 mod region;
 
-pub use client::{Client, HTTP_PROXY, NetError, REDIRECTS, Response, TLS_ROOTS};
+pub use client::{
+    Client, HTTP_PROXY, ModelDiscoveryQuery, NetError, REDIRECTS, Response, SensitiveBearer,
+    TLS_ROOTS,
+};
 pub use destination::Destination;
 pub use policy::{ExtraCa, Policy};
-pub use region::{RUNTIME_ALLOWLIST, Region, RegionError, RuntimeRegion};
+pub use region::{DiscoveryRegion, RUNTIME_ALLOWLIST, Region, RegionError, RuntimeRegion};
 
 /// Whether this crate itself was built with `test-endpoints` (spec 8.4;
 /// task-20-rulings.md ruling 5). Evaluated here, in this crate's own
@@ -21,3 +24,11 @@ pub use region::{RUNTIME_ALLOWLIST, Region, RegionError, RuntimeRegion};
 /// and the feature check select `-p kiro-trust` alone precisely to avoid
 /// that unification).
 pub const TEST_ENDPOINTS_COMPILED: bool = cfg!(feature = "test-endpoints");
+
+#[cfg(test)]
+mod notice_sync {
+    #[test]
+    fn crate_notice_names_its_transcribed_operation() {
+        assert!(include_str!("../NOTICE").contains("ListAvailableModels"));
+    }
+}
