@@ -21,7 +21,11 @@ pub async fn run(cfg: ServeConfig) -> Result<(), String> {
         .unwrap_or_else(|| creds.runtime_region.clone());
     drop(creds);
 
-    let net = Arc::new(Client::new(Policy::production()).map_err(|e| e.to_string())?);
+    let policy = match cfg.extra_ca {
+        Some(ca) => Policy::production().with_extra_ca(ca),
+        None => Policy::production(),
+    };
+    let net = Arc::new(Client::new(policy).map_err(|e| e.to_string())?);
     let tokens = Arc::new(TokenSource::new(
         cfg.db_path.clone(),
         net.clone(),

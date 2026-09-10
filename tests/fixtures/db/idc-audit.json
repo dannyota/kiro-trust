@@ -10,12 +10,14 @@
   },
   "automatic_updates": "disabled",
   "build_features": [],
+  "connection_limits": "32 connections, 15s header read timeout",
   "content_sharing": "opted out (x-amzn-codewhisperer-optout: true)",
   "credential_source": {
     "mode": "read-only, authorizer enforced",
     "path": "tests/fixtures/db/idc.sqlite3"
   },
   "dynamic_model_discovery": "disabled",
+  "extra_ca": "none",
   "http_proxy": "disabled (environment ignored)",
   "local_authentication": "required (token file 0600)",
   "local_listener": "127.0.0.1:3456",
