@@ -567,6 +567,14 @@ Later payload/image validation failures count as `failed` with the fixed
 model resolution remain outside the summary. Each such return is explicit;
 `Drop` is reserved for cancellation, not error propagation through `?`.
 
+Priming must also preserve usage while its future is pending. The internal
+`Pump::prime` method takes a usage observer and calls it with the latest
+`UsageSnapshot` after every completed `next()` call, before another await.
+The observer updates the request guard without adding snapshots together.
+Cancelling priming therefore retains already observed metadata and text for
+both streaming and non-streaming requests. Clear the guard snapshot when
+discarding an invalid-state attempt, before starting the permitted replay.
+
 For streaming, seed the guard from the primed pump before constructing the
 response body. The guard owns the entire body lifetime, including the initial
 event batch, beside the semaphore permit. Each chunk updates its snapshot.
