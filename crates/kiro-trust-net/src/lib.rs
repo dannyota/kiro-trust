@@ -6,7 +6,9 @@ mod destination;
 mod policy;
 mod region;
 
-pub use client::{Client, HTTP_PROXY, NetError, REDIRECTS, Response, TLS_ROOTS};
+pub use client::{
+    Client, HTTP_PROXY, NetError, REDIRECTS, Response, TLS_ROOTS, probe_loopback_health,
+};
 pub use destination::Destination;
 pub use policy::{ExtraCa, Policy};
 pub use region::{RUNTIME_ALLOWLIST, Region, RegionError, RuntimeRegion};

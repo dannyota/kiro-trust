@@ -9,99 +9,15 @@
 
 use crate::config::{AuditArgs, parse_listen, read_extra_ca, resolve_db_path, resolve_token_file};
 use crate::listener::{HEADER_READ_TIMEOUT, MAX_CONNECTIONS};
+use crate::output::{abbreviate_home_in_message, abbreviate_home_path};
+#[cfg(test)]
+use crate::output::{
+    abbreviate_home_in_message_with, abbreviate_home_path_with, is_usable_home, real_home,
+};
 use kiro_trust_auth::KiroDb;
 use kiro_trust_net::{Destination, RuntimeRegion};
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
-
-/// Abbreviating the real home directory to `~` in audit output
-/// (task-20-fix-1.md Important 1). Audit output is what a user pastes into
-/// a bug report to show their configuration is safe, and a bare path leaks
-/// the OS username the way a log line must not (CLAUDE.md; spec 6.4).
-///
-/// The two call sites need different mechanisms (task-20-fix-2.md Minor 1).
-/// `credential_source.path` is a whole path, so `abbreviate_home_path`
-/// strips the home as a path prefix with `Path::strip_prefix`, which
-/// matches whole components: that fixes both `HOME=/` (which a plain
-/// substring replace would turn into a `~` at every separator) and a
-/// sibling directory that merely shares the home as a string prefix
-/// (`/home/x-backup` under `HOME=/home/x`, which a substring replace would
-/// mangle into `~-backup`). The `problems` string embeds the path
-/// mid-sentence inside rusqlite's own error text, where a prefix strip
-/// cannot reach it, so `abbreviate_home_in_message` keeps a substring
-/// replacement, guarded to require the match be followed by a path
-/// separator or the end of the string, for the same reason a sibling
-/// directory must be left alone.
-///
-/// Both mechanisms treat `""` and `/` as "no abbreviation possible" and
-/// return the input unchanged: an empty home has nothing to strip, and `/`
-/// as home would eat the leading separator of every absolute path.
-fn real_home() -> String {
-    directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
-fn is_usable_home(home: &str) -> bool {
-    !home.is_empty() && home != "/"
-}
-
-/// Abbreviates a whole path by stripping the home directory as a path
-/// prefix. See the module-level comment above `real_home` for why this
-/// call site needs `Path::strip_prefix` rather than a substring replace.
-fn abbreviate_home_path(s: &str) -> String {
-    abbreviate_home_path_with(s, &real_home())
-}
-
-fn abbreviate_home_path_with(s: &str, home: &str) -> String {
-    if !is_usable_home(home) {
-        return s.to_string();
-    }
-    match std::path::Path::new(s).strip_prefix(home) {
-        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-        Ok(rest) => format!("~/{}", rest.display()),
-        Err(_) => s.to_string(),
-    }
-}
-
-/// Abbreviates a home-directory occurrence embedded mid-sentence inside a
-/// message. See the module-level comment above `real_home` for why this
-/// call site keeps a substring replace instead of a prefix strip, and why
-/// each match is only abbreviated when followed by a path separator or the
-/// end of the string.
-fn abbreviate_home_in_message(s: &str) -> String {
-    abbreviate_home_in_message_with(s, &real_home())
-}
-
-fn abbreviate_home_in_message_with(s: &str, home: &str) -> String {
-    if !is_usable_home(home) {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut remaining = s;
-    while let Some(idx) = remaining.find(home) {
-        let (before, at_match) = remaining.split_at(idx);
-        out.push_str(before);
-        let after = &at_match[home.len()..];
-        // A path separator, the end of the string, or any character that
-        // cannot continue a path component. The last case is what keeps
-        // `--extra-ca "$HOME"` from printing the real home: its message is
-        // `--extra-ca <path>: Is a directory`, where the home is followed by
-        // `:`, not by a separator (v020-ca-wiring-review.md, finding 1). A
-        // sibling directory sharing the home as a string prefix
-        // (`/home/x-backup` under `HOME=/home/x`) is still left alone,
-        // because `-` continues a component and so fails this test.
-        let boundary_ok = match after.chars().next() {
-            None => true,
-            Some('/') | Some('\\') => true,
-            Some(c) => !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~'),
-        };
-        out.push_str(if boundary_ok { "~" } else { home });
-        remaining = after;
-    }
-    out.push_str(remaining);
-    out
-}
 
 #[derive(Serialize, Default)]
 pub struct CredentialSource {
@@ -141,6 +57,7 @@ pub struct AuditReport {
     pub telemetry: String,
     pub content_sharing: String,
     pub request_body_logging: String,
+    pub doctor_network: String,
     pub dynamic_model_discovery: String,
     pub automatic_updates: String,
     pub build_features: Vec<String>,
@@ -339,6 +256,7 @@ pub fn report(args: &AuditArgs) -> Result<AuditReport, String> {
             "opted out (x-amzn-codewhisperer-optout: true)".into()
         },
         request_body_logging: "disabled (no flag exists)".into(),
+        doctor_network: "explicit unauthenticated GET /health to configured loopback".into(),
         dynamic_model_discovery: "disabled".into(),
         automatic_updates: "disabled".into(),
         build_features,
@@ -374,10 +292,11 @@ pub fn render_text(r: &AuditReport) -> String {
         r.local_listener, r.local_authentication, r.connection_limits
     ));
     s.push_str(&format!(
-        "Telemetry              {}\nKiro content sharing   {}\nRequest body logging   {}\nDynamic model discovery {}\nAutomatic updates      {}\n\n",
+        "Telemetry              {}\nKiro content sharing   {}\nRequest body logging   {}\nDoctor network         {}\nDynamic model discovery {}\nAutomatic updates      {}\n\n",
         r.telemetry,
         r.content_sharing,
         r.request_body_logging,
+        r.doctor_network,
         r.dynamic_model_discovery,
         r.automatic_updates
     ));
@@ -465,6 +384,13 @@ mod tests {
         };
         let r = report(&args).unwrap();
         assert_eq!(r.authentication.kind, "AWS IAM Identity Center");
+        assert_eq!(
+            r.doctor_network,
+            "explicit unauthenticated GET /health to configured loopback"
+        );
+        assert!(render_text(&r).contains(
+            "Doctor network         explicit unauthenticated GET /health to configured loopback\n"
+        ));
         // task-20-rulings.md ruling 1: us-east-1, not the owner's real
         // ap-southeast-1 SSO region.
         assert_eq!(r.authentication.sso_region, "us-east-1");

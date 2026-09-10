@@ -7,7 +7,11 @@ use bytes::Bytes;
 use futures_util::stream::{BoxStream, StreamExt, TryStreamExt};
 use http::HeaderMap;
 use std::fmt;
+use std::net::SocketAddr;
 use std::time::Duration;
+
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const HEALTH_PROBE_MAX_BODY: usize = 256;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
@@ -31,6 +35,55 @@ pub enum NetError {
     /// attaches that itself) and never certificate bytes.
     #[error("extra CA rejected: {0}")]
     ExtraCa(ExtraCaError),
+    #[error("loopback health probe failed")]
+    HealthProbe,
+}
+
+/// Sends the only plaintext request permitted in production: a fixed,
+/// unauthenticated HTTP/1 health request to a loopback socket. The caller
+/// supplies a `SocketAddr`, never a URL, host, path, method, or header.
+pub async fn probe_loopback_health(addr: SocketAddr) -> Result<(), NetError> {
+    if !addr.ip().is_loopback() {
+        return Err(NetError::HealthProbe);
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .http1_only()
+        .connect_timeout(HEALTH_PROBE_TIMEOUT)
+        .build()
+        .map_err(|_| NetError::HealthProbe)?;
+    let url = format!("http://{addr}/health");
+    let response = client
+        .get(url)
+        .timeout(HEALTH_PROBE_TIMEOUT)
+        .send()
+        .await
+        .map_err(|_| NetError::HealthProbe)?;
+    if response.status() != reqwest::StatusCode::OK
+        || response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            != Some("application/json")
+    {
+        return Err(NetError::HealthProbe);
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| NetError::HealthProbe)?;
+        if body.len().saturating_add(chunk.len()) > HEALTH_PROBE_MAX_BODY {
+            return Err(NetError::HealthProbe);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if body == br#"{"status":"ok"}"# {
+        Ok(())
+    } else {
+        Err(NetError::HealthProbe)
+    }
 }
 
 /// Root store `kiro-trust audit` reports (spec 6.6): kept next to the

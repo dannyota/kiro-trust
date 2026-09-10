@@ -73,6 +73,11 @@ support: format validation and per-image and per-request limits (section 5.3),
 and images in history entries (section 5.3, pending the live test in
 section 8.6).
 
+0.3.0 adds offline model inspection through `models list` and `models show`
+(section 4.2.1), plus `kiro-trust doctor` (section 4.6). Doctor checks local
+configuration by default. `doctor --network` also sends an explicit loopback
+health probe.
+
 ## 2. Decisions
 
 | Decision | Choice | Rejected alternative and why |
@@ -162,15 +167,23 @@ impl Client {
     pub async fn post(&self, dest: &Destination, path: &str,
         headers: HeaderMap, body: Vec<u8>) -> Result<Response, NetError>;
 }
+pub async fn probe_loopback_health(addr: SocketAddr) -> Result<(), NetError>;
 ```
 
-`Destination` is the only way to name a host. The request path is validated
+`Destination` is the only way to name a remote host. The request path is validated
 too: it must start with `/` and carry no userinfo, query, fragment, or
 backslash, and the built URL is parsed and checked to name exactly the
 destination host before it is sent. There is no `Url` in the public
 API. `Policy::production()` is the only constructor the binary uses. A
 `test-endpoints` cargo feature adds `Policy::loopback_plain_http(port)` for
 this crate's own tests; the binary never enables it and CI proves that.
+
+`probe_loopback_health` is the one public exception: it accepts a loopback
+`SocketAddr` for a fixed unauthenticated HTTP/1 `GET /health`. It rejects
+non-loopback addresses inside the net crate and returns only the fixed
+`NetError::HealthProbe` error on failure. The caller cannot change its URL,
+path, method, or headers. Section 4.6 defines its timeout and body
+bounds.
 
 The client is built with redirects disabled, `no_proxy()`, `rustls` with
 `webpki-roots`, HTTPS only, connect timeout 10 s, response header timeout 30 s.
@@ -344,7 +357,7 @@ per-frame size cap. Error bodies are read to at most 64 KiB.
 
 ### 3.5 kiro-trust (binary)
 
-`clap` subcommands: `serve`, `audit`, `env`, `exec`, and `models`. Modules:
+`clap` subcommands: `serve`, `audit`, `env`, `exec`, `models`, and `doctor`. Modules:
 `config` (flags, env, validation), `server` (axum routes, middleware, limits),
 `token` (local token file), `serve` (the `serve` command: credential read,
 bind, shutdown), `logging` (the `tracing` subscriber and its `EnvFilter`),
@@ -352,6 +365,10 @@ bind, shutdown), `logging` (the `tracing` subscriber and its `EnvFilter`),
 subscriber; it is installed once, from `logging::init`, before `serve::run`
 starts. `models list` and `models show` return before logging initialization,
 credential access, listener access, or network-client construction.
+
+`doctor` reports fixed, non-secret local diagnostics. It opens the credential
+database read-only but never constructs `TokenSource` or refreshes a
+credential. It is offline unless `--network` is present.
 
 ### 3.6 xtask
 
@@ -476,6 +493,69 @@ the child's environment only, never a log, stderr, or an error path.
 ### 4.5 Exit codes
 
 `0` success, `1` runtime failure, `2` usage or configuration error.
+
+### 4.6 `kiro-trust doctor`
+
+`kiro-trust doctor [--json] [--network] [--listen <loopback-address>]
+[--kiro-db <path>] [--runtime-region <region>] [--token-file <path>]
+[--extra-ca <pem>]` reports five checks in this order: configuration,
+database, credential expiry, local token, and listener. It reports only the
+fixed snake-case check names, statuses, and details below. It never emits a
+database value, ARN, account id, token, header value, raw network body, or
+upstream error text.
+
+The configuration check parses the loopback address and runtime-region
+override, resolves the database and token-file paths, and validates an optional
+extra CA. The database check opens the database only through
+`KiroDb::open_read_only`, verifies `query_only`, and parses the credential.
+The expiry check is `valid` when more than five minutes remain,
+`refresh_required` when a positive interval of five minutes or less remains,
+and `expired` when the expiry is reached or unavailable. Doctor does not
+refresh, so an expiry warning makes no promise about refresh success.
+
+The local-token check uses `symlink_metadata` only. It never reads token-file
+contents. A present `KIRO_TRUST_TOKEN` reports `explicit_token_configured`
+without inspecting its value. On Unix a token file must be regular and have no
+group or other mode bits. Windows reports `acl_not_verified` for a regular
+file. Missing token files are warnings because `serve` creates them.
+
+Without `--network`, listener is `skipped` with `network_disabled`. With it,
+the only request is the fixed, unauthenticated HTTP/1 `GET /health` to the
+configured loopback socket. The private net client disables proxies and
+redirects, applies two-second connect and response deadlines, reads at most
+256 bytes, and accepts only status 200, `application/json`, and exactly
+`{"status":"ok"}`. It rejects a non-loopback address again inside the net
+crate. No token, caller-provided method, path, host, or header enters the
+probe.
+
+`DoctorReport` serializes as `version`, `paths`, and `checks`. `paths` has
+optional `database`, `token_file`, and `extra_ca` fields whose paths use the
+same home abbreviation as audit. `checks` has fixed `name`, `status`, and
+`detail` enums. Text output renders the paths first, then `NAME STATUS DETAIL`.
+The command exits 1 when any check is an error; warning-only and skipped-only
+reports exit 0.
+
+| Check condition | Status | Detail |
+| --- | --- | --- |
+| Configuration parses and optional CA loads | ok | valid |
+| Invalid listener, region, path resolution, or CA | error | invalid_configuration |
+| Database opens read-only and credential parses | ok | read_only |
+| Database missing or unreadable | error | database_unavailable |
+| Read-only assertion or credential parsing fails | error | credential_invalid |
+| More than five minutes until expiry | ok | valid |
+| Positive expiry interval at most five minutes | warning | refresh_required |
+| Expiry reached or unavailable | warning | expired |
+| Credential unavailable | skipped | credential_unavailable |
+| Explicit local token variable is present | ok | explicit_token_configured |
+| Private Unix token file | ok | private_file |
+| Token file missing | warning | token_file_missing |
+| Token metadata unreadable | error | token_metadata_unreadable |
+| Symlink, nonregular, or unsafe Unix token file | error | unsafe_token_file |
+| Regular Windows token file | warning | acl_not_verified |
+| Offline listener check | skipped | network_disabled |
+| Network probe succeeds | ok | healthy |
+| Network probe fails | error | health_probe_failed |
+| Invalid configuration prevents a dependent check | skipped | invalid_configuration |
 
 ## 5. Protocol translation
 
@@ -783,6 +863,11 @@ or `security_logging.rs` (section 8.4).
   path so the deviation is visible.
 - Timeouts per 3.2. The Kiro bearer token appears in exactly one place: the
   `Authorization` header of a runtime request.
+- `doctor --network` is the sole exception to the HTTPS destination policy. It
+  may make one unauthenticated plaintext HTTP/1 `GET /health` request to its
+  configured loopback `SocketAddr`. It has no caller-controlled request
+  components, disables proxies and redirects, and does not change the outbound
+  policy for `serve`, `audit`, model commands, or inference.
 
 ### 6.3 Local listener
 
@@ -877,7 +962,9 @@ or `security_logging.rs` (section 8.4).
 ### 6.5 Telemetry
 
 None. No exporter, no crash reporter, no update check, no remote
-configuration. The only outbound traffic is the two hosts in 6.2.
+configuration. Remote traffic goes only to the two hosts in section 6.2.
+`doctor --network` also permits the explicit unauthenticated loopback health
+probe defined in section 4.6.
 
 ### 6.6 Audit output
 
@@ -914,6 +1001,7 @@ Connection limits      32 connections, 15s header read timeout
 Telemetry              none
 Kiro content sharing   opted out (x-amzn-codewhisperer-optout: true)
 Request body logging   disabled (no flag exists)
+Doctor network         explicit unauthenticated GET /health to configured loopback
 Dynamic model discovery disabled
 Automatic updates      disabled
 
@@ -952,6 +1040,12 @@ way. An unreadable or malformed file adds a sanitized problem and makes audit
 exit 1, since a configured anchor that cannot be loaded is a deviation the
 operator has to see. `Connection limits` is fixed text derived from
 `MAX_CONNECTIONS` and `HEADER_READ_TIMEOUT` (section 6.3).
+
+`Doctor network` is fixed policy text backed by the loopback probe tests in
+`security_net.rs`. Its JSON field is `doctor_network`, with the exact value
+`explicit unauthenticated GET /health to configured loopback`. The line
+describes the permitted request; it does not claim that a listener was
+contacted. Audit itself never probes the listener.
 
 On Windows, `Local authentication` reads
 `required (token file, user profile ACL)`, matching 6.3: Windows sets no

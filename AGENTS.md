@@ -79,6 +79,9 @@ kiro-trust (bin)  →  kiro-trust-kiro  →  kiro-trust-net, kiro-trust-protocol
 - Loopback only. Never add a non-loopback bind override.
 - No telemetry, exporter, crash reporter, update check, or model discovery,
   even behind a flag.
+- `doctor --network` may make one unauthenticated plaintext `GET /health`
+  request to the configured loopback address. It accepts no caller-controlled
+  method, path, host, or headers. Offline doctor never makes a request.
 - Unknown model returns 400. Never fall back to a default model.
 - `x-amzn-codewhisperer-optout` defaults to `true`; `--share-content` is the
   only way to send `false`, and audit shows it.

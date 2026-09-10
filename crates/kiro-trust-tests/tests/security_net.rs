@@ -1,6 +1,9 @@
 use http::HeaderMap;
-use kiro_trust_net::{Client, Destination, NetError, Policy, RuntimeRegion};
+use kiro_trust_net::{Client, Destination, NetError, Policy, RuntimeRegion, probe_loopback_health};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -8,6 +11,178 @@ fn runtime() -> Destination {
     Destination::Runtime {
         region: RuntimeRegion::parse("us-east-1").unwrap(),
     }
+}
+
+async fn receive_without_advancing_time<T>(receiver: &mut oneshot::Receiver<T>) -> T {
+    loop {
+        match receiver.try_recv() {
+            Ok(value) => return value,
+            Err(oneshot::error::TryRecvError::Empty) => tokio::task::yield_now().await,
+            Err(oneshot::error::TryRecvError::Closed) => panic!("synthetic server closed"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn loopback_health_probe_accepts_only_the_fixed_unauthenticated_health_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "ok"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    probe_loopback_health(*server.address()).await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].headers.get("authorization").is_none());
+    assert!(requests[0].headers.get("x-api-key").is_none());
+}
+
+#[tokio::test]
+async fn loopback_health_probe_rejects_non_loopback_addresses() {
+    let error = probe_loopback_health("192.0.2.1:80".parse().unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, NetError::HealthProbe));
+}
+
+#[tokio::test]
+async fn loopback_health_probe_rejects_redirects() {
+    let server = MockServer::start().await;
+    let evil = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", evil.uri()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = probe_loopback_health(*server.address()).await.unwrap_err();
+    assert!(matches!(error, NetError::HealthProbe));
+    assert!(evil.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn loopback_health_probe_rejects_oversized_bodies() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_bytes(vec![b'x'; 257]),
+        )
+        .mount(&server)
+        .await;
+
+    let error = probe_loopback_health(*server.address()).await.unwrap_err();
+    assert!(matches!(error, NetError::HealthProbe));
+}
+
+#[tokio::test]
+async fn loopback_health_probe_rejects_wrong_content_type() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/plain")
+                .set_body_string(r#"{"status":"ok"}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let error = probe_loopback_health(*server.address()).await.unwrap_err();
+    assert!(matches!(error, NetError::HealthProbe));
+}
+
+#[tokio::test]
+async fn loopback_health_probe_rejects_wrong_json() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "not-ok"})),
+        )
+        .mount(&server)
+        .await;
+
+    let error = probe_loopback_health(*server.address()).await.unwrap_err();
+    assert!(matches!(error, NetError::HealthProbe));
+}
+
+#[tokio::test]
+async fn loopback_health_probe_times_out() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"status": "ok"}))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&server)
+        .await;
+
+    let error = probe_loopback_health(*server.address()).await.unwrap_err();
+    assert!(matches!(error, NetError::HealthProbe));
+}
+
+#[tokio::test(start_paused = true)]
+async fn loopback_health_probe_deadline_includes_headers_and_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let started = tokio::time::Instant::now();
+    let (request_sent, mut request_received) = oneshot::channel();
+    let (release_headers, release_headers_received) = oneshot::channel();
+    let (headers_sent, mut headers_received) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 256];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(read, 0, "probe closed before sending its request");
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        request_sent.send(()).unwrap();
+        release_headers_received.await.unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 15\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        headers_sent.send(()).unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = stream.write_all(br#"{"status":"ok"}"#).await;
+    });
+
+    let probe = tokio::spawn(probe_loopback_health(address));
+    receive_without_advancing_time(&mut request_received).await;
+    assert_eq!(tokio::time::Instant::now() - started, Duration::ZERO);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    release_headers.send(()).unwrap();
+    receive_without_advancing_time(&mut headers_received).await;
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(1)
+    );
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        probe.is_finished(),
+        "the two-second request deadline must include the delayed body"
+    );
+    assert!(matches!(probe.await.unwrap(), Err(NetError::HealthProbe)));
+    server.abort();
 }
 
 // spec 6.2: a 3xx from either host fails without following.

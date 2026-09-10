@@ -630,9 +630,11 @@ profile ARN, account id, header value, token, pagination token, or raw body is
 logged.
 
 The protocol crate remains pure. `reqwest` remains in `kiro-trust-net` only.
-Public network APIs name hosts through `Destination` only. The binary never
-enables `test-endpoints`. The six production `expose_secret()` sites remain
-the exact list in the current spec.
+Public network APIs name non-loopback hosts through `Destination` only.
+`probe_loopback_health(SocketAddr)` is the sole exception: it accepts only a
+configured loopback address and sends the fixed unauthenticated health request
+defined in section 4. The binary never enables `test-endpoints`. The six
+production `expose_secret()` sites remain the exact list in the current spec.
 
 ## 9. Evidence and release gates
 

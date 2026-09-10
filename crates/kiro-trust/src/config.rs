@@ -26,6 +26,8 @@ pub enum Command {
     Serve(ServeArgs),
     /// Print the effective security configuration.
     Audit(AuditArgs),
+    /// Check local configuration and optionally probe the loopback listener.
+    Doctor(DoctorArgs),
     /// Print the exports Claude Code needs.
     Env(EnvArgs),
     /// Run a command with the exports set in its environment (spec 4.4).
@@ -108,6 +110,25 @@ pub struct AuditArgs {
     /// Additional PEM trust anchor, added to the compiled roots, never
     /// replacing them (spec 6.2, 4.1). `audit` validates this file with no
     /// network access (spec 4.2, 6.6).
+    #[arg(long, env = "KIRO_TRUST_EXTRA_CA")]
+    pub extra_ca: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DoctorArgs {
+    #[arg(long)]
+    pub json: bool,
+    /// Probe the configured loopback listener with a fixed unauthenticated health request.
+    #[arg(long)]
+    pub network: bool,
+    #[arg(long, env = "KIRO_TRUST_LISTEN", default_value = DEFAULT_LISTEN)]
+    pub listen: String,
+    #[arg(long, env = "KIRO_TRUST_DB")]
+    pub kiro_db: Option<PathBuf>,
+    #[arg(long, env = "KIRO_TRUST_RUNTIME_REGION")]
+    pub runtime_region: Option<String>,
+    #[arg(long, env = "KIRO_TRUST_TOKEN_FILE")]
+    pub token_file: Option<PathBuf>,
     #[arg(long, env = "KIRO_TRUST_EXTRA_CA")]
     pub extra_ca: Option<PathBuf>,
 }

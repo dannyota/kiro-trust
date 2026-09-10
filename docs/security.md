@@ -13,6 +13,9 @@ a test behind it.
 - Loopback listener with a mandatory local token.
 - No request or response body logging, and no option to enable it.
 - No telemetry, crash reporting, update checks, or model discovery.
+- `doctor --network` may send one unauthenticated `GET /health` request to the
+  configured loopback listener. It has no caller-controlled request parts and
+  does not change the outbound policy for other commands.
 - No developer-only feature, such as `capture` (which writes real prompts
   and responses to disk), compiled into a release build.
 
@@ -48,13 +51,23 @@ by the named tests `oidc_redirect_rejected`, `runtime_redirect_rejected`, and
 `proxy_env_ignored` (`crates/kiro-trust-tests/tests/security_net.rs`), not by
 `audit`.
 
-**Fixed text asserting an absence.** The `Telemetry`, `Request body logging`,
-`Dynamic model discovery`, and `Automatic updates` lines print the same way
-regardless of build or configuration, because each asserts that a whole
-category of code does not exist in this binary. No field a program can print
-proves an absence better than the source does. Read those four as a pointer to
-verify the claim in the source (or `NOTICE`), not as something `audit` checked
-for you. The same holds for the no-body-logging promise above.
+**Fixed policy text.** The `Telemetry`, `Request body logging`, `Doctor
+network`, `Dynamic model discovery`, and `Automatic updates` lines print the
+same way regardless of build or configuration. Source inspection must verify
+each policy. `Doctor network` is backed by the loopback probe tests in
+`crates/kiro-trust-tests/tests/security_net.rs`. No field a program can print
+proves a policy better than the source and its tests. The no-body-logging
+promise has the same limit.
+
+## Doctor
+
+`kiro-trust doctor` checks local configuration, database access, credential
+expiry, token-file metadata, and listener reachability without network access.
+`--network` enables one fixed, unauthenticated HTTP/1 `GET /health` probe to
+the configured loopback address. The probe disables proxies and redirects,
+uses two-second deadlines, reads at most 256 bytes, and accepts only the fixed
+health JSON response. It never reads token-file contents or refreshes a
+credential.
 
 ## Verifying a release
 

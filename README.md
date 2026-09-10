@@ -89,6 +89,8 @@ spec for every flag and environment variable.
 - Request and response bodies are never logged, and no flag exists to log
   them.
 - No telemetry, no update checks, no dynamic model discovery.
+- `doctor --network` is the sole diagnostic network exception. It sends one
+  unauthenticated `GET /health` request to the configured loopback listener.
 - No developer-only feature, such as `capture` (which writes real prompts
   and responses to disk), is compiled into a release build.
 
@@ -119,6 +121,18 @@ text asserting that a category of code does not exist. The difference matters
 when you are relying on `audit` as evidence:
 [`docs/security.md`](docs/security.md#what-audit-measures) draws that line
 for each printed field.
+
+## Doctor
+
+```bash
+kiro-trust doctor [--json] [--network]
+```
+
+Checks configuration, the read-only credential database, credential expiry,
+local-token metadata, and listener reachability. It is offline by default.
+`--network` sends one fixed unauthenticated `GET /health` request to the
+configured loopback listener. Doctor never refreshes a credential or reads
+token-file contents.
 
 ## Limitations
 
