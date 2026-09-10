@@ -7,7 +7,8 @@
 //! only reads rows already in the database (it never refreshes a token,
 //! which is the one path in this workspace that calls the network).
 
-use crate::config::{AuditArgs, parse_listen, resolve_db_path, resolve_token_file};
+use crate::config::{AuditArgs, parse_listen, read_extra_ca, resolve_db_path, resolve_token_file};
+use crate::listener::{HEADER_READ_TIMEOUT, MAX_CONNECTIONS};
 use kiro_trust_auth::KiroDb;
 use kiro_trust_net::{Destination, RuntimeRegion};
 use serde::Serialize;
@@ -119,10 +120,12 @@ pub struct AuditReport {
     pub runtime: Runtime,
     pub allowed_outbound: Vec<String>,
     pub tls_roots: String,
+    pub extra_ca: String,
     pub http_proxy: String,
     pub redirects: String,
     pub local_listener: String,
     pub local_authentication: String,
+    pub connection_limits: String,
     pub telemetry: String,
     pub content_sharing: String,
     pub request_body_logging: String,
@@ -162,6 +165,36 @@ pub fn report(args: &AuditArgs) -> Result<AuditReport, String> {
     if let Some(Err(e)) = &region_arg {
         problems.push(e.to_string());
     }
+
+    // spec 6.6: `audit` validates --extra-ca with no network access, the
+    // same parse `serve` runs at startup (spec 4.1), reusing
+    // `config::read_extra_ca` rather than restating the read-and-parse
+    // logic. An invalid file adds a sanitized problem (path only, never
+    // certificate bytes: `ConfigError::ExtraCa`'s Display already carries
+    // just that) and makes audit exit 1, since a configured anchor that
+    // cannot be loaded is a deviation the operator has to see.
+    let extra_ca = match read_extra_ca(args.extra_ca.as_ref()) {
+        Ok(None) => "none".to_string(),
+        Ok(Some(_)) => abbreviate_home_path(
+            &args
+                .extra_ca
+                .as_ref()
+                .expect("Some(_) implies the path was given")
+                .display()
+                .to_string(),
+        ),
+        Err(e) => {
+            problems.push(abbreviate_home_in_message(&e.to_string()));
+            abbreviate_home_path(
+                &args
+                    .extra_ca
+                    .as_ref()
+                    .expect("read_extra_ca only fails when a path was given")
+                    .display()
+                    .to_string(),
+            )
+        }
+    };
 
     let db_open = KiroDb::open_read_only(&db_path);
     // Measured, not asserted (task-20-fix-1.md Important 2): `is_read_only`
@@ -258,6 +291,7 @@ pub fn report(args: &AuditArgs) -> Result<AuditReport, String> {
         runtime,
         allowed_outbound: outbound,
         tls_roots: kiro_trust_net::TLS_ROOTS.to_string(),
+        extra_ca,
         http_proxy: kiro_trust_net::HTTP_PROXY.to_string(),
         redirects: kiro_trust_net::REDIRECTS.to_string(),
         local_listener: listener,
@@ -271,6 +305,14 @@ pub fn report(args: &AuditArgs) -> Result<AuditReport, String> {
         } else {
             "required (token file, user profile ACL)".to_string()
         },
+        // Fixed text derived from `listener::MAX_CONNECTIONS` and
+        // `listener::HEADER_READ_TIMEOUT` (spec 6.3, 6.6), not a separate
+        // hardcoded literal: changing either constant changes this line
+        // without a second edit site.
+        connection_limits: format!(
+            "{MAX_CONNECTIONS} connections, {}s header read timeout",
+            HEADER_READ_TIMEOUT.as_secs()
+        ),
         // telemetry, request_body_logging, dynamic_model_discovery, and
         // automatic_updates stay fixed literals (task-20-fix-1.md
         // Important 2, scoped): each asserts the *absence* of code, and a
@@ -312,12 +354,12 @@ pub fn render_text(r: &AuditReport) -> String {
         s.push_str(&format!("  {h}\n"));
     }
     s.push_str(&format!(
-        "\nTLS roots              {}\nHTTP proxy             {}\nRedirects              {}\n\n",
-        r.tls_roots, r.http_proxy, r.redirects
+        "\nTLS roots              {}\nExtra CA               {}\nHTTP proxy             {}\nRedirects              {}\n\n",
+        r.tls_roots, r.extra_ca, r.http_proxy, r.redirects
     ));
     s.push_str(&format!(
-        "Local listener         {}\nLocal authentication   {}\n\n",
-        r.local_listener, r.local_authentication
+        "Local listener         {}\nLocal authentication   {}\nConnection limits      {}\n\n",
+        r.local_listener, r.local_authentication, r.connection_limits
     ));
     s.push_str(&format!(
         "Telemetry              {}\nKiro content sharing   {}\nRequest body logging   {}\nDynamic model discovery {}\nAutomatic updates      {}\n\n",
@@ -407,6 +449,7 @@ mod tests {
             runtime_region: None,
             token_file: None,
             share_content: false,
+            extra_ca: None,
         };
         let r = report(&args).unwrap();
         assert_eq!(r.authentication.kind, "AWS IAM Identity Center");
@@ -419,7 +462,16 @@ mod tests {
             vec!["oidc.us-east-1.amazonaws.com", "runtime.us-east-1.kiro.dev"]
         );
         assert_eq!(r.tls_roots, "webpki-roots (compiled in)");
+        assert_eq!(r.extra_ca, "none");
         assert_eq!(r.http_proxy, "disabled (environment ignored)");
+        assert_eq!(
+            r.connection_limits,
+            format!(
+                "{} connections, {}s header read timeout",
+                crate::listener::MAX_CONNECTIONS,
+                crate::listener::HEADER_READ_TIMEOUT.as_secs()
+            )
+        );
         assert_eq!(r.telemetry, "none");
         assert_eq!(
             r.content_sharing,
@@ -461,7 +513,14 @@ mod tests {
         for line in [
             "Credential source".to_string(),
             "mode                 read-only, authorizer enforced".to_string(),
+            "TLS roots              webpki-roots (compiled in)".to_string(),
+            "Extra CA               none".to_string(),
             "Local listener         127.0.0.1:3456".to_string(),
+            format!(
+                "Connection limits      {} connections, {}s header read timeout",
+                crate::listener::MAX_CONNECTIONS,
+                crate::listener::HEADER_READ_TIMEOUT.as_secs()
+            ),
             "Automatic updates      disabled".to_string(),
             build_features_line,
         ] {
@@ -489,6 +548,7 @@ mod tests {
             runtime_region: None,
             token_file: None,
             share_content: false,
+            extra_ca: None,
         };
         let r = report(&args).unwrap();
         assert!(
@@ -543,6 +603,7 @@ mod tests {
             runtime_region: None,
             token_file: None,
             share_content: false,
+            extra_ca: None,
         };
         let r = report(&args).unwrap();
         assert!(
@@ -568,6 +629,7 @@ mod tests {
             runtime_region: None,
             token_file: None,
             share_content: true,
+            extra_ca: None,
         };
         let r = report(&args).unwrap();
         assert_eq!(r.content_sharing, "enabled (--share-content)");
@@ -615,6 +677,7 @@ mod tests {
             runtime_region: Some("not-a-region".into()),
             token_file: None,
             share_content: false,
+            extra_ca: None,
         };
         let r = report(&args).unwrap();
         assert!(
@@ -645,6 +708,7 @@ mod tests {
             runtime_region: None,
             token_file: None,
             share_content: false,
+            extra_ca: None,
         };
         let r = report(&args).unwrap();
         if cfg!(unix) {
@@ -783,5 +847,139 @@ mod tests {
         let text = render_text(&r);
         assert!(text.contains("Build features         capture"));
         assert!(text.contains("development feature capture is compiled in"));
+    }
+
+    // The shared test CA fixture, the same one config.rs's tests use; see
+    // `tests/fixtures/ca/README.md`.
+    const TEST_CA_PEM: &str = include_str!("../../../tests/fixtures/ca/test-ca.crt");
+
+    // spec 6.6: `Extra CA` shows the configured path, abbreviated the same
+    // way as `credential_source.path`, when --extra-ca is set and valid.
+    #[test]
+    fn a_valid_extra_ca_file_is_shown_abbreviated_and_does_not_fail_the_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = synthetic_db(dir.path());
+        let ca_path = dir.path().join("extra-ca.pem");
+        std::fs::write(&ca_path, TEST_CA_PEM).unwrap();
+        let args = AuditArgs {
+            json: false,
+            listen: "127.0.0.1:3456".into(),
+            kiro_db: Some(db),
+            runtime_region: None,
+            token_file: None,
+            share_content: false,
+            extra_ca: Some(ca_path.clone()),
+        };
+        let r = report(&args).unwrap();
+        assert_eq!(r.extra_ca, ca_path.display().to_string());
+        assert!(!r.extra_ca.contains("BEGIN CERTIFICATE"));
+        // A *valid* extra CA contributes no problem of its own. Asserted that
+        // way rather than as `exit_code == 0`, because a build that also
+        // compiles `kiro-trust-tests` unifies `test-endpoints` into the
+        // `kiro-trust-net` this crate links (see the comment in
+        // `report_matches_the_synthetic_fixture` and CLAUDE.md's Architecture
+        // rules), which legitimately adds its own problem and exits 1. The
+        // claim under test is about the CA, so it names the CA.
+        assert!(
+            !r.problems.iter().any(|p| p.contains("extra-ca")),
+            "a valid extra CA must add no problem of its own: {:?}",
+            r.problems
+        );
+        assert!(render_text(&r).contains(&format!("Extra CA               {}", r.extra_ca)));
+    }
+
+    // spec 6.6: an unreadable or malformed --extra-ca file adds a sanitized
+    // problem and makes audit exit 1, since a configured anchor that
+    // cannot be loaded is a deviation the operator has to see. `audit`
+    // never touches the network to validate it (module doc comment above).
+    #[test]
+    fn a_missing_extra_ca_file_fails_the_audit_without_leaking_the_path_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = synthetic_db(dir.path());
+        let missing = dir.path().join("no-such-ca.pem");
+        let args = AuditArgs {
+            json: false,
+            listen: "127.0.0.1:3456".into(),
+            kiro_db: Some(db),
+            runtime_region: None,
+            token_file: None,
+            share_content: false,
+            extra_ca: Some(missing.clone()),
+        };
+        let r = report(&args).unwrap();
+        assert_eq!(exit_code(&r), 1);
+        assert!(
+            r.problems
+                .iter()
+                .any(|p| p.contains("extra-ca") || p.contains("extra CA")),
+            "{:?}",
+            r.problems
+        );
+    }
+
+    #[test]
+    fn a_malformed_extra_ca_file_fails_the_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = synthetic_db(dir.path());
+        let ca_path = dir.path().join("bad-ca.pem");
+        std::fs::write(&ca_path, b"not a certificate").unwrap();
+        let args = AuditArgs {
+            json: false,
+            listen: "127.0.0.1:3456".into(),
+            kiro_db: Some(db),
+            runtime_region: None,
+            token_file: None,
+            share_content: false,
+            extra_ca: Some(ca_path),
+        };
+        let r = report(&args).unwrap();
+        assert_eq!(exit_code(&r), 1, "{:?}", r.problems);
+        assert!(!r.problems.join("|").contains("BEGIN CERTIFICATE"));
+    }
+
+    // Certificate bytes and the real home directory must never reach text
+    // output, JSON output, or a `ConfigError`/problem string. This is the
+    // brief's central safety property for this slice, so it is proven
+    // directly against the rendered text and JSON, not only against the
+    // structured field.
+    #[test]
+    fn extra_ca_never_leaks_certificate_bytes_or_home_directory() {
+        let home = real_home();
+        if !is_usable_home(&home) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = synthetic_db(dir.path());
+        let ca_path = Path::new(&home).join("kiro-trust-wiring-check-ca.pem");
+        std::fs::write(&ca_path, TEST_CA_PEM).unwrap();
+        let args = AuditArgs {
+            json: false,
+            listen: "127.0.0.1:3456".into(),
+            kiro_db: Some(db),
+            runtime_region: None,
+            token_file: None,
+            share_content: false,
+            extra_ca: Some(ca_path.clone()),
+        };
+        let r = report(&args).unwrap();
+        let _ = std::fs::remove_file(&ca_path);
+        assert!(
+            r.extra_ca.starts_with('~'),
+            "extra_ca should start with ~, got: {}",
+            r.extra_ca
+        );
+        assert!(!r.extra_ca.contains(&home));
+        let text = render_text(&r);
+        assert!(!text.contains(&home));
+        assert!(!text.contains("BEGIN CERTIFICATE"));
+        // The PEM's own base64 body line must never appear verbatim either.
+        for line in TEST_CA_PEM.lines() {
+            if !line.starts_with("-----") && line.len() > 8 {
+                assert!(!text.contains(line), "leaked a certificate body line");
+            }
+        }
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains(&home));
+        assert!(!json.contains("BEGIN CERTIFICATE"));
     }
 }
