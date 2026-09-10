@@ -2,6 +2,22 @@
 
 All notable changes to kiro-trust. Dates are UTC.
 
+## 0.2.0 - unreleased
+
+- `kiro-trust exec -- <cmd> [args...]` runs a command with
+  `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` in its environment and
+  nothing else changed. Compared with `eval "$(kiro-trust env)"`, the token
+  never enters a shell or a shell history. On Unix it replaces itself with the
+  child, so no wrapper process survives holding the token.
+- `--extra-ca <pem>` adds trust anchors from one PEM file to the compiled
+  roots, never replacing them, for networks that terminate TLS at an
+  inspecting middlebox. A missing, unreadable, malformed, or oversized file is
+  a startup error, never a silent fallback, and `audit` shows the configured
+  path so the deviation is visible.
+- The listener bounds connections that never reach a handler: at most 32
+  concurrent connections, and a 15-second deadline for a connection's first
+  request to be parsed. `audit` reports both.
+
 ## 0.1.0 - 2026-09-09
 
 First release.

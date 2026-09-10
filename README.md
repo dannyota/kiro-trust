@@ -56,15 +56,26 @@ kiro-trust serve
 `serve` blocks the terminal, so run the rest in a second shell:
 
 ```bash
+kiro-trust exec -- claude
+```
+
+Or, if you would rather set the variables in the shell itself:
+
+```bash
 eval "$(kiro-trust env)"
 claude
 ```
 
+Prefer `exec` where it fits: it puts the token in one child process's
+environment and nowhere else, while `eval` puts it in the shell and every
+process started from it afterwards.
+
 `kiro-trust serve` reads the Kiro CLI credential read-only, refreshes it
 through AWS OIDC when it is near expiry, and listens on loopback with a
-freshly generated local token. `kiro-trust env` prints the
-`ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` exports Claude Code needs to talk
-to it; `eval` puts them in the current shell. See
+freshly generated local token. `kiro-trust exec` and `kiro-trust env` both
+supply the `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` Claude Code needs to
+talk to it: `exec` sets them on one child process, `env` prints them for `eval`
+to put in the current shell. See
 [section 4](docs/specs/kiro-trust-design.md#4-command-surface) of the design
 spec for every flag and environment variable.
 
@@ -92,8 +103,9 @@ spec for every flag and environment variable.
 kiro-trust audit [--json]
 ```
 
-Prints the effective security configuration: listener address, credential
-database path, outbound hosts, TLS roots, and whether any developer-only
+Prints the effective security configuration: listener address, connection
+limits, credential database path, outbound hosts, TLS roots, any extra trust
+anchor configured with `--extra-ca`, and whether any developer-only
 feature (such as `capture`, which writes real prompts and responses to disk)
 is compiled into this build. It exits 1 when the listener address cannot be
 parsed or is not loopback, an invalid `--runtime-region` is given, the
