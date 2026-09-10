@@ -145,6 +145,17 @@ The live command above still skips `forced_refresh_succeeds`: that test forces
 a real OIDC refresh and needs a second, explicit `KIRO_TRUST_LIVE_REFRESH=1`
 alongside `KIRO_TRUST_LIVE=1` (spec 8.6).
 
+**The owner's Kiro allowance is exhausted as of 2026-09-10, so the whole live
+tier fails against the runtime until it resets.** Read a `ThrottlingException`,
+a `TooManyRequestsException`, a 429, or a quota or limit message from
+`runtime.<region>.kiro.dev` as that exhaustion, not as a regression you
+introduced; do not "fix" code to make a live test pass. The OIDC refresh path
+is a different service and is unaffected. The offline suite (`cargo test
+--workspace`) is the gate that still means something, so keep every claim
+tied to it. `history_image_is_accepted` (spec 5.3 step 6, 8.6) cannot be
+resolved while this holds, so history images stay dropped. Delete this
+paragraph once the allowance resets.
+
 ## Release
 
 **A release ends at the signed tag and the GitHub Release assets** (binaries,
