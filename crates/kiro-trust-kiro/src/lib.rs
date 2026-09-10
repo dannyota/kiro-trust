@@ -4,8 +4,8 @@ mod client;
 mod error;
 pub mod headers;
 
-pub use client::{KiroClient, Upstream, UpstreamStream};
-pub use error::{UpstreamError, UpstreamErrorKind};
+pub use client::{AttemptProgress, KiroClient, RetryDelay, Upstream, UpstreamStream, retry_after};
+pub use error::{UpstreamError, UpstreamErrorKind, classify_throttle};
 
 // NOTICE distribution (final-fix-2.md Important 1; Apache-2.0 section 4(d)):
 // this crate transcribes the Kiro runtime client, its retry backoff, and

@@ -2,8 +2,8 @@
 //! internal/kiroclient/client.go and backoff.go.
 
 use crate::error::{
-    UpstreamError, UpstreamErrorKind, is_event_stream_content_type, is_retryable_exception,
-    parse_exception_message, parse_exception_type,
+    UpstreamError, UpstreamErrorKind, classify_throttle, is_event_stream_content_type,
+    is_retryable_exception, parse_exception_message, parse_exception_type,
 };
 use crate::headers::{AMZ_TARGET, AMZ_USER_AGENT, CONTENT_TYPE, MAX_ATTEMPTS, USER_AGENT};
 use async_trait::async_trait;
@@ -14,11 +14,66 @@ use kiro_trust_auth::{AuthError, TokenSource};
 use kiro_trust_net::{Client, Destination, NetError};
 use kiro_trust_protocol::kiro::Payload;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, SystemTime};
 
 pub struct UpstreamStream {
     pub attempts: u32,
     pub bytes: BoxStream<'static, Result<Bytes, UpstreamError>>,
+}
+
+#[derive(Clone, Default)]
+pub struct AttemptProgress(Arc<AtomicU32>);
+
+impl AttemptProgress {
+    pub fn completed(&self) -> u32 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub fn record_completed(&self, count: u32) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_add(count))
+            });
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryDelay {
+    Fallback,
+    Wait(Duration),
+    Stop(Option<Duration>),
+}
+
+pub fn retry_after(headers: &HeaderMap, now: SystemTime) -> RetryDelay {
+    let Some(value) = headers
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return RetryDelay::Fallback;
+    };
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return match value.parse::<u64>() {
+            Ok(seconds) => retry_delay(Duration::from_secs(seconds)),
+            Err(_) => RetryDelay::Stop(None),
+        };
+    }
+    match httpdate::parse_http_date(value) {
+        Ok(date) => match date.duration_since(now) {
+            Ok(delay) => retry_delay(delay),
+            Err(_) => RetryDelay::Fallback,
+        },
+        Err(_) => RetryDelay::Fallback,
+    }
+}
+
+fn retry_delay(delay: Duration) -> RetryDelay {
+    if delay <= Duration::from_secs(60) {
+        RetryDelay::Wait(delay)
+    } else {
+        RetryDelay::Stop(Some(delay))
+    }
 }
 
 // Manual, not derived: `bytes` has no `Debug` impl, and `Result::unwrap_err`
@@ -34,6 +89,19 @@ impl std::fmt::Debug for UpstreamStream {
 #[async_trait]
 pub trait Upstream: Send + Sync {
     async fn generate(&self, payload: &Payload) -> Result<UpstreamStream, UpstreamError>;
+
+    async fn generate_with_progress(
+        &self,
+        payload: &Payload,
+        progress: &AttemptProgress,
+    ) -> Result<UpstreamStream, UpstreamError> {
+        let result = self.generate(payload).await;
+        progress.record_completed(match &result {
+            Ok(stream) => stream.attempts,
+            Err(error) => error.attempts,
+        });
+        result
+    }
 }
 
 pub struct KiroClient {
@@ -70,11 +138,13 @@ impl KiroClient {
             .tokens
             .with_token(|t| HeaderValue::from_str(&format!("Bearer {t}")))
             .await
-            .map_err(auth_error)?
+            .map_err(|error| auth_error(error, 0))?
             .map_err(|_| {
                 UpstreamError::new(
                     UpstreamErrorKind::Auth,
                     None,
+                    None,
+                    0,
                     None,
                     "token is not a valid header value",
                 )
@@ -104,75 +174,129 @@ impl KiroClient {
     }
 }
 
-fn auth_error(e: AuthError) -> UpstreamError {
-    UpstreamError::new(UpstreamErrorKind::Auth, None, None, e.to_string())
+fn auth_error(e: AuthError, attempts: u32) -> UpstreamError {
+    UpstreamError::new(
+        UpstreamErrorKind::Auth,
+        None,
+        None,
+        attempts,
+        None,
+        e.to_string(),
+    )
 }
 
-fn net_error(e: NetError) -> UpstreamError {
-    UpstreamError::new(UpstreamErrorKind::Transport, None, None, e.to_string())
+fn net_error(e: NetError, attempts: u32) -> UpstreamError {
+    UpstreamError::new(
+        UpstreamErrorKind::Transport,
+        None,
+        None,
+        attempts,
+        None,
+        e.to_string(),
+    )
 }
 
 #[async_trait]
 impl Upstream for KiroClient {
     async fn generate(&self, payload: &Payload) -> Result<UpstreamStream, UpstreamError> {
+        self.generate_inner(payload, None).await
+    }
+
+    async fn generate_with_progress(
+        &self,
+        payload: &Payload,
+        progress: &AttemptProgress,
+    ) -> Result<UpstreamStream, UpstreamError> {
+        self.generate_inner(payload, Some(progress)).await
+    }
+}
+
+impl KiroClient {
+    async fn generate_inner(
+        &self,
+        payload: &Payload,
+        progress: Option<&AttemptProgress>,
+    ) -> Result<UpstreamStream, UpstreamError> {
         let body = serde_json::to_vec(payload).map_err(|e| {
-            UpstreamError::new(UpstreamErrorKind::Protocol, None, None, e.to_string())
+            UpstreamError::new(
+                UpstreamErrorKind::Protocol,
+                None,
+                None,
+                0,
+                None,
+                e.to_string(),
+            )
         })?;
         let invocation_id = uuid::Uuid::new_v4().to_string();
-        let mut attempt = 0u32;
+        let mut attempts = 0u32;
         let mut refreshed = false;
         loop {
-            attempt += 1;
-            let last = attempt >= MAX_ATTEMPTS;
-            let identity = self.tokens.identity().await.map_err(auth_error)?;
-            let headers = self.headers(attempt, &invocation_id).await?;
+            let request_attempt = attempts.saturating_add(1);
+            let identity = self
+                .tokens
+                .identity()
+                .await
+                .map_err(|error| auth_error(error, attempts))?;
+            let headers = self
+                .headers(request_attempt, &invocation_id)
+                .await
+                .map_err(|mut error| {
+                    error.attempts = attempts;
+                    error
+                })?;
             let dest = Destination::Runtime {
                 region: identity.runtime_region,
             };
-            let resp = match self.net.post(&dest, "/", headers, body.clone()).await {
+            let post = self.net.post(&dest, "/", headers, body.clone()).await;
+            attempts = attempts.saturating_add(1);
+            if let Some(progress) = progress {
+                progress.record_completed(1);
+            }
+            let last = attempts >= MAX_ATTEMPTS;
+            let resp = match post {
                 Ok(r) => r,
                 Err(NetError::Redirect { status }) => {
                     return Err(UpstreamError::new(
                         UpstreamErrorKind::Transport,
                         Some(status),
                         None,
+                        attempts,
+                        None,
                         "redirect rejected",
                     ));
                 }
                 Err(_e) if !last => {
                     tracing::warn!(
-                        attempt,
+                        attempt = attempts,
                         error_type = "transport",
                         "upstream request failed, retrying"
                     );
-                    tokio::time::sleep(self.backoff(attempt)).await;
+                    tokio::time::sleep(self.backoff(attempts)).await;
                     continue;
                 }
-                Err(e) => return Err(net_error(e)),
+                Err(e) => return Err(net_error(e, attempts)),
             };
             match resp.status {
                 200 => {
                     let ct = resp.content_type().unwrap_or_default();
                     if is_event_stream_content_type(&ct) {
-                        let bytes = resp.into_stream().map_err(net_error).boxed();
-                        return Ok(UpstreamStream {
-                            attempts: attempt,
-                            bytes,
-                        });
+                        let bytes = resp
+                            .into_stream()
+                            .map_err(move |error| net_error(error, attempts))
+                            .boxed();
+                        return Ok(UpstreamStream { attempts, bytes });
                     }
-                    let raw = resp.bytes_limited().await.map_err(net_error)?;
+                    let raw = resp
+                        .bytes_limited()
+                        .await
+                        .map_err(|error| net_error(error, attempts))?;
                     let ex = parse_exception_type(&raw);
-                    let retryable = ex.as_deref().is_some_and(is_retryable_exception);
-                    if retryable && !last {
-                        tracing::warn!(
-                            attempt,
-                            error_type = ex.as_deref().unwrap_or(""),
-                            "200 with an exception body, retrying"
-                        );
-                        tokio::time::sleep(self.backoff(attempt)).await;
-                        continue;
-                    }
                     let kind = match ex.as_deref() {
+                        Some(_)
+                            if classify_throttle(200, &raw) == UpstreamErrorKind::ModelCapacity =>
+                        {
+                            UpstreamErrorKind::ModelCapacity
+                        }
                         Some("ThrottlingException" | "TooManyRequestsException") => {
                             UpstreamErrorKind::Throttled
                         }
@@ -180,10 +304,28 @@ impl Upstream for KiroClient {
                         Some(_) => UpstreamErrorKind::Client,
                         None => UpstreamErrorKind::Protocol,
                     };
+                    let retryable = kind == UpstreamErrorKind::ModelCapacity
+                        || ex.as_deref().is_some_and(is_retryable_exception);
+                    if retryable && !last {
+                        let error_type = if kind == UpstreamErrorKind::ModelCapacity {
+                            "model_capacity"
+                        } else {
+                            ex.as_deref().unwrap_or("")
+                        };
+                        tracing::warn!(
+                            attempt = attempts,
+                            error_type,
+                            "200 with an exception body, retrying"
+                        );
+                        tokio::time::sleep(self.backoff(attempts)).await;
+                        continue;
+                    }
                     return Err(UpstreamError::new(
                         kind,
                         Some(200),
                         ex,
+                        attempts,
+                        None,
                         parse_exception_message(&raw),
                     ));
                 }
@@ -192,7 +334,7 @@ impl Upstream for KiroClient {
                         self.tokens.invalidate().await;
                         refreshed = true;
                         tracing::info!(
-                            attempt,
+                            attempt = attempts,
                             "403 from runtime, credential invalidated, retrying"
                         );
                         continue;
@@ -201,26 +343,42 @@ impl Upstream for KiroClient {
                         UpstreamErrorKind::Auth,
                         Some(403),
                         None,
+                        attempts,
+                        None,
                         "runtime rejected the credential",
                     ));
                 }
                 status @ (429 | 500..=599) => {
+                    let delay = retry_after(&resp.headers, SystemTime::now());
                     let raw = resp.bytes_limited().await.unwrap_or_default();
                     let ex = parse_exception_type(&raw);
+                    let kind = classify_throttle(status, &raw);
+                    if let RetryDelay::Stop(delay) = delay {
+                        return Err(UpstreamError::new(
+                            kind,
+                            Some(status),
+                            ex,
+                            attempts,
+                            delay,
+                            parse_exception_message(&raw),
+                        ));
+                    }
                     if !last {
-                        tracing::warn!(attempt, status, "upstream error, retrying");
-                        tokio::time::sleep(self.backoff(attempt)).await;
+                        tracing::warn!(attempt = attempts, status, "upstream error, retrying");
+                        let delay = match delay {
+                            RetryDelay::Wait(delay) => delay,
+                            RetryDelay::Fallback => self.backoff(attempts),
+                            RetryDelay::Stop(_) => unreachable!(),
+                        };
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
-                    let kind = if status == 429 {
-                        UpstreamErrorKind::Throttled
-                    } else {
-                        UpstreamErrorKind::Server
-                    };
                     return Err(UpstreamError::new(
                         kind,
                         Some(status),
                         ex,
+                        attempts,
+                        None,
                         parse_exception_message(&raw),
                     ));
                 }
@@ -230,6 +388,8 @@ impl Upstream for KiroClient {
                         UpstreamErrorKind::Client,
                         Some(status),
                         parse_exception_type(&raw),
+                        attempts,
+                        None,
                         parse_exception_message(&raw),
                     ));
                 }

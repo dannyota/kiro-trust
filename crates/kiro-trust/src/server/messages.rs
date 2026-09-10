@@ -74,6 +74,9 @@ pub fn parse_request(body: &Bytes) -> Result<Request, ApiError> {
 
 fn failure_to_error(f: &Failure) -> ApiError {
     match &f.kind {
+        FailureKind::Exception { .. } if f.message.contains("INSUFFICIENT_MODEL_CAPACITY") => {
+            ApiError::rate_limit(format!("model capacity unavailable: {}", f.message))
+        }
         FailureKind::Exception { exception_type }
             if matches!(
                 exception_type.as_str(),
@@ -125,11 +128,9 @@ pub async fn post_messages(
     // starts (spec 5.5): a streaming response must count against the
     // concurrency cap for as long as the connection is open, not just
     // while the upstream call is being primed.
-    let permit = state
-        .limiter
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError::rate_limit("too many concurrent requests"))?;
+    let permit = state.limiter.clone().try_acquire_owned().map_err(|_| {
+        ApiError::rate_limit_after("too many concurrent requests", Duration::from_secs(1))
+    })?;
     let identity = state
         .tokens
         .identity()
@@ -172,16 +173,34 @@ pub async fn post_messages(
         "request"
     );
 
-    // `retry_count` is the invalid-state retry gate (spec 5.4: at most one,
-    // and only before output starts); `upstream_attempts` accumulates each
-    // `generate()` call's own retries (kiro-trust-kiro's 429/5xx backoff, up
-    // to `MAX_ATTEMPTS`), which would otherwise never reach a log line. Both
-    // together are what the `retry_count` log field reports.
-    let mut retry_count = 0u32;
-    let mut upstream_attempts = 0u32;
+    // Every completed post across both the ordinary retry loop and the one
+    // permitted invalid-state replay contributes to the one terminal retry
+    // count. `UpstreamError` carries its completed posts too, so an error
+    // returned before a stream is primed cannot discard already observed
+    // retries (spec 3.4, 6.4).
+    let mut completed_attempts = 0u32;
+    let mut replayed_invalid_state = false;
     loop {
-        let upstream = state.upstream.generate(&built.payload).await?;
-        upstream_attempts += upstream.attempts.saturating_sub(1);
+        let upstream = match state.upstream.generate(&built.payload).await {
+            Ok(upstream) => {
+                completed_attempts = completed_attempts.saturating_add(upstream.attempts);
+                upstream
+            }
+            Err(error) => {
+                completed_attempts = completed_attempts.saturating_add(error.attempts);
+                let retry_count = completed_attempts.saturating_sub(1);
+                let err: ApiError = error.into();
+                tracing::warn!(
+                    %request_id,
+                    status = err.status.as_u16(),
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    retry_count,
+                    error_type = "upstream_error",
+                    "request failed"
+                );
+                return Err(err);
+            }
+        };
         let mut pump = Pump::new(upstream.bytes, opts());
         // Snapshot this attempt's request/payload for capture (spec 8.3):
         // set once per loop iteration so a retried attempt captures the
@@ -200,12 +219,12 @@ pub async fn post_messages(
             });
         }
         match pump.prime(req.stream).await {
-            Primed::Failed(f) if retry_count == 0 && retryable(&f) => {
-                retry_count += 1;
+            Primed::Failed(f) if !replayed_invalid_state && retryable(&f) => {
+                replayed_invalid_state = true;
                 built.payload.conversation_state.conversation_id = None;
                 tracing::warn!(
                     %request_id,
-                    retry_count,
+                    retry_count = completed_attempts.saturating_sub(1),
                     error_type = "invalid_state",
                     "retrying without a conversation id"
                 );
@@ -217,7 +236,7 @@ pub async fn post_messages(
                     &request_id,
                     started,
                     err.status.as_u16(),
-                    retry_count + upstream_attempts,
+                    completed_attempts.saturating_sub(1),
                     &pump,
                     "upstream_failure",
                 );
@@ -229,14 +248,14 @@ pub async fn post_messages(
                     &request_id,
                     started,
                     err.status.as_u16(),
-                    retry_count + upstream_attempts,
+                    completed_attempts.saturating_sub(1),
                     &pump,
                     "upstream_broken",
                 );
                 return Err(err);
             }
             Primed::Ready(first) | Primed::Ended(first) => {
-                let retry_count = retry_count + upstream_attempts;
+                let retry_count = completed_attempts.saturating_sub(1);
                 if req.stream {
                     return Ok(stream_response(
                         request_id,

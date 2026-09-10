@@ -1,17 +1,19 @@
 //! The Anthropic error envelope (spec 5.6).
 
 use axum::extract::rejection::BytesRejection;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use kiro_trust_kiro::{UpstreamError, UpstreamErrorKind};
 use kiro_trust_protocol::sanitize::{self, MAX_MESSAGE_BYTES};
 use serde_json::json;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: StatusCode,
     pub kind: &'static str,
     pub message: String,
+    retry_after: Option<Duration>,
 }
 
 impl ApiError {
@@ -28,6 +30,7 @@ impl ApiError {
             status,
             kind,
             message,
+            retry_after: None,
         }
     }
     pub fn invalid_request(m: impl Into<String>) -> Self {
@@ -48,6 +51,15 @@ impl ApiError {
     }
     pub fn rate_limit(m: impl Into<String>) -> Self {
         Self::new(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", m)
+    }
+    pub fn rate_limit_after(m: impl Into<String>, retry_after: Duration) -> Self {
+        let mut error = Self::rate_limit(m);
+        error.retry_after = Some(retry_after);
+        error
+    }
+    fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
     }
     // The brief's interface (Task 17) fixes this method's name to
     // `api_error`, which is `ApiError` in snake_case: the lint's premise
@@ -81,13 +93,24 @@ impl From<UpstreamError> for ApiError {
             UpstreamErrorKind::Auth => {
                 Self::authentication(format!("Kiro credential rejected: {detail}"))
             }
-            UpstreamErrorKind::Throttled => {
-                Self::rate_limit(format!("upstream throttled: {detail}"))
+            UpstreamErrorKind::Throttled | UpstreamErrorKind::ModelCapacity => {
+                let message = match e.kind {
+                    UpstreamErrorKind::ModelCapacity => {
+                        format!("model capacity unavailable: {detail}")
+                    }
+                    _ => format!("upstream throttled: {detail}"),
+                };
+                match e.retry_after {
+                    Some(retry_after) => Self::rate_limit_after(message, retry_after),
+                    None => Self::rate_limit(message),
+                }
             }
             UpstreamErrorKind::Server
             | UpstreamErrorKind::Transport
             | UpstreamErrorKind::Protocol
-            | UpstreamErrorKind::Client => Self::api_error(format!("upstream error: {detail}")),
+            | UpstreamErrorKind::Client => {
+                Self::api_error(format!("upstream error: {detail}")).with_retry_after(e.retry_after)
+            }
         }
     }
 }
@@ -111,11 +134,20 @@ impl From<BytesRejection> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = self.body().to_string();
-        (
+        let mut response = (
             self.status,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             body,
         )
-            .into_response()
+            .into_response();
+        if let Some(retry_after) = self.retry_after {
+            let seconds = retry_after.as_secs().saturating_add(u64::from(
+                !retry_after.is_zero() && retry_after.subsec_nanos() > 0,
+            ));
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }

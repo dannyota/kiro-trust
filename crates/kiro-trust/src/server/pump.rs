@@ -100,7 +100,7 @@ impl Pump {
     }
 
     fn protocol(msg: String) -> UpstreamError {
-        UpstreamError::new(UpstreamErrorKind::Protocol, None, None, msg)
+        UpstreamError::new(UpstreamErrorKind::Protocol, None, None, 0, None, msg)
     }
 
     /// Important 3: same shape as an idle-read timeout (spec 5.6's "upstream
@@ -111,6 +111,8 @@ impl Pump {
         UpstreamError::new(
             UpstreamErrorKind::Transport,
             None,
+            None,
+            0,
             None,
             format!(
                 "no output within the {}s priming deadline",

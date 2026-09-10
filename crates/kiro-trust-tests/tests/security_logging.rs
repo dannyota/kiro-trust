@@ -6,11 +6,77 @@ mod common {
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use common::{TOKEN, app, body_string};
+use common::{TOKEN, app, body_string, test_db};
+use futures_util::StreamExt;
+use kiro_trust::server::{AppState, build_router};
+use kiro_trust_auth::TokenSource;
+use kiro_trust_kiro::{KiroClient, Upstream, UpstreamError, UpstreamErrorKind, UpstreamStream};
+use kiro_trust_net::{Client, Policy};
 use kiro_trust_protocol::eventstream::encode_event_frame;
+use kiro_trust_protocol::kiro::Payload;
+use secrecy::SecretString;
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tower::ServiceExt;
+
+struct FixedAttemptUpstream {
+    responses: Mutex<Vec<Result<Vec<u8>, UpstreamError>>>,
+}
+
+#[async_trait::async_trait]
+impl Upstream for FixedAttemptUpstream {
+    async fn generate(&self, _payload: &Payload) -> Result<UpstreamStream, UpstreamError> {
+        let bytes = self.responses.lock().unwrap().remove(0)?;
+        let chunks = bytes
+            .chunks(7)
+            .map(|chunk| Ok::<bytes::Bytes, UpstreamError>(bytes::Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        Ok(UpstreamStream {
+            attempts: 13,
+            bytes: futures_util::stream::iter(chunks).boxed(),
+        })
+    }
+}
+
+fn counted_app(
+    dir: &std::path::Path,
+    responses: Vec<Result<Vec<u8>, UpstreamError>>,
+) -> axum::Router {
+    let net = Arc::new(Client::new(Policy::loopback_plain_http(1)).unwrap());
+    let state = Arc::new(AppState {
+        tokens: Arc::new(TokenSource::new(test_db(dir), net, None)),
+        upstream: Arc::new(FixedAttemptUpstream {
+            responses: Mutex::new(responses),
+        }),
+        local_token: SecretString::from(TOKEN.to_string()),
+        limiter: Arc::new(tokio::sync::Semaphore::new(32)),
+        conversation_salt: [3; 16],
+    });
+    build_router(state)
+}
+
+fn messages_request(stream: bool) -> Request<Body> {
+    Request::post("/v1/messages")
+        .header("x-api-key", TOKEN)
+        .body(Body::from(
+            serde_json::json!({
+                "model": "claude-sonnet-4-6", "max_tokens": 10, "stream": stream,
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+fn event_frames(events: &[(&str, &str)]) -> Vec<u8> {
+    events
+        .iter()
+        .flat_map(|(kind, json)| encode_event_frame(kind, json.as_bytes()))
+        .collect()
+}
 
 /// spec 6.4's allowed-fields list, transcribed here so a field reaching a
 /// log line without a matching spec update fails `nothing_sensitive_reaches_the_logs`
@@ -134,6 +200,118 @@ fn capture() -> Capture {
         capture
     })
     .clone()
+}
+
+#[tokio::test]
+async fn successful_invalid_state_replay_logs_total_completed_retries() {
+    let capture = capture();
+    let start = capture.0.lock().unwrap().len();
+    let dir = tempfile::tempdir().unwrap();
+    let app = counted_app(
+        dir.path(),
+        vec![
+            Ok(event_frames(&[(
+                "invalidStateEvent",
+                r#"{"reason":"STALE_CONVERSATION","message":"stale"}"#,
+            )])),
+            Ok(event_frames(&[(
+                "assistantResponseEvent",
+                r#"{"content":"ok"}"#,
+            )])),
+        ],
+    );
+    let response = app.oneshot(messages_request(true)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = body_string(response).await;
+    let logs = String::from_utf8(capture.0.lock().unwrap()[start..].to_vec()).unwrap();
+    assert!(
+        logs.lines()
+            .any(|line| line.contains("response") && line.contains("retry_count=25")),
+        "successful replay must log both calls' completed attempts: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn failed_invalid_state_replay_logs_total_completed_retries() {
+    let capture = capture();
+    let start = capture.0.lock().unwrap().len();
+    let dir = tempfile::tempdir().unwrap();
+    let app = counted_app(
+        dir.path(),
+        vec![
+            Ok(event_frames(&[(
+                "invalidStateEvent",
+                r#"{"reason":"STALE_CONVERSATION","message":"first"}"#,
+            )])),
+            Err(UpstreamError::new(
+                UpstreamErrorKind::Server,
+                Some(503),
+                None,
+                17,
+                None,
+                "synthetic terminal error",
+            )),
+        ],
+    );
+    let response = app.oneshot(messages_request(false)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let _ = body_string(response).await;
+    let logs = String::from_utf8(capture.0.lock().unwrap()[start..].to_vec()).unwrap();
+    assert!(
+        logs.lines()
+            .any(|line| line.contains("request failed") && line.contains("retry_count=29")),
+        "failed replay must log the stream and terminal error attempts: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn decoded_capacity_retry_does_not_log_a_hostile_exception_type() {
+    const HOSTILE_TYPE: &str = "HOSTILE_EXCEPTION_TYPE";
+
+    let capture = capture();
+    let start = capture.0.lock().unwrap().len();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(
+        Client::new(Policy::loopback_plain_http(
+            listener.local_addr().unwrap().port(),
+        ))
+        .unwrap(),
+    );
+    let tokens = Arc::new(TokenSource::new(test_db(dir.path()), net.clone(), None));
+    let state = Arc::new(AppState {
+        tokens: tokens.clone(),
+        upstream: Arc::new(
+            KiroClient::new(net, tokens, false).with_base_delay(Duration::from_millis(1)),
+        ),
+        local_token: SecretString::from(TOKEN.to_string()),
+        limiter: Arc::new(tokio::sync::Semaphore::new(32)),
+        conversation_salt: [5; 16],
+    });
+    let body = format!(r#"{{"__type":"{HOSTILE_TYPE}","message":"INSUFFICIENT_MODEL_CAPACITY"}}"#);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let request = tokio::spawn(build_router(state).oneshot(messages_request(false)));
+    for _ in 0..3 {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        connection.write_all(response.as_bytes()).await.unwrap();
+    }
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let logs = String::from_utf8(capture.0.lock().unwrap()[start..].to_vec()).unwrap();
+    assert!(
+        !logs.contains(HOSTILE_TYPE),
+        "a decoded exception type must not reach the retry logs: {logs}"
+    );
+    assert!(
+        logs.lines().any(|line| {
+            line.contains("200 with an exception body, retrying")
+                && line.contains("error_type=\"model_capacity\"")
+        }),
+        "model-capacity retries must use the fixed error type: {logs}"
+    );
 }
 
 #[tokio::test]

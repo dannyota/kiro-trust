@@ -10,6 +10,8 @@ pub enum UpstreamErrorKind {
     Auth,
     /// 429, ThrottlingException, TooManyRequestsException.
     Throttled,
+    /// The exact `INSUFFICIENT_MODEL_CAPACITY` runtime marker.
+    ModelCapacity,
     /// 5xx, InternalServerException and friends.
     Server,
     /// Connection, TLS, timeout, redirect.
@@ -26,6 +28,10 @@ pub struct UpstreamError {
     pub kind: UpstreamErrorKind,
     pub status: Option<u16>,
     pub exception_type: Option<String>,
+    /// Completed `net.post()` calls observed by this `generate()` call.
+    pub attempts: u32,
+    /// A normalized delay the local server may return to its caller.
+    pub retry_after: Option<std::time::Duration>,
     /// Capped at 1 KiB; never carries request content.
     pub message: String,
 }
@@ -35,6 +41,8 @@ impl UpstreamError {
         kind: UpstreamErrorKind,
         status: Option<u16>,
         exception_type: Option<String>,
+        attempts: u32,
+        retry_after: Option<std::time::Duration>,
         message: impl Into<String>,
     ) -> Self {
         let message: String = message.into();
@@ -43,8 +51,23 @@ impl UpstreamError {
             kind,
             status,
             exception_type,
+            attempts,
+            retry_after,
             message,
         }
+    }
+}
+
+pub fn classify_throttle(status: u16, body: &[u8]) -> UpstreamErrorKind {
+    if body
+        .windows(b"INSUFFICIENT_MODEL_CAPACITY".len())
+        .any(|window| window == b"INSUFFICIENT_MODEL_CAPACITY")
+    {
+        UpstreamErrorKind::ModelCapacity
+    } else if status == 429 {
+        UpstreamErrorKind::Throttled
+    } else {
+        UpstreamErrorKind::Server
     }
 }
 
@@ -130,5 +153,29 @@ mod tests {
             "Application/VND.Amazon.EventStream; charset=utf-8"
         ));
         assert!(!is_event_stream_content_type("application/json"));
+    }
+
+    #[test]
+    fn only_exact_markers_refine_throttling() {
+        assert_eq!(
+            classify_throttle(429, br#"{"message":"x"}"#),
+            UpstreamErrorKind::Throttled
+        );
+        assert_eq!(
+            classify_throttle(429, b"INSUFFICIENT_MODEL_CAPACITY"),
+            UpstreamErrorKind::ModelCapacity
+        );
+        assert_eq!(
+            classify_throttle(500, b"INSUFFICIENT_MODEL_CAPACITY"),
+            UpstreamErrorKind::ModelCapacity
+        );
+        assert_eq!(
+            classify_throttle(429, b"quota limit"),
+            UpstreamErrorKind::Throttled
+        );
+        assert_eq!(
+            classify_throttle(500, b"quota limit"),
+            UpstreamErrorKind::Server
+        );
     }
 }

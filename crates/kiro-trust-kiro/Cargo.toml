@@ -25,6 +25,7 @@ uuid.workspace = true
 async-trait = "0.1.92"
 tokio = { workspace = true, features = ["time"] }
 rand = "0.10.2"
+httpdate = "1.0.3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

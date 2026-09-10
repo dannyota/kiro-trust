@@ -534,6 +534,8 @@ async fn upstream_errors_map_to_the_envelope() {
             kiro_trust_kiro::UpstreamErrorKind::Throttled,
             Some(429),
             Some("ThrottlingException".into()),
+            1,
+            None,
             "slow down",
         );
         let (app, _) = app(dir.path(), vec![Err(throttled)]);
@@ -545,6 +547,48 @@ async fn upstream_errors_map_to_the_envelope() {
             .unwrap();
         assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(body_string(r).await.contains("\"rate_limit_error\""));
+    }
+
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let throttled = UpstreamError::new(
+            kiro_trust_kiro::UpstreamErrorKind::Throttled,
+            Some(429),
+            Some("ThrottlingException".into()),
+            3,
+            Some(std::time::Duration::from_millis(60_001)),
+            "slow down",
+        );
+        let (app, _) = app(dir.path(), vec![Err(throttled)]);
+        let r = app
+            .oneshot(messages_req(
+                serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(r.headers().get("retry-after").unwrap(), "61");
+    }
+
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let unavailable = UpstreamError::new(
+            kiro_trust_kiro::UpstreamErrorKind::Server,
+            Some(503),
+            Some("ServiceUnavailableException".into()),
+            1,
+            Some(std::time::Duration::from_secs(61)),
+            "busy",
+        );
+        let (app, _) = app(dir.path(), vec![Err(unavailable)]);
+        let r = app
+            .oneshot(messages_req(
+                serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(r.headers().get("retry-after").unwrap(), "61");
     }
 
     // An exception frame before any output is an HTTP error; a throttling
@@ -588,6 +632,29 @@ async fn upstream_errors_map_to_the_envelope() {
         assert!(text.ends_with(
             "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"InternalServerException: boom\"}}\n\n"
         ));
+    }
+
+    // A capacity marker in an exception frame has the same category as the
+    // HTTP error body. Once text has reached the client, the stream does not
+    // replay; it terminates with the normalized SSE error.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = frames(&[("assistantResponseEvent", r#"{"content":"part"}"#)]);
+        body.extend(encode_exception_frame(
+            "InternalServerException",
+            br#"{"message":"INSUFFICIENT_MODEL_CAPACITY"}"#,
+        ));
+        let (app, _) = app(dir.path(), vec![Ok(body)]);
+        let r = app
+            .oneshot(messages_req(
+                serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10, "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let text = body_string(r).await;
+        assert!(text.contains("model capacity unavailable"));
+        assert!(text.contains("event: error"));
     }
 }
 
@@ -1044,6 +1111,7 @@ async fn streaming_permit_is_held_for_the_connection_and_released_on_drop() {
     // The one permit is still held by `first`: a second request is rejected.
     let second = app.clone().oneshot(stream_req()).await.unwrap();
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second.headers().get("retry-after").unwrap(), "1");
 
     // Dropping `first` drops its body's stream state, and with it the
     // permit. `tokio::sync::Semaphore`'s permit release runs synchronously

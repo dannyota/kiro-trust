@@ -339,21 +339,39 @@ per-frame size cap. Error bodies are read to at most 64 KiB.
 
 - `KiroRequest`: builds `POST https://runtime.<region>.kiro.dev/` with the
   headers in section 7.4 and the serialized `Payload`.
-- `Upstream` trait: `async fn generate(&self, token, payload, region) ->
-  Result<EventStreamBody, UpstreamError>`. The production implementation uses
-  `kiro-trust-net`; tests inject a scripted implementation.
-- Retry: up to three attempts. 429 and 5xx retry with exponential backoff
-  (1 s, 2 s) plus jitter. A 200 whose `Content-Type` is not
+- `Upstream` trait: `async fn generate(&self, payload: &Payload) ->
+  Result<UpstreamStream, UpstreamError>`. Its additive
+  `generate_with_progress(&self, payload: &Payload, progress:
+  &AttemptProgress)` default records the returned stream or error count once.
+  The production implementation uses `kiro-trust-net`; tests inject a
+  scripted implementation.
+- Retry: up to three completed `net.post()` calls. Retryable 429 and 5xx
+  responses honor a valid `Retry-After` of at most 60 seconds; invalid or past
+  values use exponential backoff (1 s, 2 s) plus jitter. A longer valid delay
+  stops retries and becomes a normalized local `Retry-After` response header.
+  An all-digit delay too large for `u64` stops retries without a local header.
+  The exact `INSUFFICIENT_MODEL_CAPACITY` marker on a retryable 429 or 5xx, or in a
+  decoded non-eventstream exception, is a transient model-capacity error. A
+  200 whose `Content-Type` is not
   `application/vnd.amazon.eventstream` is decoded as an AWS exception
-  envelope; `ThrottlingException` and `InternalServerException` retry, others
-  fail. A 403 calls `TokenSource::invalidate()` when an attempt remains, and
+  envelope; retryable exception types and every decoded model-capacity
+  exception retry, others fail. A 403 calls `TokenSource::invalidate()` when
+  an attempt remains, and
   retries once with whatever that forced cycle yields: a newer credential the
   Kiro CLI wrote, a freshly refreshed one, or, when this process minted the
   rejected credential itself, the same one again (section 3.3). A second 403,
   or a 403 on the last attempt, fails with an authentication error. Connection errors before any
-  byte is sent retry; errors after the stream started do not.
-- `UpstreamError { status, exception_type, message (≤ 1 KiB) }` maps to the
-  Anthropic error envelope in the server.
+  byte is sent retry; errors after the stream started do not. A completed post
+  includes a response or transport error, and increments only after the post
+  future returns. Credential and header failures before a post count zero.
+- `UpstreamError { attempts, retry_after, status, exception_type, message
+  (≤ 1 KiB) }` maps to the Anthropic error envelope in the server. Header
+  values never enter its display or debug output. `AttemptProgress` is a
+  cloneable saturating count of completed posts. The additive
+  `Upstream::generate_with_progress` default records a returned stream or
+  error count. `KiroClient` records each completed post immediately, before
+  response inspection or an await, so cancellation during a retry sleep or a
+  pending later post retains the completed count without double counting.
 
 ### 3.5 kiro-trust (binary)
 
@@ -793,16 +811,28 @@ Every failure uses `{"type":"error","error":{"type":"<t>","message":"<m>"}}`.
 | unknown route | 404 | `not_found_error` |
 | method not allowed | 405 | `invalid_request_error` |
 | Kiro credential unusable (no database, refresh failed) | 401 | `authentication_error` |
-| upstream 429 or `ThrottlingException` after retries | 429 | `rate_limit_error` |
+| upstream throttling or model capacity after retries | 429 | `rate_limit_error` |
 | upstream 5xx, malformed stream, idle timeout (including the priming deadline, section 5.5) | 502 | `api_error` |
 | upstream 400-class other than 403/429 | 502 | `api_error` |
-| local concurrency cap | 429 | `rate_limit_error` |
+| local concurrency cap | 429 with `Retry-After: 1` | `rate_limit_error` |
 
 The message carries the upstream exception type and message capped at 1 KiB.
 It never carries request content, the local token, or a Kiro token. ARNs and
 12-digit account ids are scrubbed from the message before it reaches a
 client or a log: any `arn:` run up to the next whitespace, quote, or end of
 string becomes `arn:***`, and any bare 12-digit run becomes `***`.
+
+For retryable HTTP errors, parse `Retry-After` as an integer delay or HTTP
+date. A valid delay over 60 seconds stops the retry loop and is emitted as the
+remaining delay rounded up to whole seconds. The proxy never forwards the raw
+upstream value. Invalid, negative, and past values use jitter. The exact
+`INSUFFICIENT_MODEL_CAPACITY` marker is transcribed from
+`aws/amazon-q-developer-cli` commit
+`15cc8f3cd18c4272925ce1c7053268eedff1ea0a`,
+`crates/chat-cli/src/api_client/mod.rs`, which checks it before its general
+429 classification. The legacy wording fallback and context-overflow branch
+are not transcribed. `MONTHLY_REQUEST_COUNT` remains transient throttling
+until a scrubbed fixture proves that marker.
 
 ### 5.7 `count_tokens`
 
@@ -938,10 +968,13 @@ or `security_logging.rs` (section 8.4).
   `model`, `kiro_model`, `stream`, `status`, `duration_ms`, `retry_count`,
   `attempt`, `input_bytes`, `output_bytes`, `input_tokens`, `output_tokens`,
   `runtime_region`, `sso_region`, `frames`, `event_counts`, `error_type`.
-  `attempt` is `kiro-trust-kiro`'s per-call retry counter (the natural
-  sibling of `retry_count`, which is the higher-level invalid-state retry
-  gate); `crates/kiro-trust-tests/tests/security_logging.rs` asserts every
-  `field=` name on a captured log line is in this list.
+  `attempt` is `kiro-trust-kiro`'s per-call completed-post count.
+  `retry_count` is completed posts across the request, including the permitted
+  invalid-state replay, minus one and saturated at zero. Task 5's usage guard
+  will read the same `AttemptProgress` value at completion, failure, and
+  cancellation.
+  `crates/kiro-trust-tests/tests/security_logging.rs` asserts every `field=`
+  name on a captured log line is in this list.
 - Never logged: any header value, request or response body, prompt, tool
   name, tool argument, tool result, thinking text, conversation id, profile
   ARN, account id, token, client secret, refresh token, database path

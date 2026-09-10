@@ -63,6 +63,9 @@ transcribed from it and carry that license and attribution:
   crates/chat-cli/src/api_client/model.rs)
 - per-image and per-request image limits
   (crates/chat-cli/src/cli/chat/consts.rs, crates/agent/src/agent/consts.rs)
+- model-capacity classification from the exact
+  `INSUFFICIENT_MODEL_CAPACITY` marker
+  (crates/chat-cli/src/api_client/mod.rs)
 
 Everything else is an independent implementation.
 
