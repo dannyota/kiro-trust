@@ -28,7 +28,12 @@ pub const TEST_ENDPOINTS_COMPILED: bool = cfg!(feature = "test-endpoints");
 #[cfg(test)]
 mod notice_sync {
     #[test]
-    fn crate_notice_names_its_transcribed_operation() {
-        assert!(include_str!("../NOTICE").contains("ListAvailableModels"));
+    fn crate_notice_matches_workspace_notice() {
+        assert_eq!(
+            &include_bytes!("../NOTICE")[..],
+            &include_bytes!("../../../NOTICE")[..],
+            "crates/kiro-trust-net/NOTICE has drifted from the workspace-root \
+             NOTICE; keep them byte-identical"
+        );
     }
 }

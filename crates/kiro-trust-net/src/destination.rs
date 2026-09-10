@@ -1,5 +1,5 @@
-//! The only two hosts kiro-trust talks to (spec 6.2). No URL type exists
-//! in this crate's public API.
+//! The three fixed destination classes kiro-trust talks to (spec 6.2): OIDC,
+//! runtime, and model-catalog. No URL type exists in this crate's public API.
 
 use crate::region::{DiscoveryRegion, Region, RuntimeRegion};
 use std::fmt;

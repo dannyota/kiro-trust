@@ -84,8 +84,11 @@ spec for every flag and environment variable.
 
 - The Kiro CLI credential database is opened read-only, and only the
   Identity Center rows are read.
-- Outbound traffic goes to `oidc.<region>.amazonaws.com` and
-  `runtime.<region>.kiro.dev` only. Redirects fail. Proxy environment
+- The serve path sends outbound traffic only to
+  `oidc.<region>.amazonaws.com` and `runtime.<region>.kiro.dev`. The explicit
+  foreground `models discover` command additionally sends its fixed
+  credential-bearing request only to verified
+  `q.<region>.amazonaws.com` catalog hosts. Redirects fail. Proxy environment
   variables are ignored.
 - The listener binds to loopback only, and every request needs the local
   token.

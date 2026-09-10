@@ -1082,6 +1082,31 @@ safe-model\tnot_listed\tunknown\tnull\tnull\tnull\n"
 }
 
 #[tokio::test]
+async fn discovery_renderers_show_supported_and_not_listed_catalog_statuses() {
+    let report = discover_with_page(serde_json::json!({
+        "models": [
+            {"modelId": "claude-sonnet-4.6"},
+            {"modelId": "unlisted-model"}
+        ],
+        "defaultModel": {"modelId": "claude-sonnet-4.6"}
+    }))
+    .await
+    .unwrap();
+    let json = serde_json::to_string(&report).unwrap();
+    let text = kiro_trust::models_cmd::render_discovery(&report);
+    assert_eq!(
+        json,
+        r#"{"object":"discovered_models","region":"us-east-1","default_model":"claude-sonnet-4.6","models":[{"id":"claude-sonnet-4.6","available":true,"catalog_status":"supported","input_types":[],"max_input_tokens":null,"max_output_tokens":null,"supports_prompt_cache":null,"rate_multiplier":null},{"id":"unlisted-model","available":true,"catalog_status":"not_listed","input_types":[],"max_input_tokens":null,"max_output_tokens":null,"supports_prompt_cache":null,"rate_multiplier":null}]}"#
+    );
+    assert_eq!(
+        text,
+        "AVAILABLE ID\tCATALOG STATUS\tINPUTS\tINPUT LIMIT\tOUTPUT LIMIT\tPROMPT CACHE\n\
+claude-sonnet-4.6\tsupported\t\tnull\tnull\tnull\n\
+unlisted-model\tnot_listed\t\tnull\tnull\tnull\n"
+    );
+}
+
+#[tokio::test]
 async fn discovery_fixed_operation_rejects_wrong_destination_and_redirect() {
     let server = MockServer::start().await;
     let evil = MockServer::start().await;

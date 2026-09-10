@@ -38,10 +38,9 @@ check_package() {
 }
 
 # NOTICE is required on crates that transcribe upstream protocol behavior.
-# (final-fix-2.md Important 1; see each crate's own NOTICE header and the
-# crate_notice_matches_workspace_notice test): kiro-trust-net and
-# kiro-trust-auth carry none, so they get README.md only, like every other
-# published crate.
+# The protocol, net, kiro-trust, and kiro-trust-kiro crates each carry a
+# byte-identical copy and enforce it with the crate_notice_matches_workspace_notice
+# test. kiro-trust-auth carries no transcribed implementation and no NOTICE copy.
 check_package kiro-trust-protocol src/lib.rs NOTICE
 check_package kiro-trust-net src/lib.rs NOTICE
 check_package kiro-trust-auth src/lib.rs
