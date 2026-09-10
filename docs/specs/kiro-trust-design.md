@@ -410,8 +410,9 @@ database, read a token, contact a listener, or create a network client.
 Text `list` output has `ID`, `KIRO MODEL`, `CONTEXT`, `INPUTS`, and `EFFORT`
 columns. JSON is `{"object":"model_catalog","models":[ModelInfo...]}` in
 catalog order. Text `show` prints each `ModelInfo` field in a stable order.
-JSON is the selected `ModelInfo`. An unknown id exits 1 and prints the existing
-unknown-model message without echoing anything else.
+JSON is the selected `ModelInfo`. An unknown id exits 1 and writes exactly
+`kiro-trust: unknown model; run 'kiro-trust models list' for supported models`
+to stderr. The error never includes caller input.
 
 ### 4.3 `kiro-trust env [--shell sh|fish]`
 

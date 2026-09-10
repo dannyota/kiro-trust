@@ -57,3 +57,26 @@ fn model_commands_are_offline_and_reject_unknown_ids() {
     assert_eq!(bad.status.code(), Some(1));
     assert!(bad.stdout.is_empty());
 }
+
+#[test]
+fn unknown_model_errors_never_echo_control_characters_or_long_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let inputs = ["not-a-model\n\x1b[2J".to_string(), "x".repeat(16_384)];
+
+    for json in [false, true] {
+        for input in &inputs {
+            let mut child = command(directory.path());
+            child.args(["models", "show", input]);
+            if json {
+                child.arg("--json");
+            }
+            let output = child.output().unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                "kiro-trust: unknown model; run 'kiro-trust models list' for supported models\n"
+            );
+        }
+    }
+}

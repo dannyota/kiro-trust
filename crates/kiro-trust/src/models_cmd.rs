@@ -23,8 +23,10 @@ pub fn run(args: ModelsArgs) -> i32 {
                 }
                 0
             }
-            Err(error) => {
-                eprintln!("kiro-trust: {error}");
+            Err(_) => {
+                eprintln!(
+                    "kiro-trust: unknown model; run 'kiro-trust models list' for supported models"
+                );
                 1
             }
         },
