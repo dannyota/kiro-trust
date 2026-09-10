@@ -120,8 +120,9 @@ contact a listener, or create a network client.
 Text `list` output has `ID`, `KIRO MODEL`, `CONTEXT`, `INPUTS`, and `EFFORT`
 columns. JSON is `{"object":"model_catalog","models":[ModelInfo...]}` in
 catalog order. Text `show` prints each `ModelInfo` field in a stable order.
-JSON is the selected `ModelInfo`. An unknown id exits 1 and prints the existing
-unknown-model message without echoing anything else.
+JSON is the selected `ModelInfo`. An unknown id exits 1 and prints the fixed
+error `kiro-trust: unknown model; run 'kiro-trust models list' for supported
+models`. The error never echoes the caller's input.
 
 ### 3.3 Manual discovery
 
@@ -144,6 +145,10 @@ at commit `15cc8f3cd18c4272925ce1c7053268eedff1ea0a` verifies this wire shape:
 - `crates/chat-cli/src/api_client/mod.rs` selects the endpoint from the
   profile region, configures bearer authentication, sets origin `CLI` and
   profile ARN, and paginates.
+- `crates/chat-cli/src/auth/builder_id.rs` loads the credential before API
+  use, refreshes an expired access token through `CreateToken`, and saves the
+  returned credential. Kirocc v0.11.1 `internal/auth/refresh.go` also refreshes
+  an expired credential before API use and caches the result in memory.
 - `crates/amzn-codewhisperer-client/src/operation/list_available_models.rs`
   sends `POST /` with the same input fields in the query and JSON body,
   `Content-Type: application/x-amz-json-1.0`, and
@@ -174,11 +179,13 @@ the header value, and marks it sensitive. The wrapper has no `Debug`,
 The compiled enabled-region subset contains only regions whose live gate has
 passed; other recognized regions fail before transport with `region_unverified`.
 The database reader parses and retains the profile ARN region as a typed,
-non-secret `Identity.profile_region: Region`; the accessor never exposes the
-ARN. Discovery selects this profile region, not the token region, runtime
+non-secret `Identity.profile_region: Option<Region>`. The existing identity
+keeps the profile ARN for request construction only. Discovery rejects a
+missing profile region without changing ordinary runtime credential parsing.
+Discovery selects this profile region, not the token region, runtime
 fallback, or a command-line override. It does not
 copy the upstream CLI's fallback to US East when selection fails. A government
-region or any future unverified region exits 1 before a request and names the
+region or any future unverified region exits 1 before a catalog request and names the
 two supported discovery regions.
 
 The generated source verifies the request shape, but source inspection cannot
@@ -192,26 +199,32 @@ are verified. No host is guessed.
 
 ### 3.4 Discovery credential safety
 
-A discovery command is a second, short-lived process. It must not refresh from
-the database while a running `serve` process may hold a newer in-memory refresh
-chain. Doing so could replay the database's already-exchanged refresh token and
-invalidate the running process.
+Discovery creates one ordinary `Arc<TokenSource>` with
+`TokenSource::new(db_path, net.clone(), None)` and shares it across identity
+lookup and every catalog page. The existing five-minute validity buffer
+triggers OIDC refresh when needed. All pages use the same in-memory token
+chain. An expired access token alone does not require a new Kiro CLI login.
 
-`TokenSource::from_database_without_refresh(db_path, net, runtime_override)` reads a
-currently valid database access token and exposes it only through the existing
-`TokenSource::with_token` closure. In this mode:
+Catalog responses do not trigger refresh. Discovery never calls `invalidate()`
+or retries authentication after a catalog response. A catalog 401 maps to
+`DiscoveryError::Authentication`; a catalog 403 maps to
+`DiscoveryError::AccessDenied`. Token-source and OIDC errors map to the fixed
+`Authentication` error without exposing their remote text.
 
-- a token at or before the five-minute validity buffer produces
-  `AuthError::RefreshDisabled` and tells the operator to log in through Kiro
-  CLI;
-- no OIDC client call occurs;
-- a 403 from the model-catalog endpoint returns a fixed access-denied error;
-- discovery never calls `invalidate()` or retries authentication.
+The 30-second operation deadline starts before the first `TokenSource` call
+and includes identity lookup, OIDC refresh, and every page. The OIDC exchange
+retains its own inner cap. The existing cancellation guard records a spent
+refresh seed when a 200 OIDC status arrived before cancellation. No new auth
+mode or production `expose_secret()` site is added. The database stays read-only.
 
-The constructor accepts the existing `Arc<kiro_trust_net::Client>` for test
-transport injection, but the refresh-disabled mode never uses it for OIDC.
-The ordinary `TokenSource::new` refresh behavior remains unchanged. This adds
-no production `expose_secret()` site.
+Each standalone discovery command owns a separate in-memory chain. Commit
+`66d9dd3` prevents replay within one `TokenSource`; it does not coordinate
+different processes or survive a restart. If Identity Center rotates refresh
+tokens and detects reuse, discovery can replay a database token another process
+already exchanged, or exit while the database still holds an older token.
+AWS's rotation behavior remains unknown. Main spec section 12 already accepts
+this risk for independent processes and restarts; discovery increases how often
+those processes start. No credential broker or database writer is added.
 
 ### 3.5 Discovery bounds and output
 
@@ -613,7 +626,8 @@ Three evidence gates remain:
 
 1. `models discover` needs one successful, structure-only live call for each
    region enabled in the release. Access denied leaves that region gated. An
-   offline injected transport test proves the path makes no OIDC `/token` call.
+   offline injected transport test proves expiry refresh occurs once across
+   two pages and catalog 401/403 responses never trigger another refresh.
 2. `allowance_exhausted` needs a scrubbed fixture containing the exact
    `MONTHLY_REQUEST_COUNT` marker. A generic 429 fixture proves only transient
    throttling.
