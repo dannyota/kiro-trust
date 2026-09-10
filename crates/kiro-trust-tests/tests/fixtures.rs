@@ -47,7 +47,8 @@ fn run_case(case: &Path) {
             conversation_id: Some(FIXTURE_CONVERSATION_ID.into()),
             effort,
         },
-    );
+    )
+    .unwrap();
     let payload = serde_json::to_string_pretty(&built.payload).unwrap() + "\n";
     check(&case.join("expected-payload.json"), &payload);
 

@@ -3,7 +3,7 @@
 //! from history; redacted-blob replay is a GPT-only path and is not ported.
 
 use super::content::{
-    extract_text, extract_tool_results, extract_tool_use_ids, extract_tool_uses,
+    ImageError, extract_text, extract_tool_results, extract_tool_use_ids, extract_tool_uses,
     reorder_tool_results,
 };
 use super::tool_names::ToolNameMap;
@@ -20,12 +20,21 @@ fn v5(seed: &str) -> String {
     Uuid::new_v5(&Uuid::NAMESPACE_URL, seed.as_bytes()).to_string()
 }
 
-pub fn build_history(msgs: &[Message], names: &mut ToolNameMap) -> Vec<HistoryEntry> {
+/// `counter` is the request-scoped image count shared with the current
+/// message (spec 0.2.0 design section 3): history's tool-result promotion
+/// validates and counts images exactly like the current message's, even
+/// though the `history_image_is_accepted` gate (spec 5.3 step 6) is
+/// currently FAIL and every `HistoryUserInputMessage.images` stays empty.
+pub fn build_history(
+    msgs: &[Message],
+    names: &mut ToolNameMap,
+    counter: &mut usize,
+) -> Result<Vec<HistoryEntry>, ImageError> {
     let mut history = Vec::with_capacity(msgs.len());
     for (i, m) in msgs.iter().enumerate() {
         match m.role {
             Role::User | Role::Other => {
-                let mut results = extract_tool_results(&m.content);
+                let (mut results, _images) = extract_tool_results(&m.content, counter)?;
                 if results.len() > 1 && i > 0 && msgs[i - 1].role == Role::Assistant {
                     results =
                         reorder_tool_results(results, &extract_tool_use_ids(&msgs[i - 1].content));
@@ -39,9 +48,12 @@ pub fn build_history(msgs: &[Message], names: &mut ToolNameMap) -> Vec<HistoryEn
                     model_id: None,
                     origin: Some(ORIGIN_KIRO_CLI),
                     user_input_message_context: context,
-                    // Populated by the image-translation slice once the
-                    // `history_image_is_accepted` live gate (spec 5.3 step 6)
-                    // has passed; empty until then.
+                    // FAIL branch of the `history_image_is_accepted` live
+                    // gate (spec 5.3 step 6): `_images` above is validated
+                    // and counted against the shared limit, matching the
+                    // current message, but discarded rather than attached.
+                    // Populate this field instead, from `_images`, once a
+                    // passing gate authorizes it.
                     images: vec![],
                     cache_point: None,
                 }));
@@ -68,7 +80,7 @@ pub fn build_history(msgs: &[Message], names: &mut ToolNameMap) -> Vec<HistoryEn
             }
         }
     }
-    history
+    Ok(history)
 }
 
 /// The system prompt travels as a leading user/assistant pair in history.

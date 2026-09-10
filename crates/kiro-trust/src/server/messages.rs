@@ -146,7 +146,12 @@ pub async fn post_messages(
             conversation_id: Some(conversation_id(&state.conversation_salt, session)),
             effort,
         },
-    );
+    )
+    // Raised before `state.upstream.generate` is ever called (below), so a
+    // rejected image never reaches the network (spec 5.3, 5.5). The
+    // message names the specific limit or media type; it never carries
+    // image data (spec 6.4).
+    .map_err(|e| ApiError::invalid_request(e.to_string()))?;
     let tool_names = built.tool_names.reverse_map();
     let opts = || ResponseOptions {
         model: resolved.anthropic_model.clone(),

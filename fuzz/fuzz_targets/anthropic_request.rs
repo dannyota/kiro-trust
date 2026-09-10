@@ -9,7 +9,13 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let _ = count_tokens(&req);
-    let built = build_payload(
+    // `build_payload` is fallible since 0.2.0: an image with an unsupported
+    // media type, undecodable base64, an oversized decoded body, or too many
+    // images per request is a rejection, not a panic (spec 5.3, 5.5). A
+    // rejection is a valid outcome for arbitrary input, so the fuzzer treats
+    // it as uninteresting and returns; what it still asserts is that an
+    // accepted payload always serializes.
+    let Ok(built) = build_payload(
         &req,
         &BuildOptions {
             profile_arn: Some("arn:test".into()),
@@ -17,6 +23,8 @@ fuzz_target!(|data: &[u8]| {
             conversation_id: None,
             effort: None,
         },
-    );
+    ) else {
+        return;
+    };
     serde_json::to_vec(&built.payload).expect("payload serializes");
 });
