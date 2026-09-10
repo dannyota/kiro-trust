@@ -2,7 +2,7 @@
 
 All notable changes to kiro-trust. Dates are UTC.
 
-## 0.2.0 - unreleased
+## 0.2.0 - 2026-09-10
 
 - `kiro-trust exec -- <cmd> [args...]` runs a command with
   `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` in its environment and
