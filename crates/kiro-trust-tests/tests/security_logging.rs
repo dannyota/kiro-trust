@@ -53,6 +53,7 @@ fn counted_app(
         }),
         local_token: SecretString::from(TOKEN.to_string()),
         limiter: Arc::new(tokio::sync::Semaphore::new(32)),
+        usage: Arc::new(kiro_trust::server::usage::UsageSummary::new()),
         conversation_salt: [3; 16],
     });
     build_router(state)
@@ -286,6 +287,7 @@ async fn decoded_capacity_retry_does_not_log_a_hostile_exception_type() {
         ),
         local_token: SecretString::from(TOKEN.to_string()),
         limiter: Arc::new(tokio::sync::Semaphore::new(32)),
+        usage: Arc::new(kiro_trust::server::usage::UsageSummary::new()),
         conversation_salt: [5; 16],
     });
     let body = format!(r#"{{"__type":"{HOSTILE_TYPE}","message":"INSUFFICIENT_MODEL_CAPACITY"}}"#);

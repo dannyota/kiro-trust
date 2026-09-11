@@ -4,12 +4,15 @@ use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use kiro_trust::server::{AppState, build_router};
 use kiro_trust_auth::TokenSource;
-use kiro_trust_kiro::{Upstream, UpstreamError, UpstreamStream};
+use kiro_trust_kiro::{Upstream, UpstreamError, UpstreamErrorKind, UpstreamStream};
 use kiro_trust_net::{Client, Policy};
 use kiro_trust_protocol::kiro::Payload;
+use kiro_trust_protocol::translate::response::{ReportedTokens, UsageSnapshot};
 use rusqlite::Connection;
 use secrecy::SecretString;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::Notify;
 use tower::ServiceExt;
 
 pub const TOKEN: &str = "test-local-token";
@@ -46,6 +49,68 @@ impl Upstream for Scripted {
     }
 }
 
+struct PendingProgress {
+    completed: u32,
+    entered: Arc<Notify>,
+}
+
+struct PrimingPending {
+    bytes: Vec<u8>,
+    entered: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl Upstream for PrimingPending {
+    async fn generate(&self, _payload: &Payload) -> Result<UpstreamStream, UpstreamError> {
+        let bytes = bytes::Bytes::copy_from_slice(&self.bytes);
+        let entered = self.entered.clone();
+        Ok(UpstreamStream {
+            attempts: 1,
+            bytes: futures_util::stream::once(async move {
+                entered.notify_one();
+                Ok::<_, UpstreamError>(bytes)
+            })
+            .chain(futures_util::stream::pending())
+            .boxed(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Upstream for PendingProgress {
+    async fn generate(&self, _payload: &Payload) -> Result<UpstreamStream, UpstreamError> {
+        unreachable!("the usage path calls generate_with_progress")
+    }
+
+    async fn generate_with_progress(
+        &self,
+        _payload: &Payload,
+        progress: &kiro_trust_kiro::AttemptProgress,
+    ) -> Result<UpstreamStream, UpstreamError> {
+        progress.record_completed(self.completed);
+        self.entered.notify_one();
+        futures_util::future::pending().await
+    }
+}
+
+fn app_with_upstream(
+    dir: &std::path::Path,
+    upstream: Arc<dyn Upstream>,
+    limiter: Arc<tokio::sync::Semaphore>,
+) -> (axum::Router, Arc<kiro_trust::server::usage::UsageSummary>) {
+    let net = Arc::new(Client::new(Policy::loopback_plain_http(1)).unwrap());
+    let usage = Arc::new(kiro_trust::server::usage::UsageSummary::new());
+    let state = Arc::new(AppState {
+        tokens: Arc::new(TokenSource::new(test_db(dir), net, None)),
+        upstream,
+        local_token: SecretString::from(TOKEN.to_string()),
+        limiter,
+        usage: usage.clone(),
+        conversation_salt: [6; 16],
+    });
+    (build_router(state), usage)
+}
+
 pub fn test_db(dir: &std::path::Path) -> std::path::PathBuf {
     let p = dir.join("data.sqlite3");
     let c = Connection::open(&p).unwrap();
@@ -80,6 +145,7 @@ pub fn app_with_chunk_size(
         upstream: scripted.clone(),
         local_token: SecretString::from(TOKEN.to_string()),
         limiter: Arc::new(tokio::sync::Semaphore::new(32)),
+        usage: Arc::new(kiro_trust::server::usage::UsageSummary::new()),
         conversation_salt: [7u8; 16],
     });
     (build_router(state), scripted)
@@ -169,6 +235,747 @@ async fn health_needs_no_token_but_everything_else_does() {
 }
 
 #[tokio::test]
+async fn usage_starts_empty_and_requires_the_local_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(dir.path(), vec![]);
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(Request::get("/v1/usage").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .oneshot(
+            Request::get("/v1/usage")
+                .header("x-api-key", TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let report: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(report["object"], "usage_summary");
+    assert_eq!(report["requests"]["started"], 0);
+    assert_eq!(report["requests"]["in_flight"], 0);
+    assert_eq!(report["models"], serde_json::json!([]));
+}
+
+async fn usage_report(app: axum::Router) -> serde_json::Value {
+    let response = app
+        .oneshot(
+            Request::get("/v1/usage")
+                .header("x-api-key", TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_str(&body_string(response).await).unwrap()
+}
+
+#[tokio::test]
+async fn usage_counts_a_completed_non_streaming_request_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(
+        dir.path(),
+        vec![Ok(frames(&[
+            ("assistantResponseEvent", r#"{"content":"done"}"#),
+            (
+                "metadataEvent",
+                r#"{"tokenUsage":{"uncachedInputTokens":10,"outputTokens":1,"totalTokens":11,"cacheReadInputTokens":0,"cacheWriteInputTokens":0}}"#,
+            ),
+        ]))],
+    );
+    let response = app
+        .clone()
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let report = usage_report(app).await;
+    assert_eq!(report["requests"]["started"], 1);
+    assert_eq!(report["requests"]["completed"], 1);
+    assert_eq!(report["requests"]["failed"], 0);
+    assert_eq!(report["requests"]["cancelled"], 0);
+    assert_eq!(report["requests"]["in_flight"], 0);
+    assert_eq!(report["tokens"]["reported"]["input"], 10);
+    assert_eq!(report["tokens"]["estimated"]["input"], 0);
+    assert_eq!(report["models"].as_array().unwrap().len(), 1);
+    assert_eq!(report["models"][0]["id"], "claude-sonnet-4-6");
+}
+
+#[tokio::test]
+async fn usage_preserves_metadata_for_priming_and_midstream_failures() {
+    let metadata = r#"{"tokenUsage":{"uncachedInputTokens":6,"outputTokens":1,"totalTokens":7,"cacheReadInputTokens":0,"cacheWriteInputTokens":0}}"#;
+    for (streaming, events) in [
+        (false, vec![("metadataEvent", metadata)]),
+        (
+            true,
+            vec![
+                ("assistantResponseEvent", r#"{"content":"partial"}"#),
+                ("metadataEvent", metadata),
+            ],
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut response_bytes = frames(&events);
+        response_bytes.extend(encode_exception_frame(
+            "InternalServerException",
+            br#"{"message":"failed"}"#,
+        ));
+        let (app, _) = app(dir.path(), vec![Ok(response_bytes)]);
+        let response = app
+            .clone()
+            .oneshot(messages_req(serde_json::json!({
+                "model": "claude-sonnet-4-6", "max_tokens": 10, "stream": streaming,
+                "messages": [{"role": "user", "content": "hi"}]
+            })))
+            .await
+            .unwrap();
+        if streaming {
+            let _ = body_string(response).await;
+        } else {
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        }
+        let report = usage_report(app).await;
+        assert_eq!(report["requests"]["failed"], 1);
+        assert_eq!(report["requests"]["cancelled"], 0);
+        assert_eq!(report["tokens"]["reported"]["input"], 6);
+    }
+}
+
+#[tokio::test]
+async fn usage_replay_uses_final_attempt_tokens_and_cumulative_retries() {
+    let invalid = frames(&[
+        (
+            "metadataEvent",
+            r#"{"tokenUsage":{"uncachedInputTokens":77,"outputTokens":3,"totalTokens":80,"cacheReadInputTokens":8,"cacheWriteInputTokens":9}}"#,
+        ),
+        (
+            "invalidStateEvent",
+            r#"{"reason":"STALE_CONVERSATION","message":"stale"}"#,
+        ),
+    ]);
+    let final_attempt = frames(&[
+        ("assistantResponseEvent", r#"{"content":"done"}"#),
+        (
+            "metadataEvent",
+            r#"{"tokenUsage":{"uncachedInputTokens":9,"outputTokens":1,"totalTokens":10,"cacheReadInputTokens":0,"cacheWriteInputTokens":0}}"#,
+        ),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let (first_app, _) = app(dir.path(), vec![Ok(invalid), Ok(final_attempt)]);
+    let response = first_app
+        .clone()
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let report = usage_report(first_app).await;
+    assert_eq!(report["requests"]["completed"], 1);
+    assert_eq!(report["retries"], 1);
+    assert_eq!(report["tokens"]["reported"]["input"], 9);
+    assert_eq!(report["tokens"]["reported"]["cache_read"], 0);
+    assert_eq!(report["tokens"]["reported"]["cache_write"], 0);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(
+        dir.path(),
+        vec![
+            Ok(frames(&[
+                (
+                    "metadataEvent",
+                    r#"{"tokenUsage":{"uncachedInputTokens":77,"outputTokens":3,"totalTokens":80,"cacheReadInputTokens":8,"cacheWriteInputTokens":9}}"#,
+                ),
+                (
+                    "invalidStateEvent",
+                    r#"{"reason":"STALE_CONVERSATION","message":"stale"}"#,
+                ),
+            ])),
+            Err(UpstreamError::new(
+                UpstreamErrorKind::Transport,
+                None,
+                None,
+                1,
+                None,
+                "final failure",
+            )),
+        ],
+    );
+    let response = app
+        .clone()
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let report = usage_report(app).await;
+    assert_eq!(report["requests"]["failed"], 1);
+    assert_eq!(report["retries"], 1);
+    assert_eq!(report["tokens"]["reported"]["input"], 0);
+    assert_eq!(report["tokens"]["reported"]["output"], 0);
+    assert_eq!(report["tokens"]["reported"]["cache_read"], 0);
+    assert_eq!(report["tokens"]["reported"]["cache_write"], 0);
+    assert_eq!(report["tokens"]["estimated"]["input"], 0);
+    assert_eq!(report["tokens"]["estimated"]["output"], 0);
+}
+
+#[tokio::test]
+async fn usage_maps_an_upstream_transport_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(
+        dir.path(),
+        vec![Err(UpstreamError::new(
+            UpstreamErrorKind::Transport,
+            None,
+            None,
+            2,
+            None,
+            "synthetic transport failure",
+        ))],
+    );
+    let response = app
+        .clone()
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let report = usage_report(app).await;
+    assert_eq!(report["requests"]["failed"], 1);
+    assert_eq!(report["requests"]["in_flight"], 0);
+    assert_eq!(report["retries"], 1);
+    assert_eq!(
+        report["errors"],
+        serde_json::json!([{"kind":"transport","count":1}])
+    );
+}
+
+#[tokio::test]
+async fn usage_route_prioritizes_capacity_over_throttling_exception_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = frames(&[("assistantResponseEvent", r#"{"content":"partial"}"#)]);
+    bytes.extend(encode_exception_frame(
+        "ThrottlingException",
+        br#"{"message":"INSUFFICIENT_MODEL_CAPACITY"}"#,
+    ));
+    let (app, _) = app(dir.path(), vec![Ok(bytes)]);
+    let response = app
+        .clone()
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let report = usage_report(app).await;
+    assert_eq!(
+        report["errors"],
+        serde_json::json!([{"kind":"model_capacity","count":1}])
+    );
+}
+
+#[tokio::test]
+async fn usage_counts_identity_and_concurrency_failures_but_excludes_auth_and_unknown_models() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.sqlite3");
+    let net = Arc::new(Client::new(Policy::loopback_plain_http(1)).unwrap());
+    let usage = Arc::new(kiro_trust::server::usage::UsageSummary::new());
+    let state = Arc::new(AppState {
+        tokens: Arc::new(TokenSource::new(missing, net, None)),
+        upstream: Arc::new(Scripted {
+            responses: Mutex::new(vec![]),
+            payloads: Mutex::new(vec![]),
+            chunk_size: 7,
+        }),
+        local_token: SecretString::from(TOKEN.to_string()),
+        limiter: Arc::new(tokio::sync::Semaphore::new(1)),
+        usage: usage.clone(),
+        conversation_salt: [2; 16],
+    });
+    let app = build_router(state);
+    let identity = app
+        .clone()
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(identity.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        usage.snapshot().totals.errors[0].kind,
+        kiro_trust::server::usage::UsageErrorKind::Authentication
+    );
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/messages")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let unknown = app
+        .clone()
+        .oneshot(messages_req(serde_json::json!({
+            "model": "unknown", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(usage.snapshot().totals.requests.started, 1);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (app, usage) = app_with_upstream(
+        dir.path(),
+        Arc::new(Scripted {
+            responses: Mutex::new(vec![]),
+            payloads: Mutex::new(vec![]),
+            chunk_size: 7,
+        }),
+        Arc::new(tokio::sync::Semaphore::new(0)),
+    );
+    let response = app
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let report = usage.snapshot();
+    assert_eq!(report.totals.requests.failed, 1);
+    assert_eq!(
+        report.totals.errors[0].kind,
+        kiro_trust::server::usage::UsageErrorKind::LocalConcurrency
+    );
+}
+
+#[tokio::test]
+async fn usage_counts_an_invalid_image_as_a_local_failure_without_upstream_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, scripted) = app(dir.path(), vec![]);
+    let response = app
+        .clone()
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "%%%"
+                }}
+            ]}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(scripted.payloads.lock().unwrap().is_empty());
+
+    let report = usage_report(app).await;
+    assert_eq!(report["requests"]["failed"], 1);
+    assert_eq!(report["requests"]["cancelled"], 0);
+    assert_eq!(
+        report["errors"],
+        serde_json::json!([{"kind":"invalid_request","count":1}])
+    );
+}
+
+#[tokio::test]
+async fn usage_counts_an_unread_stream_as_cancelled_with_primed_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(
+        dir.path(),
+        vec![Ok(frames(&[(
+            "assistantResponseEvent",
+            r#"{"content":"partial"}"#,
+        )]))],
+    );
+    let response = app
+        .clone()
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+
+    let report = usage_report(app).await;
+    assert_eq!(report["requests"]["cancelled"], 1);
+    assert_eq!(report["requests"]["in_flight"], 0);
+    assert_eq!(report["tokens"]["estimated"]["output"], 1);
+    assert_eq!(
+        report["errors"],
+        serde_json::json!([{"kind":"cancelled","count":1}])
+    );
+}
+
+#[tokio::test]
+async fn usage_counts_a_stream_dropped_after_its_first_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(
+        dir.path(),
+        vec![Ok(frames(&[(
+            "assistantResponseEvent",
+            r#"{"content":"partial"}"#,
+        )]))],
+    );
+    let response = app
+        .clone()
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+    body.frame()
+        .await
+        .expect("the stream yields a first frame")
+        .expect("the first frame is valid");
+    drop(body);
+
+    let report = usage_report(app).await;
+    assert_eq!(report["requests"]["cancelled"], 1);
+    assert_eq!(report["requests"]["in_flight"], 0);
+}
+
+#[tokio::test]
+async fn usage_cancels_a_pending_generate_with_observed_attempts() {
+    for (completed, retries) in [(0, 0), (1, 0), (2, 1)] {
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(Notify::new());
+        let (app, usage) = app_with_upstream(
+            dir.path(),
+            Arc::new(PendingProgress {
+                completed,
+                entered: entered.clone(),
+            }),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        );
+        let notified = entered.notified();
+        let task = tokio::spawn(app.clone().oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))));
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("generate_with_progress reaches its pending state");
+        task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled request future terminates");
+
+        let report = usage.snapshot();
+        assert_eq!(report.totals.requests.cancelled, 1);
+        assert_eq!(report.totals.requests.in_flight, 0);
+        assert_eq!(report.totals.retries, retries);
+    }
+}
+
+#[tokio::test]
+async fn usage_snapshot_preserves_global_and_model_invariants_while_requests_are_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let entered = Arc::new(Notify::new());
+    let (app, usage) = app_with_upstream(
+        dir.path(),
+        Arc::new(PendingProgress {
+            completed: 0,
+            entered: entered.clone(),
+        }),
+        Arc::new(tokio::sync::Semaphore::new(2)),
+    );
+    let first_wait = entered.notified();
+    let first = tokio::spawn(app.clone().oneshot(messages_req(serde_json::json!({
+        "model": "claude-sonnet-4-6", "max_tokens": 10,
+        "messages": [{"role": "user", "content": "one"}]
+    }))));
+    tokio::time::timeout(Duration::from_secs(1), first_wait)
+        .await
+        .expect("first request is pending");
+    let second_wait = entered.notified();
+    let second = tokio::spawn(app.oneshot(messages_req(serde_json::json!({
+        "model": "claude-sonnet-4-6", "max_tokens": 10,
+        "messages": [{"role": "user", "content": "two"}]
+    }))));
+    tokio::time::timeout(Duration::from_secs(1), second_wait)
+        .await
+        .expect("second request is pending");
+    let report = usage.snapshot();
+    assert_eq!(report.totals.requests.started, 2);
+    assert_eq!(report.totals.requests.in_flight, 2);
+    assert_eq!(
+        report.totals.requests.started,
+        report.totals.requests.completed
+            + report.totals.requests.failed
+            + report.totals.requests.cancelled
+            + report.totals.requests.in_flight
+    );
+    assert_eq!(report.models.len(), 1);
+    assert_eq!(report.models[0].totals.requests.in_flight, 2);
+    assert_eq!(
+        report.models[0].totals.requests.started,
+        report.models[0].totals.requests.completed
+            + report.models[0].totals.requests.failed
+            + report.models[0].totals.requests.cancelled
+            + report.models[0].totals.requests.in_flight
+    );
+    assert_eq!(
+        report.totals.requests.started,
+        report
+            .models
+            .iter()
+            .map(|model| model.totals.requests.started)
+            .sum::<u64>()
+    );
+    first.abort();
+    second.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(1), first)
+        .await
+        .expect("first cancellation terminates");
+    let _ = tokio::time::timeout(Duration::from_secs(1), second)
+        .await
+        .expect("second cancellation terminates");
+    let report = usage.snapshot();
+    assert_eq!(
+        report.totals.requests.started,
+        report.totals.requests.completed
+            + report.totals.requests.failed
+            + report.totals.requests.cancelled
+            + report.totals.requests.in_flight
+    );
+    assert_eq!(
+        report.models[0].totals.requests.started,
+        report.models[0].totals.requests.completed
+            + report.models[0].totals.requests.failed
+            + report.models[0].totals.requests.cancelled
+            + report.models[0].totals.requests.in_flight
+    );
+    assert_eq!(
+        report.totals.requests.cancelled,
+        report
+            .models
+            .iter()
+            .map(|model| model.totals.requests.cancelled)
+            .sum::<u64>()
+    );
+}
+
+#[tokio::test]
+async fn usage_json_never_contains_request_content_markers() {
+    const MARKER: &str = "usage-secret-marker";
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(
+        dir.path(),
+        vec![Ok(frames(&[(
+            "assistantResponseEvent",
+            r#"{"content":"ok"}"#,
+        )]))],
+    );
+    let _ = app
+        .clone()
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10,
+            "messages": [{"role": "user", "content": MARKER}],
+            "tools": [{"name": MARKER, "input_schema": {"type": "object"}}]
+        })))
+        .await
+        .unwrap();
+    let response = app
+        .oneshot(
+            Request::get("/v1/usage")
+                .header("x-api-key", TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = body_string(response).await;
+    assert!(!json.contains(MARKER));
+    assert!(!json.contains("tool"));
+}
+
+#[tokio::test]
+async fn usage_preserves_snapshots_when_priming_is_cancelled() {
+    for (streaming, events) in [
+        (
+            true,
+            vec![(
+                "metadataEvent",
+                r#"{"tokenUsage":{"uncachedInputTokens":4,"outputTokens":1,"totalTokens":5,"cacheReadInputTokens":0,"cacheWriteInputTokens":0}}"#,
+            )],
+        ),
+        (
+            false,
+            vec![
+                ("assistantResponseEvent", r#"{"content":"text"}"#),
+                (
+                    "metadataEvent",
+                    r#"{"tokenUsage":{"uncachedInputTokens":4,"outputTokens":1,"totalTokens":5,"cacheReadInputTokens":0,"cacheWriteInputTokens":0}}"#,
+                ),
+            ],
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(Notify::new());
+        let (app, usage) = app_with_upstream(
+            dir.path(),
+            Arc::new(PrimingPending {
+                bytes: frames(&events),
+                entered: entered.clone(),
+            }),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        );
+        let notified = entered.notified();
+        let task = tokio::spawn(app.oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10, "stream": streaming,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))));
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("priming consumes the observed frame before pending");
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled priming future terminates");
+        let report = usage.snapshot();
+        assert_eq!(report.totals.requests.cancelled, 1);
+        assert_eq!(report.totals.requests.in_flight, 0);
+        assert_eq!(report.totals.tokens.reported.input, 4);
+    }
+}
+
+#[test]
+fn usage_summary_uses_bounded_models_and_resets_with_new_state() {
+    let key = kiro_trust_protocol::catalog::resolve("claude-sonnet-4-6", false)
+        .unwrap()
+        .key;
+    let summary = Arc::new(kiro_trust::server::usage::UsageSummary::new());
+    let mut request = summary.begin(key);
+    request.attempt_progress().record_completed(2);
+    request.update(
+        UsageSnapshot {
+            reported: ReportedTokens {
+                input: 10,
+                ..ReportedTokens::default()
+            },
+            ..UsageSnapshot::default()
+        },
+        0,
+    );
+    request.complete();
+    let report = summary.snapshot();
+    assert_eq!(report.totals.retries, 1);
+    assert_eq!(report.models.len(), 1);
+    assert_eq!(report.models[0].id, "claude-sonnet-4-6");
+    assert_eq!(report.totals.tokens.reported.input, 10);
+
+    let alias_key = kiro_trust_protocol::catalog::resolve("claude-sonnet-4.6", false)
+        .unwrap()
+        .key;
+    let mut alias_request = summary.begin(alias_key);
+    alias_request.complete();
+    let report = summary.snapshot();
+    assert_eq!(report.models.len(), 1);
+    assert_eq!(report.models[0].totals.requests.started, 2);
+
+    let context_key = kiro_trust_protocol::catalog::resolve("claude-sonnet-4-6", true)
+        .unwrap()
+        .key;
+    let mut context_request = summary.begin(context_key);
+    context_request.complete();
+    let report = summary.snapshot();
+    assert_eq!(report.models.len(), 2);
+    assert_eq!(report.models[0].id, "claude-sonnet-4-6");
+    assert_eq!(report.models[1].id, "claude-sonnet-4-6[1m]");
+
+    let reset = kiro_trust::server::usage::UsageSummary::new().snapshot();
+    assert_eq!(reset.totals.requests.started, 0);
+    assert!(reset.models.is_empty());
+}
+
+#[test]
+fn usage_cancellation_derives_retries_from_completed_attempts() {
+    let key = kiro_trust_protocol::catalog::resolve("claude-sonnet-4-6", false)
+        .unwrap()
+        .key;
+    for (completed, retries) in [(0, 0), (1, 0), (2, 1)] {
+        let summary = Arc::new(kiro_trust::server::usage::UsageSummary::new());
+        let request = summary.begin(key);
+        request.attempt_progress().record_completed(completed);
+        drop(request);
+        let report = summary.snapshot();
+        assert_eq!(report.totals.requests.cancelled, 1);
+        assert_eq!(report.totals.requests.in_flight, 0);
+        assert_eq!(report.totals.retries, retries);
+    }
+}
+
+#[tokio::test]
+async fn usage_terminal_initial_batch_is_completed_without_an_eof_poll() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = app(
+        dir.path(),
+        vec![Ok(frames(&[
+            ("assistantResponseEvent", r#"{"content":"done"}"#),
+            (
+                "metadataEvent",
+                r#"{"tokenUsage":{"uncachedInputTokens":1,"outputTokens":1,"totalTokens":2,"cacheReadInputTokens":0,"cacheWriteInputTokens":0}}"#,
+            ),
+        ]))],
+    );
+    let response = app
+        .clone()
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+    let mut saw_terminal = false;
+    while let Some(frame) = body.frame().await {
+        let data = frame
+            .expect("the streamed frame is valid")
+            .into_data()
+            .expect("the stream only yields data frames");
+        if String::from_utf8_lossy(&data).contains("message_stop") {
+            saw_terminal = true;
+            break;
+        }
+    }
+    assert!(saw_terminal);
+    drop(body);
+
+    let report = usage_report(app).await;
+    assert_eq!(report["requests"]["completed"], 1);
+    assert_eq!(report["requests"]["cancelled"], 0);
+    assert_eq!(report["requests"]["in_flight"], 0);
+}
+
+#[tokio::test]
 async fn unknown_routes_and_methods_use_the_error_envelope() {
     let dir = tempfile::tempdir().unwrap();
     let (app, _) = app(dir.path(), vec![]);
@@ -239,6 +1046,7 @@ async fn an_empty_token_never_authenticates_even_against_an_empty_local_token() 
         upstream,
         local_token: SecretString::from(String::new()),
         limiter: Arc::new(tokio::sync::Semaphore::new(32)),
+        usage: Arc::new(kiro_trust::server::usage::UsageSummary::new()),
         conversation_salt: [7u8; 16],
     });
     let app = build_router(state);
@@ -1046,6 +1854,7 @@ async fn concurrency_cap_returns_429() {
         upstream: scripted,
         local_token: SecretString::from(TOKEN.to_string()),
         limiter: limiter.clone(),
+        usage: Arc::new(kiro_trust::server::usage::UsageSummary::new()),
         conversation_salt: [1u8; 16],
     });
     let app = build_router(state);
@@ -1090,6 +1899,7 @@ async fn streaming_permit_is_held_for_the_connection_and_released_on_drop() {
         upstream: scripted,
         local_token: SecretString::from(TOKEN.to_string()),
         limiter: limiter.clone(),
+        usage: Arc::new(kiro_trust::server::usage::UsageSummary::new()),
         conversation_salt: [4u8; 16],
     });
     let app = build_router(state);
@@ -1155,6 +1965,7 @@ async fn a_stalled_upstream_fails_after_the_priming_deadline_and_releases_the_pe
         upstream: Arc::new(Stalled),
         local_token: SecretString::from(TOKEN.to_string()),
         limiter: limiter.clone(),
+        usage: Arc::new(kiro_trust::server::usage::UsageSummary::new()),
         conversation_salt: [9u8; 16],
     });
     let app = build_router(state);

@@ -14,6 +14,26 @@ use std::collections::HashMap;
 const OPEN_TAG: &str = "<thinking>";
 const CLOSE_TAG: &str = "</thinking>";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ReportedTokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct EstimatedTokens {
+    pub input: u64,
+    pub output: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct UsageSnapshot {
+    pub reported: ReportedTokens,
+    pub estimated: EstimatedTokens,
+}
+
 /// Absolute cap on accumulated output (text + thinking + tool-call input +
 /// redacted content share one `output_chars` counter), independent of the
 /// client's `max_tokens`. `/v1/messages` requires `max_tokens` (spec 5.1,
@@ -395,6 +415,29 @@ impl ResponseTranslator {
         }
     }
 
+    pub fn usage_snapshot(&self) -> UsageSnapshot {
+        let mut snapshot = UsageSnapshot {
+            reported: ReportedTokens {
+                cache_read: self.cache_read,
+                cache_write: self.cache_write,
+                ..ReportedTokens::default()
+            },
+            estimated: EstimatedTokens::default(),
+        };
+        if self.input_tokens > 0 || self.output_tokens > 0 {
+            snapshot.reported.input = self.input_tokens;
+            snapshot.reported.output = self.output_tokens;
+        } else {
+            snapshot.estimated.input = self.opts.estimated_input_tokens;
+            snapshot.estimated.output = if self.output_chars == 0 {
+                0
+            } else {
+                (self.output_chars / 4).max(1) as u64
+            };
+        }
+        snapshot
+    }
+
     /// Consume one upstream event; returns the streaming events to send.
     pub fn push(&mut self, ev: &Event) -> Vec<StreamEvent> {
         let mut out = Vec::new();
@@ -716,6 +759,40 @@ mod tests {
     }
     fn text(s: &str) -> Event {
         Event::AssistantResponse { content: s.into() }
+    }
+
+    #[test]
+    fn usage_snapshot_separates_sources() {
+        let mut estimated = ResponseTranslator::new(opts());
+        estimated.push(&text("four"));
+        assert_eq!(estimated.usage_snapshot().reported.input, 0);
+        assert_eq!(estimated.usage_snapshot().estimated.output, 1);
+
+        let mut reported = ResponseTranslator::new(opts());
+        reported.push(&Event::Metering {
+            credits: 0.0,
+            input_tokens: 4,
+            output_tokens: 1,
+        });
+        assert_eq!(reported.usage_snapshot().reported.input, 4);
+        assert_eq!(reported.usage_snapshot().reported.output, 1);
+        assert_eq!(reported.usage_snapshot().estimated.input, 0);
+    }
+
+    #[test]
+    fn cache_write_only_keeps_input_estimated() {
+        let mut translator = ResponseTranslator::new(opts());
+        translator.push(&Event::Metadata {
+            uncached_input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 5,
+        });
+        let snapshot = translator.usage_snapshot();
+        assert_eq!(snapshot.reported.input, 0);
+        assert_eq!(snapshot.reported.cache_write, 5);
+        assert_eq!(snapshot.estimated.input, opts().estimated_input_tokens);
     }
     fn names(evs: &[StreamEvent]) -> Vec<&'static str> {
         evs.iter().map(StreamEvent::event_name).collect()

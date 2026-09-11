@@ -587,6 +587,7 @@ records the rule here before writing code.
 | --- | --- | --- |
 | `GET /health` | none | `{"status":"ok"}` |
 | `GET /v1/models` | local token | static catalog, section 5.2 |
+| `GET /v1/usage` | local token | process-local usage summary, section 6.7 |
 | `POST /v1/messages` | local token | translate, call Kiro, stream or fold |
 | `POST /v1/messages/count_tokens` | local token | `{"input_tokens": n}` from section 5.7 |
 
@@ -1087,6 +1088,46 @@ explicit file mode, so audit does not claim one.
 The profile ARN and account id are never printed. `--json` emits the same
 data as one object. When `Build features` lists `capture` or
 `test-endpoints`, audit exits 1.
+
+### 6.7 Process-local usage summary
+
+`serve` owns an in-memory usage summary that starts empty and disappears when
+the process exits. Authenticated `GET /v1/usage` returns the summary without
+contacting Kiro and does not count as model usage. The response contains
+`object: "usage_summary"`, an RFC 3339 `since` timestamp, flattened request,
+token, duration, retry, and error counters, plus nonzero catalog-model rows.
+The summary has no file, database, telemetry, reset route, or billing claim.
+
+Token counts retain separate `reported` and `estimated` buckets. Metadata or
+metering with a nonzero input or output reports both values. Otherwise the
+existing local estimates remain estimated. Cache read and cache write values
+always remain reported. The translator replaces an earlier snapshot rather
+than adding it. The Anthropic response `usage` shape remains unchanged.
+
+The summary begins after known-model resolution and before the local
+concurrency permit. Local authentication and unknown-model rejection stay
+outside it. Later local payload or image validation records `invalid_request`.
+Identity failures record `authentication`. Upstream `Auth`, `Throttled`,
+`ModelCapacity`, `Transport`, `Protocol`, and `Server` or `Client` map to
+`authentication`, `transient_throttle`, `model_capacity`, `transport`,
+`protocol`, and `upstream_server`. Decoded invalid state maps to
+`invalid_state`; decoded capacity and throttle exceptions use the matching
+fixed categories, and other decoded exceptions use `upstream_server`.
+Allowance exhaustion remains unclassified until its evidence gate exists.
+
+Each request owns one attempt-progress handle across the ordinary call and
+the one permitted invalid-state replay. Completed transport attempts determine
+retries as `completed - 1`, including cancellation. The final observed attempt
+supplies token values. A streamed request keeps its guard through the initial
+SSE batch and completes when it yields the terminal event. A body drop before
+a terminal transition records `cancelled`. One lock updates global and bounded
+catalog-model counters, preserving the request-count invariant before
+saturation. All counters saturate at `u64::MAX`.
+
+Priming reports the latest translator snapshot after every completed pump
+chunk and before another upstream await. Cancelling either response mode while
+priming therefore retains observed metadata or text. An invalid-state replay
+clears the discarded attempt snapshot before it starts the final attempt.
 
 ## 7. Verified facts
 

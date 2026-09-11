@@ -8,7 +8,9 @@ use futures_util::stream::BoxStream;
 use kiro_trust_kiro::{UpstreamError, UpstreamErrorKind};
 use kiro_trust_protocol::anthropic::StreamEvent;
 use kiro_trust_protocol::eventstream::{EventParser, FrameDecoder};
-use kiro_trust_protocol::translate::response::{Failure, ResponseOptions, ResponseTranslator};
+use kiro_trust_protocol::translate::response::{
+    Failure, ResponseOptions, ResponseTranslator, UsageSnapshot,
+};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -218,7 +220,10 @@ impl Pump {
     /// both paths, from the first read until `self.translator.started()`
     /// (Important 3): once real output exists, the deadline no longer
     /// applies, so a long legitimate generation is never cut short by it.
-    pub async fn prime(&mut self, streaming: bool) -> Primed {
+    pub async fn prime<F>(&mut self, streaming: bool, mut observe: F) -> Primed
+    where
+        F: FnMut(UsageSnapshot),
+    {
         let mut buffered = Vec::new();
         let deadline = Instant::now() + PRIMING_DEADLINE;
         loop {
@@ -234,6 +239,7 @@ impl Pump {
                     }
                 }
             };
+            observe(self.translator.usage_snapshot());
             // Non-streaming never reads `buffered`: `post_messages` only
             // consumes a `Primed::Ready`/`Ended` payload inside its
             // `if req.stream` branch, and folds the non-streaming response

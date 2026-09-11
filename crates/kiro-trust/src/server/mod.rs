@@ -7,6 +7,7 @@ pub mod error;
 pub mod messages;
 mod models;
 pub mod pump;
+pub mod usage;
 
 use crate::listener::ConnectionInfo;
 use crate::server::error::ApiError;
@@ -31,6 +32,7 @@ pub struct AppState {
     pub upstream: Arc<dyn Upstream>,
     pub local_token: SecretString,
     pub limiter: Arc<Semaphore>,
+    pub usage: Arc<usage::UsageSummary>,
     /// Per-process salt for deriving Kiro conversation ids (Task 18).
     pub conversation_salt: [u8; 16],
     /// Developer-only payload capture (spec 8.3). `None` when no
@@ -108,6 +110,10 @@ async fn health() -> Response {
         .into_response()
 }
 
+async fn usage(State(state): State<Arc<AppState>>) -> axum::Json<usage::UsageReport> {
+    axum::Json(state.usage.snapshot())
+}
+
 async fn not_found() -> Response {
     ApiError::not_found("no such route").into_response()
 }
@@ -120,6 +126,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models::get_models))
+        .route("/v1/usage", get(usage))
         .route("/v1/messages", post(messages::post_messages))
         .route(
             "/v1/messages/count_tokens",

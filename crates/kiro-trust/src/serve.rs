@@ -84,6 +84,7 @@ pub async fn run(mut cfg: ServeConfig) -> Result<(), String> {
         upstream,
         local_token,
         limiter: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)),
+        usage: Arc::new(crate::server::usage::UsageSummary::new()),
         conversation_salt: salt,
         #[cfg(feature = "capture")]
         capture,

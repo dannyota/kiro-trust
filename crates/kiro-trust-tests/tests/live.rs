@@ -54,6 +54,7 @@ fn app(buffer: Option<Duration>) -> axum::Router {
         upstream,
         local_token: SecretString::from("live".to_string()),
         limiter: Arc::new(tokio::sync::Semaphore::new(4)),
+        usage: Arc::new(kiro_trust::server::usage::UsageSummary::new()),
         conversation_salt: [3u8; 16],
     });
     build_router(state)
