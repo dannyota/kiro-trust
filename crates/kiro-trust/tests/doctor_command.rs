@@ -166,9 +166,22 @@ fn doctor_invalid_credential_errors_without_refreshing() {
 #[test]
 fn doctor_unreadable_metadata_errors() {
     let dir = tempfile::tempdir().unwrap();
-    let ancestor = dir.path().join("not-a-directory");
-    std::fs::write(&ancestor, b"x").unwrap();
-    let output = command_for(&fixture_db(), &ancestor.join("token"), "127.0.0.1:9")
+    #[cfg(windows)]
+    // Windows reserves `<` in a file name, producing a metadata error.
+    let token = dir.path().join("token<");
+    #[cfg(not(windows))]
+    let token = {
+        let ancestor = dir.path().join("not-a-directory");
+        std::fs::write(&ancestor, b"x").unwrap();
+        ancestor.join("token")
+    };
+    let error = std::fs::symlink_metadata(&token).expect_err("fixture metadata must fail");
+    assert_ne!(
+        error.kind(),
+        std::io::ErrorKind::NotFound,
+        "fixture metadata must fail for a reason other than a missing token file: {error}"
+    );
+    let output = command_for(&fixture_db(), &token, "127.0.0.1:9")
         .output()
         .unwrap();
     assert_eq!(

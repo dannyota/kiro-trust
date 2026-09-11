@@ -2,7 +2,7 @@
 
 All notable changes to kiro-trust. Dates are UTC.
 
-## 0.3.0 - 2026-09-10
+## 0.3.0 - 2026-09-11
 
 - `kiro-trust models list [--json]` and `kiro-trust models show <model>
   [--json]` inspect the compiled catalog without credentials or network access.
