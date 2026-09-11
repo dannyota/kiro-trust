@@ -2,6 +2,33 @@
 
 All notable changes to kiro-trust. Dates are UTC.
 
+## 0.3.0 - 2026-09-10
+
+- `kiro-trust models list [--json]` and `kiro-trust models show <model>
+  [--json]` inspect the compiled catalog without credentials or network access.
+  The catalog reports routable models and their context tiers, inputs, effort
+  levels, aliases, and history-image forwarding state. It does not report
+  remote availability or enable a model.
+- `kiro-trust doctor [--json] [--network]` checks local configuration,
+  read-only credential access, expiry, and local-token metadata. It is offline
+  by default. `--network` permits one fixed, unauthenticated loopback
+  `GET /health` reachability probe with a two-second total deadline.
+- `GET /v1/usage` returns an authenticated, process-local summary of observed
+  proxy activity. The summary starts empty on `serve`, disappears when the
+  process exits, and separates upstream-reported token counts from local
+  estimates. It never reports remaining Kiro credits.
+- Retryable 429 and 5xx responses honor bounded `Retry-After` values.
+  `INSUFFICIENT_MODEL_CAPACITY` receives the `model_capacity` classification.
+  Each `generate` call allows at most three upstream attempts and counts
+  completed posts through cancellation. The permitted invalid-state replay can
+  make one additional `generate` call.
+- The refresh chain retains the newest credential in memory after an OIDC
+  refresh, avoiding replay of a refresh token already exchanged by this
+  process. It does not write the Kiro CLI database or coordinate separate
+  processes.
+- Manual model discovery, monthly allowance classification, and history-image
+  forwarding remain deferred behind their separate evidence gates.
+
 ## 0.2.0 - 2026-09-10
 
 - `kiro-trust exec -- <cmd> [args...]` runs a command with

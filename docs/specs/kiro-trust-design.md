@@ -1,6 +1,6 @@
 # kiro-trust — design
 
-Status: approved design for v0.1. This document is the source of truth for
+Status: v0.3.0 release candidate, 2026-09-10. This document is the source of truth for
 scope, architecture, security contracts, and verified protocol facts. When code
 and spec disagree, the spec wins; fix the spec first, in the same commit as any
 behavior change. The behavioral reference is
@@ -66,17 +66,21 @@ keep narrow; `models sync` and Tool Search would add an outbound host and
 server-tool emulation, and section 6.5 bans model discovery outright, flag or
 no flag.
 
-0.2.0 moves three former backlog items into scope: `kiro-trust exec`
+0.2.0 moved three former backlog items into scope: `kiro-trust exec`
 (section 4.5), an additive enterprise CA flag (section 4.1), and a header read
-timeout with an idle connection cap (section 6.3). It also completes image
-support: format validation and per-image and per-request limits (section 5.3),
-and images in history entries (section 5.3, pending the live test in
-section 8.6).
+timeout with an idle connection cap (section 6.3). It also added image format
+validation and per-image and per-request limits. The proxy forwards images in
+the current message. It drops history images until the live test in section
+8.6 proves that runtime behavior.
 
-0.3.0 adds offline model inspection through `models list` and `models show`
-(section 4.2.1), plus `kiro-trust doctor` (section 4.6). Doctor checks local
-configuration by default. `doctor --network` also sends an explicit loopback
-health probe.
+The 0.3.0 candidate adds offline model inspection through `models list` and
+`models show` (section 4.2.1), `kiro-trust doctor` (section 4.6), bounded
+retry handling, and the process-local usage summary at `GET /v1/usage`.
+Doctor checks local configuration by default. `doctor --network` also sends an
+explicit loopback health probe. The refresh-token chain keeps refreshed
+credentials in memory and does not update the Kiro CLI database. Manual model
+discovery, monthly allowance classification, and history-image forwarding stay
+deferred behind their separate evidence gates.
 
 ## 2. Decisions
 
@@ -182,8 +186,8 @@ this crate's own tests; the binary never enables it and CI proves that.
 `SocketAddr` for a fixed unauthenticated HTTP/1 `GET /health`. It rejects
 non-loopback addresses inside the net crate and returns only the fixed
 `NetError::HealthProbe` error on failure. The caller cannot change its URL,
-path, method, or headers. Section 4.6 defines its timeout and body
-bounds.
+path, method, or headers. Section 4.6 defines its single two-second total
+deadline, with connection bounded within that deadline, and its body bound.
 
 The client is built with redirects disabled, `no_proxy()`, `rustls` with
 `webpki-roots`, HTTPS only, connect timeout 10 s, response header timeout 30 s.
@@ -540,8 +544,8 @@ file. Missing token files are warnings because `serve` creates them.
 Without `--network`, listener is `skipped` with `network_disabled`. With it,
 the only request is the fixed, unauthenticated HTTP/1 `GET /health` to the
 configured loopback socket. The private net client disables proxies and
-redirects, applies two-second connect and response deadlines, reads at most
-256 bytes, and accepts only status 200, `application/json`, and exactly
+redirects, applies one two-second total probe deadline, reads at most 256
+bytes, and accepts only status 200, `application/json`, and exactly
 `{"status":"ok"}`. It rejects a non-loopback address again inside the net
 crate. No token, caller-provided method, path, host, or header enters the
 probe.
@@ -832,8 +836,9 @@ upstream value. Invalid, negative, and past values use jitter. The exact
 `15cc8f3cd18c4272925ce1c7053268eedff1ea0a`,
 `crates/chat-cli/src/api_client/mod.rs`, which checks it before its general
 429 classification. The legacy wording fallback and context-overflow branch
-are not transcribed. `MONTHLY_REQUEST_COUNT` remains transient throttling
-until a scrubbed fixture proves that marker.
+are not transcribed. Until a scrubbed fixture proves the exact
+`MONTHLY_REQUEST_COUNT` marker, that marker retains ordinary status and
+exception classification. It has no marker-specific category or behavior.
 
 ### 5.7 `count_tokens`
 
@@ -971,8 +976,8 @@ or `security_logging.rs` (section 8.4).
   `runtime_region`, `sso_region`, `frames`, `event_counts`, `error_type`.
   `attempt` is `kiro-trust-kiro`'s per-call completed-post count.
   `retry_count` is completed posts across the request, including the permitted
-  invalid-state replay, minus one and saturated at zero. Task 5's usage guard
-  will read the same `AttemptProgress` value at completion, failure, and
+  invalid-state replay, minus one and saturated at zero. The usage guard reads
+  the same `AttemptProgress` value at completion, failure, and
   cancellation.
   `crates/kiro-trust-tests/tests/security_logging.rs` asserts every `field=`
   name on a captured log line is in this list.
@@ -1794,3 +1799,6 @@ Deferred with reasons; each becomes a spec change before code.
 | cosign step in addition to attestations | attestations already Sigstore-backed |
 | Homebrew tap | must not strip quarantine; needs notarization |
 | digest of the stored credential row as the freshness discriminator (3.3) | `expires_at` covers every write the Kiro CLI actually performs; a digest would also catch two writes sharing an expiry, and must never be logged or serialized |
+| manual model discovery | needs one successful, structure-only catalog request for each proposed region before any region ships |
+| monthly allowance classification | needs a scrubbed fixture with the exact `MONTHLY_REQUEST_COUNT` marker; ordinary status and exception classification remains in use |
+| history-image forwarding | needs the structural `history_image_is_accepted` live test after runtime access returns |

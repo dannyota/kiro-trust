@@ -32,6 +32,10 @@ publishing it alone can leave `cargo install kiro-trust` unable to resolve.
 1. Bump the version in `Cargo.toml`: `[workspace.package] version` and the
    `version` fields for `kiro-trust-protocol`, `kiro-trust-net`,
    `kiro-trust-auth`, and `kiro-trust-kiro` in `[workspace.dependencies]`.
+   Keep the `kiro-trust` path dependency at the same version too. Update the
+   inherited workspace package versions in `Cargo.lock`, including the test
+   support crate and `xtask`, and the `kiro-trust-protocol` package version in
+   `fuzz/Cargo.lock`, without changing unrelated dependency selections.
    Bumping only `[workspace.package] version` leaves stale requirements in the
    dependency metadata.
 2. Regenerate the audit gate fixture: its `"version"` field is not stripped by
@@ -90,14 +94,14 @@ fuzz targets. Preflight in step 6 verifies the workspace packages and the
 SBOM tool without uploading anything. Both must pass for the exact release
 commit before tagging.
 
-For local checks when needed, cap builds at two jobs and tests at four threads.
+For local checks when needed, cap builds at two jobs and tests at six threads.
 The package check requires Python 3.11 or later for TOML parsing.
 Run one build-heavy command at a time:
 
 ```bash
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets --jobs 2 -- -D warnings
-cargo test --locked --workspace --jobs 2 -- --test-threads=4
+cargo test --locked --workspace --jobs 2 -- --test-threads=6
 ./scripts/check-packages.sh
 ./scripts/check-fixtures.sh
 ./scripts/check-features.sh

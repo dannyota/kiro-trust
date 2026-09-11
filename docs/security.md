@@ -8,9 +8,11 @@ Every item is a contract in `docs/specs/kiro-trust-design.md` section 6 with
 a test behind it.
 
 - Read-only Kiro credential access; only the Identity Center rows are read.
-- Two outbound hosts, constructed internally from validated regions. No
-  redirects, no proxy, compiled-in TLS roots.
-- Loopback listener with a mandatory local token.
+- Remote traffic to two hosts, constructed internally from validated regions.
+  No redirects, no proxy, compiled-in TLS roots. `doctor --network` has the
+  separate fixed loopback health-probe exception below.
+- Loopback listener with a mandatory local token on every route except
+  unauthenticated `GET /health`.
 - No request or response body logging, and no option to enable it.
 - No telemetry, crash reporting, update checks, or model discovery.
 - `doctor --network` may send one unauthenticated `GET /health` request to the
@@ -61,13 +63,13 @@ promise has the same limit.
 
 ## Doctor
 
-`kiro-trust doctor` checks local configuration, database access, credential
-expiry, token-file metadata, and listener reachability without network access.
-`--network` enables one fixed, unauthenticated HTTP/1 `GET /health` probe to
-the configured loopback address. The probe disables proxies and redirects,
-uses two-second deadlines, reads at most 256 bytes, and accepts only the fixed
-health JSON response. It never reads token-file contents or refreshes a
-credential.
+`kiro-trust doctor` checks local configuration, including the listener address,
+database access, credential expiry, and token-file metadata without network
+access. `--network` enables one fixed, unauthenticated HTTP/1 `GET /health`
+probe to check reachability of the configured loopback address. The probe
+disables proxies and redirects, uses one two-second total deadline, reads at
+most 256 bytes, and accepts only the fixed health JSON response. It never reads
+token-file contents or refreshes a credential.
 
 ## Verifying a release
 

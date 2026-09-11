@@ -323,7 +323,7 @@ offline run performs these checks in order:
 `--network` adds one request: unauthenticated `GET /health` to the configured
 loopback address. `kiro-trust-net::probe_loopback_health(SocketAddr)` builds a
 private reqwest client with proxies and redirects disabled, fixed `/health`,
-HTTP/1, a two-second connect timeout, a two-second response timeout, and a
+HTTP/1, one two-second total deadline with connection bounded within it, and a
 256-byte body limit. The function rejects non-loopback addresses again. It
 sends no local or Kiro token and accepts only status 200 with
 `application/json` and `{"status":"ok"}`.
@@ -383,8 +383,8 @@ message and usage category distinguish:
 | --- | --- | --- |
 | `local_concurrency` | The 32-request semaphore has no permit | Never inside the proxy; return 429 with `Retry-After: 1` |
 | `model_capacity` | The bounded upstream error body contains the exact marker `INSUFFICIENT_MODEL_CAPACITY` | Transient; use the retry schedule |
-| `allowance_exhausted` | The bounded upstream error body contains the exact marker `MONTHLY_REQUEST_COUNT` | Never; return 429 immediately |
-| `transient_throttle` | 429, `ThrottlingException`, or `TooManyRequestsException` without the monthly marker | Transient; use the retry schedule |
+| `allowance_exhausted` (gated) | A scrubbed recorded response fixture verifies the exact `MONTHLY_REQUEST_COUNT` marker | Not emitted until the evidence gate passes; retain ordinary status and exception classification |
+| `transient_throttle` | 429, `ThrottlingException`, or `TooManyRequestsException`; after the allowance gate passes, these without the monthly marker | Transient; use the retry schedule |
 
 The retry schedule belongs to `KiroClient::generate()` and applies to retryable
 HTTP errors and decoded non-eventstream JSON exceptions. The server adds no
@@ -401,8 +401,9 @@ The two exact markers come from the Kiro CLI source at the pinned commit,
 `crates/chat-cli/src/api_client/mod.rs`. Arbitrary words such as `quota`,
 `limit`, or every 429 never establish allowance exhaustion. A scrubbed,
 recorded response fixture must verify the exact monthly marker before
-`allowance_exhausted` ships. Until that fixture exists, the classifier treats
-the response as `transient_throttle`.
+`allowance_exhausted` ships. Until that fixture exists, the classifier retains
+ordinary status and exception classification. It emits no marker-specific
+allowance category or behavior.
 
 ### 5.2 Retry-After
 
@@ -489,9 +490,11 @@ uses `ModelKey` and omits zero-count slots. The catalog id is rendered only when
 the snapshot is built. Each `errors` entry is `{"kind":"transport","count":1}`;
 zero-count categories are omitted and entries follow enum order. The fixed
 categories are `local_concurrency`, `authentication`, `model_capacity`,
-`allowance_exhausted`, `transient_throttle`, `upstream_server`, `transport`,
-`protocol`, `invalid_state`, `invalid_request`, and `cancelled`. Counters and sums saturate at
-`u64::MAX`. The fixed model keys and error enum bound cardinality.
+`transient_throttle`, `upstream_server`, `transport`, `protocol`,
+`invalid_state`, `invalid_request`, and `cancelled`. `allowance_exhausted` is
+a gated future category and is omitted until its recorded-marker evidence
+exists. Counters and sums saturate at `u64::MAX`. The fixed model keys and
+error enum bound cardinality.
 
 The response describes observed proxy activity. It never claims current or
 remaining Kiro credits. The upstream `meteringEvent.credits` value remains

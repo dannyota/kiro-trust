@@ -77,15 +77,32 @@ to put in the current shell. See
 [section 4](docs/specs/kiro-trust-design.md#4-command-surface) of the design
 spec for every flag and environment variable.
 
+Inspect the models that this build can route without opening the credential
+database or making a network request:
+
+```bash
+kiro-trust models list
+kiro-trust models show claude-sonnet-4.6 --json
+```
+
+`models list` prints `ID`, `KIRO MODEL`, `CONTEXT`, `INPUTS`, and `EFFORT`.
+Its JSON output is `{"object":"model_catalog","models":[...]}` in catalog
+order. `models show` prints the selected model's metadata in a fixed field
+order, or that metadata as JSON. Both commands describe compiled support, not
+remote availability. `models discover` is not included in 0.3.0: it remains
+gated on a verified catalog request for each proposed region and cannot enable
+or route a model.
+
 ## Guarantees
 
 - The Kiro CLI credential database is opened read-only, and only the
   Identity Center rows are read.
-- Outbound traffic goes to `oidc.<region>.amazonaws.com` and
+- Remote traffic uses `oidc.<region>.amazonaws.com` and
   `runtime.<region>.kiro.dev` only. Redirects fail. Proxy environment
-  variables are ignored.
-- The listener binds to loopback only, and every request needs the local
-  token.
+  variables are ignored. `doctor --network` has the separate fixed loopback
+  health-probe exception below.
+- The listener binds to loopback only. Every route except unauthenticated
+  `GET /health` needs the local token.
 - Request and response bodies are never logged, and no flag exists to log
   them.
 - No telemetry, no update checks, no dynamic model discovery.
@@ -117,8 +134,9 @@ confirmed read-only, the credential cannot be read, or a developer-only feature
 is compiled in (spec 4.2).
 
 Some printed lines are measurements of the running build and others are fixed
-text asserting that a category of code does not exist. The difference matters
-when you are relying on `audit` as evidence:
+policy text. Fixed text records a declared policy. It does not measure or
+prove the absence of code. The difference matters when you are relying on
+`audit` as evidence:
 [`docs/security.md`](docs/security.md#what-audit-measures) draws that line
 for each printed field.
 
@@ -128,11 +146,32 @@ for each printed field.
 kiro-trust doctor [--json] [--network]
 ```
 
-Checks configuration, the read-only credential database, credential expiry,
-local-token metadata, and listener reachability. It is offline by default.
-`--network` sends one fixed unauthenticated `GET /health` request to the
-configured loopback listener. Doctor never refreshes a credential or reads
-token-file contents.
+Checks configuration, including the configured listener address, the read-only
+credential database, credential expiry, and local-token metadata. It is
+offline by default. `--network` adds one fixed unauthenticated `GET /health`
+request to check reachability of the configured loopback listener with a
+two-second total probe deadline. Doctor never refreshes a credential or reads
+token-file contents. Its text output
+lists `DATABASE`, `TOKEN FILE`, and `EXTRA CA`, then five fixed checks:
+`configuration`, `database`, `credential_expiry`, `local_token`, and
+`listener`. JSON returns the same paths and checks with fixed snake-case
+statuses and details. Errors exit 1; warnings and skipped checks exit 0.
+An expired access token alone does not require a new Kiro CLI login. The normal
+in-memory token source refreshes it through OIDC when the stored refresh chain
+can do so.
+
+## Usage summary
+
+`GET /v1/usage` requires the local token. It returns a `usage_summary` with
+its start time, request outcomes, retries, durations, fixed error categories,
+and nonzero per-model rows. The summary belongs to one `serve` process. It
+starts empty and is lost when that process exits.
+
+The `tokens.reported` bucket contains counts received from Kiro. The
+`tokens.estimated` bucket contains the local input and output estimates used
+when the upstream did not report those counts. Cache counts always remain in
+`reported`. These counters describe proxy activity only. They do not estimate
+or expose any current, monthly, or remaining Kiro allowance.
 
 ## Limitations
 
@@ -142,8 +181,13 @@ reasoning, and section 13 has the backlog.
 
 - Identity Center credentials only: no social login, no Kiro API keys
   (`ksk_…`).
-- Claude models only, from a static catalog: no GPT models on Kiro, no
-  dynamic model discovery.
+- Claude models only, from a static catalog: no GPT models on Kiro. Manual
+  discovery remains deferred until its per-region catalog evidence gate passes.
+- Monthly allowance classification remains deferred until a scrubbed fixture
+  proves the exact `MONTHLY_REQUEST_COUNT` marker.
+- Current-message images are accepted and forwarded. Images from history
+  entries remain dropped until `history_image_is_accepted` passes after runtime
+  access returns.
 - Nothing emulated proxy-side: no Tool Search, Advisor, truncation notice
   injection, or retry of thinking-only responses.
 - One local user: no web UI, remote listener, multi-user, or account pooling.

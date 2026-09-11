@@ -16,8 +16,8 @@
     "mode": "read-only, authorizer enforced",
     "path": "tests/fixtures/db/idc.sqlite3"
   },
-  "dynamic_model_discovery": "disabled",
   "doctor_network": "explicit unauthenticated GET /health to configured loopback",
+  "dynamic_model_discovery": "disabled",
   "extra_ca": "none",
   "http_proxy": "disabled (environment ignored)",
   "local_authentication": "required (token file 0600)",
@@ -31,5 +31,5 @@
   },
   "telemetry": "none",
   "tls_roots": "webpki-roots (compiled in)",
-  "version": "0.2.0"
+  "version": "0.3.0"
 }
