@@ -603,6 +603,30 @@ async fn monthly_marker_on_a_429_stops_retrying() {
 }
 
 #[tokio::test]
+async fn monthly_marker_on_a_503_with_a_long_retry_after_stops_without_a_delay() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("retry-after", "61")
+                .set_body_string(monthly_limit_body()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let error = client(&server, dir.path(), false)
+        .await
+        .generate(&payload())
+        .await
+        .unwrap_err();
+    assert_eq!(error.attempts, 1);
+    assert_eq!(error.kind, UpstreamErrorKind::AllowanceExhausted);
+    assert_eq!(error.status, Some(503));
+    assert_eq!(error.retry_after, None);
+}
+
+#[tokio::test]
 async fn monthly_marker_in_a_200_throttling_exception_stops_retrying() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

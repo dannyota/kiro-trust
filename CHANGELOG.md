@@ -9,8 +9,10 @@ All notable changes to kiro-trust. Dates are UTC.
   reported as a 502. The proxy returns 429 `rate_limit_error` with
   `x-should-retry: false`, and `GET /v1/usage` counts it as
   `allowance_exhausted`. A recorded runtime response backs the classification.
-- `UpstreamErrorKind` in `kiro-trust-kiro` gains the `AllowanceExhausted`
-  variant.
+- Breaking library change: the public `UpstreamErrorKind` enum in
+  `kiro-trust-kiro` gains the `AllowanceExhausted` variant, so an exhaustive
+  `match` on it needs a new arm.
+- rustls is updated to 0.23.45 for RUSTSEC-2026-0285.
 
 ## 0.3.0 - 2026-09-11
 
