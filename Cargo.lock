@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "kiro-trust"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1089,7 +1089,7 @@ dependencies = [
 
 [[package]]
 name = "kiro-trust-auth"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "directories",
  "http",
@@ -1107,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "kiro-trust-kiro"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "kiro-trust-net"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1145,7 +1145,7 @@ dependencies = [
 
 [[package]]
 name = "kiro-trust-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
  "crc32fast",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "kiro-trust-tests"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2637,7 +2637,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "kiro-trust-protocol",
  "rusqlite",

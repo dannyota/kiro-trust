@@ -89,7 +89,7 @@ kiro-trust models show claude-sonnet-4.6 --json
 Its JSON output is `{"object":"model_catalog","models":[...]}` in catalog
 order. `models show` prints the selected model's metadata in a fixed field
 order, or that metadata as JSON. Both commands describe compiled support, not
-remote availability. `models discover` is not included in 0.3.0: it remains
+remote availability. `models discover` is not included in 0.4.0: it remains
 gated on a verified catalog request for each proposed region and cannot enable
 or route a model.
 

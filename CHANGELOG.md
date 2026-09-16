@@ -2,7 +2,7 @@
 
 All notable changes to kiro-trust. Dates are UTC.
 
-## Unreleased
+## 0.4.0 - 2026-09-17
 
 - An exhausted monthly Kiro request allowance, marked by
   `MONTHLY_REQUEST_COUNT` in the runtime's error body, is no longer retried or

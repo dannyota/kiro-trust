@@ -1,6 +1,6 @@
 # kiro-trust — design
 
-Status: v0.3.0 release candidate, 2026-09-10. This document is the source of truth for
+Status: v0.4.0 release candidate, 2026-09-17. This document is the source of truth for
 scope, architecture, security contracts, and verified protocol facts. When code
 and spec disagree, the spec wins; fix the spec first, in the same commit as any
 behavior change. The behavioral reference is
@@ -82,7 +82,7 @@ credentials in memory and does not update the Kiro CLI database. Manual model
 discovery and history-image forwarding stay deferred behind their separate
 evidence gates.
 
-The next release classifies the monthly allowance marker (section 5.6). A live
+0.4.0 classifies the monthly allowance marker (section 5.6). A live
 capture on 2026-09-16 recorded the marker and passed its evidence gate.
 
 ## 2. Decisions
