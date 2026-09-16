@@ -79,8 +79,11 @@ retry handling, and the process-local usage summary at `GET /v1/usage`.
 Doctor checks local configuration by default. `doctor --network` also sends an
 explicit loopback health probe. The refresh-token chain keeps refreshed
 credentials in memory and does not update the Kiro CLI database. Manual model
-discovery, monthly allowance classification, and history-image forwarding stay
-deferred behind their separate evidence gates.
+discovery and history-image forwarding stay deferred behind their separate
+evidence gates.
+
+The next release classifies the monthly allowance marker (section 5.6). A live
+capture on 2026-09-16 recorded the marker and passed its evidence gate.
 
 ## 2. Decisions
 
@@ -817,8 +820,9 @@ Every failure uses `{"type":"error","error":{"type":"<t>","message":"<m>"}}`.
 | method not allowed | 405 | `invalid_request_error` |
 | Kiro credential unusable (no database, refresh failed) | 401 | `authentication_error` |
 | upstream throttling or model capacity after retries | 429 | `rate_limit_error` |
+| monthly request allowance exhausted (never retried) | 429 with `x-should-retry: false`, no `Retry-After` | `rate_limit_error` |
 | upstream 5xx, malformed stream, idle timeout (including the priming deadline, section 5.5) | 502 | `api_error` |
-| upstream 400-class other than 403/429 | 502 | `api_error` |
+| upstream 400-class other than 403/429, without the allowance marker | 502 | `api_error` |
 | local concurrency cap | 429 with `Retry-After: 1` | `rate_limit_error` |
 
 The message carries the upstream exception type and message capped at 1 KiB.
@@ -836,9 +840,35 @@ upstream value. Invalid, negative, and past values use jitter. The exact
 `15cc8f3cd18c4272925ce1c7053268eedff1ea0a`,
 `crates/chat-cli/src/api_client/mod.rs`, which checks it before its general
 429 classification. The legacy wording fallback and context-overflow branch
-are not transcribed. Until a scrubbed fixture proves the exact
-`MONTHLY_REQUEST_COUNT` marker, that marker retains ordinary status and
-exception classification. It has no marker-specific category or behavior.
+are not transcribed.
+
+The exact `MONTHLY_REQUEST_COUNT` marker is transcribed from the same file at
+the same commit. That file matches the marker as a byte substring of the error
+body, and the generated SDK lists the value as a `reason` on both
+`ServiceQuotaExceededException` and `ThrottlingException`. The recorded
+fixture `tests/fixtures/errors/monthly-request-count` is the runtime's HTTP 400
+response with an exhausted allowance: an AWS JSON 1.0 body whose `__type` is
+`ServiceQuotaExceededException`, whose `message` is "You have reached the
+limit.", and whose `reason` is `MONTHLY_REQUEST_COUNT`. The response carries no
+`x-amzn-errortype` header.
+
+`KiroClient::generate()` classifies a bounded error body that contains the
+marker as `AllowanceExhausted` on three paths: a 400-class status other than
+403, a 429 or 5xx status, and a 200 whose body is a JSON exception. Precedence
+is the capacity marker, then the allowance marker, then the status or
+exception type. So a 429 or `ThrottlingException` that carries the allowance
+marker is exhaustion, not transient throttling. Unlike the Kiro CLI, which
+checks 429 first, the proxy puts the allowance marker ahead of 429 because
+retrying cannot succeed before the allowance resets. An exhausted allowance
+ends the retry loop at once, ignores any `Retry-After`, and becomes 429
+`rate_limit_error` with `x-should-retry: false`. Anthropic SDK clients,
+including Claude Code, honor that header and do not retry. The message starts
+with `Kiro monthly request allowance exhausted:`. Words such as `quota` or
+`limit`, and the exception type alone, never establish exhaustion.
+
+Exception frames inside an event stream keep their existing classification.
+The frame decoder keeps only a frame's exception type and `message`, and no
+capture shows the allowance marker in a frame.
 
 ### 5.7 `count_tokens`
 
@@ -1118,7 +1148,7 @@ Identity failures record `authentication`. Upstream `Auth`, `Throttled`,
 `protocol`, and `upstream_server`. Decoded invalid state maps to
 `invalid_state`; decoded capacity and throttle exceptions use the matching
 fixed categories, and other decoded exceptions use `upstream_server`.
-Allowance exhaustion remains unclassified until its evidence gate exists.
+Upstream `AllowanceExhausted` maps to `allowance_exhausted` (section 5.6).
 
 Each request owns one attempt-progress handle across the ordinary call and
 the one permitted invalid-state replay. Completed transport attempts determine
@@ -1323,6 +1353,14 @@ not mean the forced-refresh path ran.
   `{"exception_type": .., "payload": ..}` objects, one per frame, that the
   harness re-encodes to the same bytes
 - `expected-sse.txt` or `expected-message.json`: the Anthropic output
+
+`tests/fixtures/errors/<case>/` holds a recorded upstream error response
+instead: `body.json`, the exact response body bytes, and `meta.json` with
+`source`, `status`, `content_type`, and `features`. The fixture harness skips
+these directories because they have no `request.json`. The client tests in
+`crates/kiro-trust-tests/tests/kiro_client.rs` serve the body with the
+recorded status. A recorded error body is saved byte for byte and never
+edited; `scripts/check-fixtures.sh` scans it like every other fixture.
 
 Fixture tests compare the produced payload with `expected-payload.json` as
 JSON values (key order independent, `conversationId` masked) and the produced
@@ -1800,5 +1838,4 @@ Deferred with reasons; each becomes a spec change before code.
 | Homebrew tap | must not strip quarantine; needs notarization |
 | digest of the stored credential row as the freshness discriminator (3.3) | `expires_at` covers every write the Kiro CLI actually performs; a digest would also catch two writes sharing an expiry, and must never be logged or serialized |
 | manual model discovery | needs one successful, structure-only catalog request for each proposed region before any region ships |
-| monthly allowance classification | needs a scrubbed fixture with the exact `MONTHLY_REQUEST_COUNT` marker; ordinary status and exception classification remains in use |
 | history-image forwarding | needs the structural `history_image_is_accepted` live test after runtime access returns |

@@ -12,6 +12,9 @@ pub enum UpstreamErrorKind {
     Throttled,
     /// The exact `INSUFFICIENT_MODEL_CAPACITY` runtime marker.
     ModelCapacity,
+    /// The exact `MONTHLY_REQUEST_COUNT` runtime marker: the monthly request
+    /// allowance is used up. Never retried.
+    AllowanceExhausted,
     /// 5xx, InternalServerException and friends.
     Server,
     /// Connection, TLS, timeout, redirect.
@@ -58,12 +61,26 @@ impl UpstreamError {
     }
 }
 
+const CAPACITY_MARKER: &[u8] = b"INSUFFICIENT_MODEL_CAPACITY";
+const ALLOWANCE_MARKER: &[u8] = b"MONTHLY_REQUEST_COUNT";
+
+fn contains(body: &[u8], marker: &[u8]) -> bool {
+    body.windows(marker.len()).any(|window| window == marker)
+}
+
+/// Whether a bounded error body carries the exact monthly allowance marker
+/// (spec 5.6).
+pub fn is_allowance_exhausted(body: &[u8]) -> bool {
+    contains(body, ALLOWANCE_MARKER)
+}
+
+/// Capacity outranks the allowance marker, and both outrank a plain 429
+/// (spec 5.6).
 pub fn classify_throttle(status: u16, body: &[u8]) -> UpstreamErrorKind {
-    if body
-        .windows(b"INSUFFICIENT_MODEL_CAPACITY".len())
-        .any(|window| window == b"INSUFFICIENT_MODEL_CAPACITY")
-    {
+    if contains(body, CAPACITY_MARKER) {
         UpstreamErrorKind::ModelCapacity
+    } else if is_allowance_exhausted(body) {
+        UpstreamErrorKind::AllowanceExhausted
     } else if status == 429 {
         UpstreamErrorKind::Throttled
     } else {
@@ -176,6 +193,22 @@ mod tests {
         assert_eq!(
             classify_throttle(500, b"quota limit"),
             UpstreamErrorKind::Server
+        );
+        assert_eq!(
+            classify_throttle(429, b"MONTHLY_REQUEST_COUNT"),
+            UpstreamErrorKind::AllowanceExhausted
+        );
+        assert_eq!(
+            classify_throttle(500, b"MONTHLY_REQUEST_COUNT"),
+            UpstreamErrorKind::AllowanceExhausted
+        );
+        assert_eq!(
+            classify_throttle(429, b"INSUFFICIENT_MODEL_CAPACITY MONTHLY_REQUEST_COUNT"),
+            UpstreamErrorKind::ModelCapacity
+        );
+        assert_eq!(
+            classify_throttle(429, b"monthly request count"),
+            UpstreamErrorKind::Throttled
         );
     }
 }

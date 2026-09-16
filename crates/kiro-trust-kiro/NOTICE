@@ -66,6 +66,12 @@ transcribed from it and carry that license and attribution:
 - model-capacity classification from the exact
   `INSUFFICIENT_MODEL_CAPACITY` marker
   (crates/chat-cli/src/api_client/mod.rs)
+- monthly allowance classification from the exact
+  `MONTHLY_REQUEST_COUNT` marker
+  (crates/chat-cli/src/api_client/mod.rs;
+  crates/amzn-codewhisperer-streaming-client/src/types:
+  _service_quota_exceeded_exception_reason.rs,
+  _throttling_exception_reason.rs)
 
 Everything else is an independent implementation.
 

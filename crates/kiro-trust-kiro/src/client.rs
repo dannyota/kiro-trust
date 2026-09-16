@@ -2,8 +2,9 @@
 //! internal/kiroclient/client.go and backoff.go.
 
 use crate::error::{
-    UpstreamError, UpstreamErrorKind, classify_throttle, is_event_stream_content_type,
-    is_retryable_exception, parse_exception_message, parse_exception_type,
+    UpstreamError, UpstreamErrorKind, classify_throttle, is_allowance_exhausted,
+    is_event_stream_content_type, is_retryable_exception, parse_exception_message,
+    parse_exception_type,
 };
 use crate::headers::{AMZ_TARGET, AMZ_USER_AGENT, CONTENT_TYPE, MAX_ATTEMPTS, USER_AGENT};
 use async_trait::async_trait;
@@ -297,6 +298,9 @@ impl KiroClient {
                         {
                             UpstreamErrorKind::ModelCapacity
                         }
+                        Some(_) if is_allowance_exhausted(&raw) => {
+                            UpstreamErrorKind::AllowanceExhausted
+                        }
                         Some("ThrottlingException" | "TooManyRequestsException") => {
                             UpstreamErrorKind::Throttled
                         }
@@ -305,7 +309,8 @@ impl KiroClient {
                         None => UpstreamErrorKind::Protocol,
                     };
                     let retryable = kind == UpstreamErrorKind::ModelCapacity
-                        || ex.as_deref().is_some_and(is_retryable_exception);
+                        || (kind != UpstreamErrorKind::AllowanceExhausted
+                            && ex.as_deref().is_some_and(is_retryable_exception));
                     if retryable && !last {
                         let error_type = if kind == UpstreamErrorKind::ModelCapacity {
                             "model_capacity"
@@ -353,6 +358,16 @@ impl KiroClient {
                     let raw = resp.bytes_limited().await.unwrap_or_default();
                     let ex = parse_exception_type(&raw);
                     let kind = classify_throttle(status, &raw);
+                    if kind == UpstreamErrorKind::AllowanceExhausted {
+                        return Err(UpstreamError::new(
+                            kind,
+                            Some(status),
+                            ex,
+                            attempts,
+                            None,
+                            parse_exception_message(&raw),
+                        ));
+                    }
                     if let RetryDelay::Stop(delay) = delay {
                         return Err(UpstreamError::new(
                             kind,
@@ -384,8 +399,13 @@ impl KiroClient {
                 }
                 status => {
                     let raw = resp.bytes_limited().await.unwrap_or_default();
+                    let kind = if is_allowance_exhausted(&raw) {
+                        UpstreamErrorKind::AllowanceExhausted
+                    } else {
+                        UpstreamErrorKind::Client
+                    };
                     return Err(UpstreamError::new(
-                        UpstreamErrorKind::Client,
+                        kind,
                         Some(status),
                         parse_exception_type(&raw),
                         attempts,

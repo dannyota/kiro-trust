@@ -14,6 +14,8 @@ pub struct ApiError {
     pub kind: &'static str,
     pub message: String,
     retry_after: Option<Duration>,
+    /// Sends `x-should-retry: false`, which Anthropic SDK clients honor.
+    no_retry: bool,
 }
 
 impl ApiError {
@@ -31,6 +33,7 @@ impl ApiError {
             kind,
             message,
             retry_after: None,
+            no_retry: false,
         }
     }
     pub fn invalid_request(m: impl Into<String>) -> Self {
@@ -55,6 +58,13 @@ impl ApiError {
     pub fn rate_limit_after(m: impl Into<String>, retry_after: Duration) -> Self {
         let mut error = Self::rate_limit(m);
         error.retry_after = Some(retry_after);
+        error
+    }
+    /// The monthly request allowance is used up (spec 5.6). Retrying cannot
+    /// succeed before the allowance resets, so the response says not to.
+    pub fn allowance_exhausted(m: impl Into<String>) -> Self {
+        let mut error = Self::rate_limit(m);
+        error.no_retry = true;
         error
     }
     fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
@@ -105,6 +115,9 @@ impl From<UpstreamError> for ApiError {
                     None => Self::rate_limit(message),
                 }
             }
+            UpstreamErrorKind::AllowanceExhausted => Self::allowance_exhausted(format!(
+                "Kiro monthly request allowance exhausted: {detail}"
+            )),
             UpstreamErrorKind::Server
             | UpstreamErrorKind::Transport
             | UpstreamErrorKind::Protocol
@@ -147,6 +160,11 @@ impl IntoResponse for ApiError {
             if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
                 response.headers_mut().insert(header::RETRY_AFTER, value);
             }
+        }
+        if self.no_retry {
+            response
+                .headers_mut()
+                .insert("x-should-retry", HeaderValue::from_static("false"));
         }
         response
     }

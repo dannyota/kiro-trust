@@ -1,0 +1,1 @@
+{"source": "live capture 2026-09-16, runtime.us-east-1.kiro.dev GenerateAssistantResponse with an exhausted monthly allowance", "status": 400, "content_type": "application/x-amz-json-1.0", "features": ["error", "allowance_exhausted"]}

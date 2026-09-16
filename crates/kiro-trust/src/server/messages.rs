@@ -123,6 +123,7 @@ fn upstream_usage_kind(error: &UpstreamError) -> UsageErrorKind {
         UpstreamErrorKind::Auth => UsageErrorKind::Authentication,
         UpstreamErrorKind::Throttled => UsageErrorKind::TransientThrottle,
         UpstreamErrorKind::ModelCapacity => UsageErrorKind::ModelCapacity,
+        UpstreamErrorKind::AllowanceExhausted => UsageErrorKind::AllowanceExhausted,
         UpstreamErrorKind::Transport => UsageErrorKind::Transport,
         UpstreamErrorKind::Protocol => UsageErrorKind::Protocol,
         UpstreamErrorKind::Server | UpstreamErrorKind::Client => UsageErrorKind::UpstreamServer,

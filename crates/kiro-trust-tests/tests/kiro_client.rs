@@ -521,6 +521,131 @@ async fn capacity_marker_in_a_json_exception_uses_the_same_category() {
     assert_eq!(error.kind, UpstreamErrorKind::ModelCapacity);
 }
 
+fn monthly_limit_body() -> String {
+    std::fs::read_to_string(
+        kiro_trust_tests::fixtures_dir().join("errors/monthly-request-count/body.json"),
+    )
+    .unwrap()
+}
+
+// Recorded 400 body (tests/fixtures/errors/monthly-request-count).
+#[tokio::test]
+async fn recorded_monthly_limit_is_allowance_exhaustion_without_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .insert_header("content-type", "application/x-amz-json-1.0")
+                .set_body_string(monthly_limit_body()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let error = client(&server, dir.path(), false)
+        .await
+        .generate(&payload())
+        .await
+        .unwrap_err();
+    assert_eq!(error.attempts, 1);
+    assert_eq!(error.kind, UpstreamErrorKind::AllowanceExhausted);
+    assert_eq!(error.status, Some(400));
+    assert_eq!(
+        error.exception_type.as_deref(),
+        Some("ServiceQuotaExceededException")
+    );
+    assert_eq!(error.message, "You have reached the limit.");
+    assert_eq!(error.retry_after, None);
+}
+
+#[tokio::test]
+async fn other_400_bodies_stay_client_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"__type":"ServiceQuotaExceededException","message":"You have reached the limit."}"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let error = client(&server, dir.path(), false)
+        .await
+        .generate(&payload())
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, UpstreamErrorKind::Client);
+}
+
+#[tokio::test]
+async fn monthly_marker_on_a_429_stops_retrying() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "1")
+                .set_body_string(
+                    r#"{"__type":"ThrottlingException","message":"x","reason":"MONTHLY_REQUEST_COUNT"}"#,
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let error = client(&server, dir.path(), false)
+        .await
+        .generate(&payload())
+        .await
+        .unwrap_err();
+    assert_eq!(error.attempts, 1);
+    assert_eq!(error.kind, UpstreamErrorKind::AllowanceExhausted);
+    assert_eq!(error.retry_after, None);
+}
+
+#[tokio::test]
+async fn monthly_marker_in_a_200_throttling_exception_stops_retrying() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_string(
+                    r#"{"__type":"ThrottlingException","message":"x","reason":"MONTHLY_REQUEST_COUNT"}"#,
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let error = client(&server, dir.path(), false)
+        .await
+        .generate(&payload())
+        .await
+        .unwrap_err();
+    assert_eq!(error.attempts, 1);
+    assert_eq!(error.kind, UpstreamErrorKind::AllowanceExhausted);
+}
+
+#[tokio::test]
+async fn capacity_marker_outranks_the_monthly_marker() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).set_body_string(
+            r#"{"__type":"ThrottlingException","message":"INSUFFICIENT_MODEL_CAPACITY","reason":"MONTHLY_REQUEST_COUNT"}"#,
+        ))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let error = client(&server, dir.path(), false)
+        .await
+        .generate(&payload())
+        .await
+        .unwrap_err();
+    assert_eq!(error.attempts, 3);
+    assert_eq!(error.kind, UpstreamErrorKind::ModelCapacity);
+}
+
 #[tokio::test]
 async fn pre_send_header_failure_reports_zero_attempts() {
     let server = MockServer::start().await;

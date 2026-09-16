@@ -173,6 +173,11 @@ when the upstream did not report those counts. Cache counts always remain in
 `reported`. These counters describe proxy activity only. They do not estimate
 or expose any current, monthly, or remaining Kiro allowance.
 
+When Kiro reports that the monthly request allowance is used up, the proxy
+does not retry. It returns 429 `rate_limit_error` with `x-should-retry: false`,
+so Claude Code stops instead of retrying, and it counts the failure as
+`allowance_exhausted`.
+
 ## Limitations
 
 Each item below is a deliberate decision rather than an omission;
@@ -183,8 +188,6 @@ reasoning, and section 13 has the backlog.
   (`ksk_…`).
 - Claude models only, from a static catalog: no GPT models on Kiro. Manual
   discovery remains deferred until its per-region catalog evidence gate passes.
-- Monthly allowance classification remains deferred until a scrubbed fixture
-  proves the exact `MONTHLY_REQUEST_COUNT` marker.
 - Current-message images are accepted and forwarded. Images from history
   entries remain dropped until `history_image_is_accepted` passes after runtime
   access returns.

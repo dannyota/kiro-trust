@@ -7,7 +7,7 @@ use std::time::Instant;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-const ERROR_KINDS: usize = 10;
+const ERROR_KINDS: usize = 11;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,6 +22,7 @@ pub enum UsageErrorKind {
     InvalidState,
     InvalidRequest,
     Cancelled,
+    AllowanceExhausted,
 }
 
 impl UsageErrorKind {
@@ -36,6 +37,7 @@ impl UsageErrorKind {
         Self::InvalidState,
         Self::InvalidRequest,
         Self::Cancelled,
+        Self::AllowanceExhausted,
     ];
 
     fn index(self) -> usize {
@@ -50,6 +52,7 @@ impl UsageErrorKind {
             Self::InvalidState => 7,
             Self::InvalidRequest => 8,
             Self::Cancelled => 9,
+            Self::AllowanceExhausted => 10,
         }
     }
 }

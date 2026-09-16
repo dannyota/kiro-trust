@@ -2,6 +2,16 @@
 
 All notable changes to kiro-trust. Dates are UTC.
 
+## Unreleased
+
+- An exhausted monthly Kiro request allowance, marked by
+  `MONTHLY_REQUEST_COUNT` in the runtime's error body, is no longer retried or
+  reported as a 502. The proxy returns 429 `rate_limit_error` with
+  `x-should-retry: false`, and `GET /v1/usage` counts it as
+  `allowance_exhausted`. A recorded runtime response backs the classification.
+- `UpstreamErrorKind` in `kiro-trust-kiro` gains the `AllowanceExhausted`
+  variant.
+
 ## 0.3.0 - 2026-09-11
 
 - `kiro-trust models list [--json]` and `kiro-trust models show <model>

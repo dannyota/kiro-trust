@@ -493,6 +493,67 @@ async fn usage_route_prioritizes_capacity_over_throttling_exception_type() {
 }
 
 #[tokio::test]
+async fn allowance_exhaustion_is_a_non_retryable_rate_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let exhausted = UpstreamError::new(
+        kiro_trust_kiro::UpstreamErrorKind::AllowanceExhausted,
+        Some(400),
+        Some("ServiceQuotaExceededException".into()),
+        1,
+        None,
+        "You have reached the limit.",
+    );
+    let (app, _) = app(dir.path(), vec![Err(exhausted)]);
+    let response = app
+        .clone()
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers().get("x-should-retry").unwrap(), "false");
+    assert!(response.headers().get("retry-after").is_none());
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Kiro monthly request allowance exhausted: ServiceQuotaExceededException")
+    );
+    let report = usage_report(app).await;
+    assert_eq!(
+        report["errors"],
+        serde_json::json!([{"kind":"allowance_exhausted","count":1}])
+    );
+}
+
+#[tokio::test]
+async fn transient_rate_limits_do_not_forbid_client_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let throttled = UpstreamError::new(
+        kiro_trust_kiro::UpstreamErrorKind::Throttled,
+        Some(429),
+        Some("ThrottlingException".into()),
+        3,
+        None,
+        "slow down",
+    );
+    let (app, _) = app(dir.path(), vec![Err(throttled)]);
+    let response = app
+        .oneshot(messages_req(serde_json::json!({
+            "model": "claude-sonnet-4-6", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().get("x-should-retry").is_none());
+}
+
+#[tokio::test]
 async fn usage_counts_identity_and_concurrency_failures_but_excludes_auth_and_unknown_models() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.sqlite3");
